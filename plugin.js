@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.9'
+const VERSION = '0.2.0'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -159,6 +159,10 @@ function providerKey(name) {
   if (key === 'deep-seek') return 'deepseek'
   if (key === 'opencode_go' || key === 'opencode-go-sub' || key === 'go') return 'opencode-go'
   if (key === 'ollama-cloud' || key === 'ollama_cloud') return 'ollama'
+  if (key === 'minimax-cn' || key === 'minimax_cn' || key === 'minimax-token-plan') return 'minimax'
+  if (key === 'novita-ai' || key === 'novitaai') return 'novita'
+  if (key === 'deep-infra') return 'deepinfra'
+  if (key === 'ai-gateway' || key === 'vercel' || key === 'vercel-ai-gateway') return 'ai-gateway'
   return key
 }
 
@@ -201,6 +205,15 @@ const PROVIDER_LABELS = {
   ollama: 'Ollama Cloud',
   'ollama-cloud': 'Ollama Cloud',
   ollama_cloud: 'Ollama Cloud',
+  minimax: 'MiniMax',
+  'minimax-cn': 'MiniMax',
+  novita: 'Novita',
+  'novita-ai': 'Novita',
+  deepinfra: 'DeepInfra',
+  'deep-infra': 'DeepInfra',
+  'ai-gateway': 'AI Gateway',
+  vercel: 'AI Gateway',
+  'vercel-ai-gateway': 'AI Gateway',
   nous: 'Nous'
 }
 
@@ -617,11 +630,22 @@ function UsageBar({ remaining }) {
   })
 }
 
+function displayDetail(card) {
+  const detail = String((card && card.detail) || '').trim()
+  if (!detail) return ''
+  // Bar + "% left" already show the same unitless fraction.
+  if (card.remaining !== null && card.remaining !== undefined) {
+    if (/^[\d,]+\s+of\s+[\d,]+\s+left$/i.test(detail)) return ''
+  }
+  return detail
+}
+
 function LimitCard({ card, nowMs, actions }) {
   const remaining = card.remaining
   const tone = toneForRemaining(remaining)
   const reset = formatReset(card.resetAt, card.resetText, nowMs)
   const leftLabel = remaining === null || remaining === undefined ? '—' : `${remaining}% left`
+  const detail = displayDetail(card)
   return jsxs('div', {
     style: {
       display: 'flex',
@@ -646,10 +670,10 @@ function LimitCard({ card, nowMs, actions }) {
                 children: reset.startsWith('Resets') || reset.startsWith('Reset') ? reset : `Resets ${reset}`
               })
             : null,
-          card.detail
+          detail
             ? jsx('div', {
                 style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
-                children: card.detail
+                children: detail
               })
             : null
         ]
@@ -1039,7 +1063,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, and Ollama Cloud when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
@@ -1069,7 +1093,7 @@ function Page() {
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children:
-                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, OpenRouter, or Nous, then refresh.'
+                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, OpenRouter, or Nous, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {

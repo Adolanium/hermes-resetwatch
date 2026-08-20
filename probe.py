@@ -6,8 +6,10 @@ Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
 (ZCode) come from those logins. When CLI login is missing, Kimi Coding
 (KIMI_CODING_API_KEY / KIMI_API_KEY) and GLM (ZAI_API_KEY / GLM_API_KEY)
 fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
-(OPENCODE_GO_API_KEY), and Ollama Cloud (OLLAMA_API_KEY) always use
-Hermes env.
+(OPENCODE_GO_API_KEY), Ollama Cloud (OLLAMA_API_KEY), MiniMax
+(MINIMAX_API_KEY), Novita (NOVITA_API_KEY), DeepInfra
+(DEEPINFRA_API_KEY), and Vercel AI Gateway (AI_GATEWAY_API_KEY) always
+use Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
@@ -59,6 +61,15 @@ OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 
 OLLAMA_CLOUD_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_CLOUD_ME_URL = "https://ollama.com/api/me"
+
+MINIMAX_TOKEN_PLAN_URLS = (
+    "https://www.minimax.io/v1/token_plan/remains",
+    "https://api.minimax.io/v1/token_plan/remains",
+)
+MINIMAX_CN_TOKEN_PLAN_URL = "https://api.minimaxi.com/v1/token_plan/remains"
+NOVITA_BALANCE_URL = "https://api.novita.ai/openapi/v1/billing/balance/detail"
+DEEPINFRA_CHECKLIST_URL = "https://api.deepinfra.com/payment/checklist"
+AI_GATEWAY_CREDITS_URL = "https://ai-gateway.vercel.sh/v1/credits"
 
 # Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
 # Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
@@ -182,6 +193,14 @@ def _provider_key(name: Any) -> str:
         return "opencode-go"
     if key in {"ollama-cloud", "ollama_cloud"}:
         return "ollama"
+    if key in {"minimax-cn", "minimax_cn", "minimax-token-plan"}:
+        return "minimax"
+    if key in {"novita-ai", "novitaai"}:
+        return "novita"
+    if key in {"deep-infra"}:
+        return "deepinfra"
+    if key in {"ai-gateway", "vercel", "vercel-ai-gateway"}:
+        return "ai-gateway"
     return key
 
 
@@ -708,12 +727,11 @@ def _kimi_usage_window(detail: Any, *, label: str) -> Optional[dict]:
     if limit is None or limit <= 0 or used is None:
         return None
     used_percent = max(0.0, min(100.0, used / float(limit) * 100.0))
-    left = remaining if remaining is not None else max(0, limit - used)
     return _win(
         label,
         used_percent,
         _parse_dt(detail.get("resetTime") or detail.get("resetAt")),
-        f"{left} of {limit} left",
+        None,
     )
 
 
@@ -1639,15 +1657,7 @@ def _glm_usage_window(item: Any) -> Optional[dict]:
             return None
     used_percent = max(0.0, min(100.0, float(pct)))
     reset_at = _parse_dt(item.get("nextResetTime"))
-    remaining = item.get("remaining")
-    limit = item.get("usage")
-    detail = None
-    if isinstance(remaining, (int, float)) and isinstance(limit, (int, float)) and float(limit) > 0:
-        if float(limit) >= 1000:
-            detail = f"{float(remaining):,.0f} of {float(limit):,.0f} left"
-        else:
-            detail = f"{float(remaining):.0f} of {float(limit):.0f} left"
-    return _win(_glm_window_label(item), used_percent, reset_at, detail)
+    return _win(_glm_window_label(item), used_percent, reset_at, None)
 
 
 def _clock_label(stamp: datetime) -> str:
@@ -2068,6 +2078,312 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
     return _snapshot("ollama", plan, windows)
 
 
+def _parse_epoch_ms(value: Any) -> Optional[datetime]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        n = float(value)
+        if n > 1e12:
+            return datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
+        if n > 1e9:
+            return datetime.fromtimestamp(n, tz=timezone.utc)
+    return _parse_dt(value)
+
+
+def _minimax_api_key() -> Optional[str]:
+    return _hermes_env_value("MINIMAX_API_KEY") or _hermes_env_value("MINIMAX_CN_API_KEY")
+
+
+def _minimax_remaining_percent(item: dict, *keys: str) -> Optional[float]:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            n = float(value)
+            if 0.0 <= n <= 1.0:
+                return n * 100.0
+            if 0.0 <= n <= 100.0:
+                return n
+    return None
+
+
+def _minimax_used_from_counts(item: dict, remaining_key: str, total_key: str) -> Optional[float]:
+    remaining = _to_int(item.get(remaining_key))
+    total = _to_int(item.get(total_key))
+    if remaining is None or total is None or total <= 0:
+        return None
+    used = max(0, total - remaining)
+    return max(0.0, min(100.0, used / float(total) * 100.0))
+
+
+def _minimax_pick_row(rows: list) -> Optional[dict]:
+    general = None
+    fallback = None
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("model_name") or item.get("modelName") or "").strip().lower()
+        if name == "general":
+            general = item
+            break
+        if fallback is None and name not in {"video"}:
+            fallback = item
+    return general or fallback
+
+
+def _minimax_token_plan_urls() -> list[str]:
+    urls = list(MINIMAX_TOKEN_PLAN_URLS)
+    if _hermes_env_value("MINIMAX_CN_API_KEY") and not _hermes_env_value("MINIMAX_API_KEY"):
+        urls = [MINIMAX_CN_TOKEN_PLAN_URL, *urls]
+    elif _hermes_env_value("MINIMAX_CN_API_KEY"):
+        urls.append(MINIMAX_CN_TOKEN_PLAN_URL)
+    return urls
+
+
+def _fetch_minimax_account_usage() -> Optional[dict]:
+    """MiniMax Token Plan windows from GET /v1/token_plan/remains."""
+    token = _minimax_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    payload = None
+    with httpx.Client(timeout=15.0) as client:
+        for url in _minimax_token_plan_urls():
+            try:
+                response = client.get(url, headers=headers)
+            except Exception:
+                continue
+            if response.status_code >= 400:
+                continue
+            try:
+                body = response.json() or {}
+            except Exception:
+                continue
+            if not isinstance(body, dict):
+                continue
+            base = body.get("base_resp") if isinstance(body.get("base_resp"), dict) else {}
+            code = base.get("status_code")
+            if code not in (None, 0, "0"):
+                continue
+            payload = body
+            break
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("model_remains")
+    if not isinstance(rows, list):
+        return None
+    item = _minimax_pick_row(rows)
+    if not item:
+        return None
+    windows: list[dict] = []
+    interval_left = _minimax_remaining_percent(
+        item,
+        "current_interval_remaining_percent",
+        "currentIntervalRemainingPercent",
+        "usage_percent",
+        "usagePercent",
+    )
+    interval_used = None
+    if interval_left is not None:
+        interval_used = max(0.0, min(100.0, 100.0 - interval_left))
+    else:
+        interval_used = _minimax_used_from_counts(
+            item, "current_interval_usage_count", "current_interval_total_count"
+        )
+    if interval_used is not None:
+        windows.append(
+            _win("5h", interval_used, _parse_epoch_ms(item.get("end_time") or item.get("endTime")))
+        )
+    weekly_left = _minimax_remaining_percent(
+        item,
+        "current_weekly_remaining_percent",
+        "currentWeeklyRemainingPercent",
+    )
+    weekly_used = None
+    if weekly_left is not None:
+        weekly_used = max(0.0, min(100.0, 100.0 - weekly_left))
+    else:
+        weekly_used = _minimax_used_from_counts(
+            item, "current_weekly_usage_count", "current_weekly_total_count"
+        )
+    if weekly_used is not None:
+        windows.append(
+            _win(
+                "Weekly",
+                weekly_used,
+                _parse_epoch_ms(item.get("weekly_end_time") or item.get("weeklyEndTime")),
+            )
+        )
+    if not windows:
+        return None
+    return _snapshot("minimax", "Token Plan", windows)
+
+
+def _novita_api_key() -> Optional[str]:
+    return _hermes_env_value("NOVITA_API_KEY")
+
+
+def _novita_money(value: Any) -> Optional[float]:
+    """Novita balances are 1/10000 USD strings or numbers."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value) / 10000.0
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip().replace(",", "")) / 10000.0
+        except ValueError:
+            return None
+    return None
+
+
+def _fetch_novita_account_usage() -> Optional[dict]:
+    token = _novita_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(NOVITA_BALANCE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    available = _novita_money(payload.get("availableBalance"))
+    if available is None:
+        return None
+    parts = [f"${available:,.2f} left"]
+    cash = _novita_money(payload.get("cashBalance"))
+    if cash is not None and abs(cash - available) > 0.009:
+        parts.append(f"${cash:,.2f} cash")
+    owed = _novita_money(payload.get("outstandingInvoices"))
+    if owed is not None and owed > 0:
+        parts.append(f"${owed:,.2f} owed")
+    return _snapshot("novita", None, [_win("Balance", None, None, " · ".join(parts))])
+
+
+def _deepinfra_api_key() -> Optional[str]:
+    return _hermes_env_value("DEEPINFRA_API_KEY") or _hermes_env_value("DEEPINFRA_TOKEN")
+
+
+def _fetch_deepinfra_account_usage() -> Optional[dict]:
+    token = _deepinfra_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(
+            DEEPINFRA_CHECKLIST_URL,
+            headers=headers,
+            params={"compute_owed": "true"},
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    balance_raw = payload.get("stripe_balance")
+    if not isinstance(balance_raw, (int, float)) or not math.isfinite(balance_raw):
+        return None
+    # Negative stripe_balance = prepaid funds ready to spend.
+    available = max(0.0, -float(balance_raw)) if float(balance_raw) < 0 else 0.0
+    owed = float(balance_raw) if float(balance_raw) > 0 else 0.0
+    parts = [f"${available:,.2f} left"] if available > 0 or owed <= 0 else []
+    if owed > 0:
+        parts.append(f"${owed:,.2f} owed")
+    recent = payload.get("recent")
+    if isinstance(recent, (int, float)) and math.isfinite(recent) and float(recent) > 0:
+        parts.append(f"${float(recent):,.2f} recent spend")
+    limit = payload.get("limit")
+    used_percent = None
+    if (
+        isinstance(limit, (int, float))
+        and math.isfinite(limit)
+        and float(limit) > 0
+        and isinstance(recent, (int, float))
+        and math.isfinite(recent)
+    ):
+        used_percent = max(0.0, min(100.0, float(recent) / float(limit) * 100.0))
+        parts.append(f"${float(limit):,.2f} spend limit")
+    if payload.get("suspended") is True:
+        reason = str(payload.get("suspend_reason") or "suspended").strip()
+        parts.append(f"account {reason}")
+    if not parts:
+        return None
+    return _snapshot(
+        "deepinfra",
+        None,
+        [_win("Balance" if used_percent is None else "Spend", used_percent, None, " · ".join(parts))],
+    )
+
+
+def _ai_gateway_api_key() -> Optional[str]:
+    return _hermes_env_value("AI_GATEWAY_API_KEY")
+
+
+def _fetch_ai_gateway_account_usage() -> Optional[dict]:
+    token = _ai_gateway_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(AI_GATEWAY_CREDITS_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    balance = payload.get("balance")
+    amount = None
+    if isinstance(balance, (int, float)) and math.isfinite(balance):
+        amount = float(balance)
+    elif isinstance(balance, str) and balance.strip():
+        try:
+            amount = float(balance.strip().replace(",", "").replace("$", ""))
+        except ValueError:
+            amount = None
+    if amount is None:
+        return None
+    parts = [f"${amount:,.2f} left"]
+    used = payload.get("total_used")
+    used_amount = None
+    if isinstance(used, (int, float)) and math.isfinite(used):
+        used_amount = float(used)
+    elif isinstance(used, str) and used.strip():
+        try:
+            used_amount = float(used.strip().replace(",", "").replace("$", ""))
+        except ValueError:
+            used_amount = None
+    if used_amount is not None and used_amount > 0:
+        parts.append(f"${used_amount:,.2f} used")
+    return _snapshot("ai-gateway", None, [_win("Credits", None, None, " · ".join(parts))])
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -2104,6 +2420,10 @@ def _collect_cli() -> list[dict]:
         _fetch_deepseek_account_usage,
         _fetch_opencode_go_account_usage,
         _fetch_ollama_cloud_account_usage,
+        _fetch_minimax_account_usage,
+        _fetch_novita_account_usage,
+        _fetch_deepinfra_account_usage,
+        _fetch_ai_gateway_account_usage,
     ):
         try:
             snap = fetch()

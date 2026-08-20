@@ -12,7 +12,8 @@ Bars for what you still have, and the time it fills back up.
 ## What you get
 
 **It shows what's left.** Live cards for Nous, Claude, Codex, Cursor, Kimi,
-Grok, and GLM when you are already signed in. Each card is one window: how
+Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra,
+and AI Gateway when you are already signed in. Each card is one window: how
 full it is, how much is still there, and when it resets. No chat has to be
 open.
 
@@ -49,6 +50,10 @@ Live cards fill on their own when that login is already on the machine:
 - **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak)
 - **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
+- **MiniMax:** `MINIMAX_API_KEY` (or `MINIMAX_CN_API_KEY`) in Hermes env (Token Plan 5h / weekly)
+- **Novita:** `NOVITA_API_KEY` in Hermes env (dollar balance)
+- **DeepInfra:** `DEEPINFRA_API_KEY` in Hermes env (prepaid balance)
+- **AI Gateway:** `AI_GATEWAY_API_KEY` in Hermes env (Vercel credits)
 
 Gemini, Perplexity, and anything else can be a manual clock. Type the percent
 left and the reset time.
@@ -67,8 +72,9 @@ appear, run "Reload desktop plugins" from the palette.
 Live rows work on stock Hermes. `probe.py` asks the gateway Python for
 Claude, Codex, and OpenRouter. If Hermes OAuth is missing, it reads the
 Claude Code and Codex CLIs instead. Cursor, Kimi, Grok, GLM, DeepSeek,
-OpenCode Go, and Ollama Cloud come from those apps' own CLI, desktop
-logins, or Hermes API keys. Copy both `plugin.js` and `probe.py`.
+OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway
+come from those apps' own CLI, desktop logins, or Hermes API keys. Copy
+both `plugin.js` and `probe.py`.
 
 ## What's inside
 
@@ -92,11 +98,13 @@ Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), Grok
 CLI (`~/.grok`), and GLM via ZCode (`~/.zcode`) come from those logins
 first. If Kimi or GLM CLI login is missing, Hermes env keys fill the same
 cards: `KIMI_CODING_API_KEY` or `KIMI_API_KEY` (Coding Plan), and
-`ZAI_API_KEY` or `GLM_API_KEY`. DeepSeek, OpenCode Go, and Ollama Cloud
-use `DEEPSEEK_API_KEY` / `OPENCODE_GO_API_KEY` / `OLLAMA_API_KEY` from
-Hermes env (process env or `$HERMES_HOME/.env` on Windows and Mac).
-Older `/usage` output is still parsed when a session is focused, as a
-last fallback.
+`ZAI_API_KEY` or `GLM_API_KEY`. DeepSeek, OpenCode Go, Ollama Cloud,
+MiniMax, Novita, DeepInfra, and AI Gateway use `DEEPSEEK_API_KEY` /
+`OPENCODE_GO_API_KEY` / `OLLAMA_API_KEY` / `MINIMAX_API_KEY` /
+`NOVITA_API_KEY` / `DEEPINFRA_API_KEY` / `AI_GATEWAY_API_KEY` from Hermes
+env (process env or `$HERMES_HOME/.env` on Windows and Mac). Older
+`/usage` output is still parsed when a session is focused, as a last
+fallback.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
 
