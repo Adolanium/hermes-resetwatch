@@ -2,7 +2,8 @@
  * Resetwatch: remaining subscription quota and reset clocks for Hermes Desktop.
  *
  * One uncompiled plugin.js. A full page (sidebar + palette +
- * keybind), not a HUD. Live rows come from gateway RPCs Hermes already owns.
+ * keybind), not a HUD. Live rows come from gateway RPCs plus probe.py
+ * for CLI and app logins Hermes does not OAuth itself.
  * Manual clocks cover plans with no public remaining-quota API.
  *
  * 1. Import the SDK as a namespace so missing named exports cannot crash load.
@@ -17,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.2'
+const VERSION = '0.1.3'
 const POLL_MS = 30000
 
 const host = sdk.host
@@ -149,8 +150,11 @@ function isNousProvider(name) {
   return /^nous\b/i.test(String(name || '').trim())
 }
 
-function isGrokProvider(name) {
-  return /^(grok|xai-oauth|xai)$/i.test(String(name || '').trim())
+function providerKey(name) {
+  const key = String(name || '').trim().toLowerCase()
+  if (key === 'kimi-coding') return 'kimi'
+  if (key === 'xai-oauth' || key === 'xai') return 'grok'
+  return key
 }
 
 function isHttpUrl(url) {
@@ -176,6 +180,9 @@ const PROVIDER_LABELS = {
   cursor: 'Cursor',
   kimi: 'Kimi',
   'kimi-coding': 'Kimi',
+  grok: 'Grok',
+  'xai-oauth': 'Grok',
+  xai: 'Grok',
   nous: 'Nous'
 }
 
@@ -285,7 +292,6 @@ function cardsFromUsageGroups(groups, skipNous) {
   const cards = []
   for (const group of groups || []) {
     if (skipNous && isNousProvider(group.provider)) continue
-    if (isGrokProvider(group.provider)) continue
     const extra = (group.details || []).filter(line => !/^\(or run \/topup\)$/i.test(line))
     const windows = group.windows || []
     windows.forEach((window, index) => {
@@ -321,7 +327,6 @@ function cardsFromUsageGroups(groups, skipNous) {
 function cardsFromAccountSnapshots(snapshots) {
   const cards = []
   for (const snap of snapshots || []) {
-    if (isGrokProvider(snap.provider)) continue
     const provider = providerTitle(snap.provider, snap.plan)
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
@@ -387,16 +392,17 @@ function probePythonCandidates(home) {
   ]
 }
 
-async function probeStockAccountUsage() {
+async function probeStockAccountUsage(opts) {
   try {
     const shown = await host.request('config.show', {})
     const home = hermesHomeFromConfig(shown)
     if (!home) return null
     const probe = `${home}/desktop-plugins/resetwatch/probe.py`
+    const flags = opts && opts.cliOnly ? ' --cli-only' : ''
     for (const python of probePythonCandidates(home)) {
       try {
         const result = await host.request('shell.exec', {
-          command: `${quoteShell(python)} ${quoteShell(probe)}`
+          command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
         })
         if (!result || result.code) continue
         const text = String(result.stdout || '').trim()
@@ -439,10 +445,15 @@ async function fetchLiveCards(sessionId) {
     }
   }
 
+  const accountProviders = new Set()
   try {
     const account = await host.request('account.usage', {})
     haveAccountRpc = true
-    cards.push(...cardsFromAccountSnapshots(account && account.snapshots))
+    const snaps = (account && account.snapshots) || []
+    for (const snap of snaps) {
+      if (snap && snap.provider) accountProviders.add(providerKey(snap.provider))
+    }
+    cards.push(...cardsFromAccountSnapshots(snaps))
   } catch (error) {
     const message = error && error.message ? error.message : ''
     if (!/unknown method|not found|-32601/i.test(message)) {
@@ -450,9 +461,12 @@ async function fetchLiveCards(sessionId) {
     }
   }
 
-  if (!haveAccountRpc) {
-    const probed = await probeStockAccountUsage()
-    if (probed && probed.length) cards.push(...cardsFromAccountSnapshots(probed))
+  const probed = await probeStockAccountUsage({ cliOnly: haveAccountRpc })
+  if (probed && probed.length) {
+    const extra = haveAccountRpc
+      ? probed.filter(snap => snap && snap.provider && !accountProviders.has(providerKey(snap.provider)))
+      : probed
+    cards.push(...cardsFromAccountSnapshots(extra))
   }
 
   if (!haveAccountRpc && sid) {
@@ -956,7 +970,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans Hermes is already signed into, including Claude, Codex, Cursor, and Kimi when those CLIs or apps are logged in. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth, plus Claude, Codex, Cursor, Kimi, and Grok when those CLIs or apps are logged in. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
