@@ -12,12 +12,14 @@ Bars for what you still have, and the time it fills back up.
 ## What you get
 
 **It shows what's left.** Live cards for Nous, Claude, Codex, Cursor, Kimi,
-and Grok when you are already signed in. Each card is one window: how full
-it is, how much is still there, and when it resets. No chat has to be open.
+Grok, and GLM when you are already signed in. Each card is one window: how
+full it is, how much is still there, and when it resets. No chat has to be
+open.
 
 **It names the plan.** Claude shows Pro, Max, Max 5x, or Max 20x. Codex shows
 Plus. Cursor shows Ultra (or whatever the app is on). Kimi shows Advanced.
-Nous Portal shows the portal plan, not a bare Plus.
+GLM shows Lite, Pro, or Max. Nous Portal shows the portal plan, not a bare
+Plus.
 
 **It covers the rest by hand.** Gemini, Perplexity, or anything you type.
 Paste the percent left and the reset time from the vendor page. Open takes
@@ -41,9 +43,9 @@ appear, run "Reload desktop plugins" from the palette.
 
 Live rows work on stock Hermes. `probe.py` asks the gateway Python for
 Claude, Codex, and OpenRouter. If Hermes OAuth is missing, it reads the
-Claude Code and Codex CLIs instead. Cursor, Kimi, and Grok come from
-those apps' own CLI or desktop logins. Copy both `plugin.js` and
-`probe.py`.
+Claude Code and Codex CLIs instead. Cursor, Kimi, Grok, and GLM (ZCode)
+come from those apps' own CLI or desktop logins. Copy both `plugin.js`
+and `probe.py`.
 
 ## What's inside
 
@@ -62,9 +64,10 @@ RPC fills Claude, Codex, OpenRouter, and any other providers it already
 knows. On stock Hermes, `probe.py` fills the rest through `shell.exec`:
 the same Claude / Codex / OpenRouter fetchers. If Hermes OAuth is missing,
 Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards.
-Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), and Grok
-CLI (`~/.grok`) always come from those logins. Older `/usage` output is
-still parsed when a session is focused, as a last fallback.
+Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), Grok
+CLI (`~/.grok`), and GLM via ZCode (`~/.zcode`) always come from those
+logins. Older `/usage` output is still parsed when a session is focused,
+as a last fallback.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
 

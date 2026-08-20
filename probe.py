@@ -2,8 +2,9 @@
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
-Codex CLI logins fill those same cards. Cursor, Kimi, and Grok always
-come from those apps' own CLI or desktop logins. No tokens on stdout.
+Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
+(ZCode) come from those apps' own CLI or desktop logins. No tokens on
+stdout.
 """
 
 from __future__ import annotations
@@ -142,6 +143,8 @@ def _provider_key(name: Any) -> str:
         return "kimi"
     if key in {"xai-oauth", "xai"}:
         return "grok"
+    if key in {"zai", "zcode", "zhipu", "glm-coding", "zai-coding-plan"}:
+        return "glm"
     return key
 
 
@@ -1399,6 +1402,183 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     return _snapshot("openai-codex", plan, windows, details)
 
 
+ZCODE_CODING_PROVIDER_IDS = ("builtin:zai-coding-plan", "builtin:bigmodel-coding-plan")
+
+
+def _zcode_roots() -> list[Path]:
+    roots: list[Path] = []
+    override = (os.environ.get("ZCODE_HOME") or "").strip()
+    if override:
+        roots.append(Path(override).expanduser())
+    roots.append(_user_home() / ".zcode")
+    if _is_macos():
+        roots.append(_user_home() / "Library" / "Application Support" / "ZCode")
+    if _is_windows():
+        for env_name in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(env_name) or ""
+            if base:
+                roots.append(Path(base) / "ZCode")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def _zcode_read_json(path: Path) -> Optional[dict]:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _zcode_selected_provider_id(settings: dict) -> Optional[str]:
+    selected_map = settings.get("modelProviderFamilySelectedKeys")
+    if not isinstance(selected_map, dict):
+        return None
+    selected = selected_map.get("zai") or selected_map.get("glm") or selected_map.get("zhipu")
+    text = str(selected or "").strip()
+    if not text:
+        return None
+    if text.startswith("coding-plan:"):
+        text = text.split(":", 1)[1].strip()
+    return text or None
+
+
+def _zcode_provider_key(providers: dict, provider_id: str) -> Optional[tuple[str, str]]:
+    entry = providers.get(provider_id)
+    if not isinstance(entry, dict):
+        return None
+    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    token = options.get("apiKey")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    base = str(options.get("baseURL") or "").strip()
+    return token.strip(), base
+
+
+def _zcode_coding_credentials() -> Optional[tuple[str, str]]:
+    """Return (api_key, base_url) from a ZCode Coding Plan login. Never other providers."""
+    for root in _zcode_roots():
+        config = _zcode_read_json(root / "v2" / "config.json") or _zcode_read_json(root / "cli" / "config.json")
+        if not config:
+            continue
+        providers = config.get("provider") if isinstance(config.get("provider"), dict) else {}
+        if not providers:
+            continue
+        settings = _zcode_read_json(root / "v2" / "setting.json") or {}
+        ordered: list[str] = []
+        selected = _zcode_selected_provider_id(settings)
+        if selected:
+            ordered.append(selected)
+        ordered.extend(ZCODE_CODING_PROVIDER_IDS)
+        seen: set[str] = set()
+        for provider_id in ordered:
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            if provider_id not in ZCODE_CODING_PROVIDER_IDS:
+                continue
+            loaded = _zcode_provider_key(providers, provider_id)
+            if loaded:
+                return loaded
+    return None
+
+
+def _zai_monitor_base(base_url: str) -> str:
+    text = (base_url or "").lower()
+    if "bigmodel.cn" in text:
+        return "https://open.bigmodel.cn"
+    return "https://api.z.ai"
+
+
+def _glm_window_label(item: dict) -> str:
+    kind = str(item.get("type") or "").strip().upper()
+    unit = _to_int(item.get("unit"))
+    number = _to_int(item.get("number"))
+    if kind in {"CREDIT_LIMIT", "TOKENS_LIMIT"}:
+        if unit == 3:
+            return "5h" if number in {None, 5} else f"{number}h"
+        if unit == 6:
+            return "Weekly" if number in {None, 1, 7} else f"{number}w"
+        return "Credits"
+    if kind == "TIME_LIMIT":
+        return "MCP"
+    return _title_case_slug(kind) or "Limit"
+
+
+def _glm_usage_window(item: Any) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    kind = str(item.get("type") or "").strip().upper()
+    if kind not in {"CREDIT_LIMIT", "TOKENS_LIMIT", "TIME_LIMIT"}:
+        return None
+    pct = item.get("percentage")
+    if not isinstance(pct, (int, float)) or not math.isfinite(pct):
+        current = item.get("currentValue")
+        limit = item.get("usage")
+        if isinstance(current, (int, float)) and isinstance(limit, (int, float)) and float(limit) > 0:
+            pct = max(0.0, min(100.0, float(current) / float(limit) * 100.0))
+        else:
+            return None
+    used_percent = max(0.0, min(100.0, float(pct)))
+    reset_at = _parse_dt(item.get("nextResetTime"))
+    remaining = item.get("remaining")
+    limit = item.get("usage")
+    detail = None
+    if isinstance(remaining, (int, float)) and isinstance(limit, (int, float)) and float(limit) > 0:
+        if float(limit) >= 1000:
+            detail = f"{float(remaining):,.0f} of {float(limit):,.0f} left"
+        else:
+            detail = f"{float(remaining):.0f} of {float(limit):.0f} left"
+    return _win(_glm_window_label(item), used_percent, reset_at, detail)
+
+
+def _fetch_glm_zcode_account_usage() -> Optional[dict]:
+    creds = _zcode_coding_credentials()
+    if not creds:
+        return None
+    token, base_url = creds
+    import httpx
+
+    url = f"{_zai_monitor_base(base_url)}/api/monitor/usage/quota/limit"
+    headers = {
+        "Authorization": token,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(url, headers=headers)
+        if response.status_code in {401, 403}:
+            headers["Authorization"] = f"Bearer {token}"
+            response = client.get(url, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    limits = data.get("limits")
+    windows: list[dict] = []
+    if isinstance(limits, list):
+        for item in limits:
+            row = _glm_usage_window(item)
+            if row:
+                windows.append(row)
+    if not windows:
+        return None
+    plan = _title_case_slug(data.get("level"))
+    return _snapshot("glm", plan, windows)
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -1431,6 +1611,7 @@ def _collect_cli() -> list[dict]:
         _fetch_cursor_account_usage,
         _fetch_kimi_account_usage,
         _fetch_grok_account_usage,
+        _fetch_glm_zcode_account_usage,
     ):
         try:
             snap = fetch()

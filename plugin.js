@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.4'
+const VERSION = '0.1.5'
 const POLL_MS = 30000
 
 const host = sdk.host
@@ -154,6 +154,7 @@ function providerKey(name) {
   const key = String(name || '').trim().toLowerCase()
   if (key === 'kimi-coding') return 'kimi'
   if (key === 'xai-oauth' || key === 'xai') return 'grok'
+  if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'zai-coding-plan') return 'glm'
   return key
 }
 
@@ -180,9 +181,14 @@ const PROVIDER_LABELS = {
   cursor: 'Cursor',
   kimi: 'Kimi',
   'kimi-coding': 'Kimi',
-  grok: 'Grok',
+    grok: 'Grok',
   'xai-oauth': 'Grok',
   xai: 'Grok',
+  glm: 'GLM',
+  zai: 'GLM',
+  zcode: 'GLM',
+  zhipu: 'GLM',
+  'zai-coding-plan': 'GLM',
   nous: 'Nous'
 }
 
@@ -970,7 +976,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, and Grok CLIs or apps when those are logged in. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, and GLM (ZCode) when those CLIs or apps are logged in. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
