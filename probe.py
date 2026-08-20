@@ -2,9 +2,11 @@
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
-Codex CLI logins fill those same cards. Cursor, Kimi, Grok, GLM (ZCode),
-and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins. OpenCode Go
-(Hermes OPENCODE_GO_API_KEY) fills from GET /zen/go/v1/usage.
+Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
+(ZCode) come from those logins. When CLI login is missing, Kimi Coding
+(KIMI_CODING_API_KEY / KIMI_API_KEY) and GLM (ZAI_API_KEY / GLM_API_KEY)
+fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY) and OpenCode Go
+(OPENCODE_GO_API_KEY) always use Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
@@ -738,29 +740,7 @@ def _kimi_extra_usage_window(payload: dict) -> Optional[dict]:
     return _win("Extra usage", used_percent, None, f"{symbol}{left:.2f} of {symbol}{total:.2f} left")
 
 
-def _fetch_kimi_account_usage() -> Optional[dict]:
-    token = _kimi_code_access_token()
-    if not token:
-        return None
-    import httpx
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
-        if response.status_code == 401:
-            token = _kimi_code_access_token(previous=token, allow_refresh=True)
-            if not token:
-                return None
-            headers["Authorization"] = f"Bearer {token}"
-            response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
-        response.raise_for_status()
-        payload = response.json() or {}
-    if not isinstance(payload, dict):
-        return None
+def _kimi_snapshot_from_payload(payload: dict) -> Optional[dict]:
     windows: list[dict] = []
     weekly = _kimi_usage_window(payload.get("usage"), label="Weekly")
     if weekly:
@@ -783,6 +763,71 @@ def _fetch_kimi_account_usage() -> Optional[dict]:
     if not windows:
         return None
     return _snapshot("kimi", infer_kimi_plan_name(payload), windows)
+
+
+def _fetch_kimi_cli_usage() -> Optional[dict]:
+    token = _kimi_code_access_token()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
+        if response.status_code == 401:
+            token = _kimi_code_access_token(previous=token, allow_refresh=True)
+            if not token:
+                return None
+            headers["Authorization"] = f"Bearer {token}"
+            response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    return _kimi_snapshot_from_payload(payload)
+
+
+def _kimi_coding_api_key() -> Optional[str]:
+    for name in ("KIMI_CODING_API_KEY", "KIMI_API_KEY"):
+        value = _hermes_env_value(name)
+        if value:
+            return value
+    return None
+
+
+def _fetch_kimi_coding_api_key_usage() -> Optional[dict]:
+    token = _kimi_coding_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    return _kimi_snapshot_from_payload(payload)
+
+
+def _fetch_kimi_account_usage() -> Optional[dict]:
+    # CLI OAuth first (can refresh on 401). Hermes Coding Plan key is fallback.
+    try:
+        snap = _fetch_kimi_cli_usage()
+        if snap:
+            return snap
+    except Exception:
+        pass
+    return _fetch_kimi_coding_api_key_usage()
 
 
 def _grok_home() -> Path:
@@ -1629,11 +1674,26 @@ def _glm_peak_status(now: Optional[datetime] = None) -> tuple[bool, str]:
     return False, f"Off-peak now · {local_clock} local · {sg_clock} UTC+8 · peak is {windows}"
 
 
-def _fetch_glm_zcode_account_usage() -> Optional[dict]:
-    creds = _zcode_coding_credentials()
-    if not creds:
+def _glm_snapshot_from_payload(payload: dict) -> Optional[dict]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
         return None
-    token, base_url = creds
+    limits = data.get("limits")
+    windows: list[dict] = []
+    if isinstance(limits, list):
+        for item in limits:
+            row = _glm_usage_window(item)
+            if row:
+                windows.append(row)
+    if not windows:
+        return None
+    _peak, peak_text = _glm_peak_status()
+    windows.append(_win("Pricing", None, None, peak_text))
+    plan = _title_case_slug(data.get("level"))
+    return _snapshot("glm", plan, windows)
+
+
+def _fetch_glm_quota(token: str, base_url: str) -> Optional[dict]:
     import httpx
 
     url = f"{_zai_monitor_base(base_url)}/api/monitor/usage/quota/limit"
@@ -1653,20 +1713,41 @@ def _fetch_glm_zcode_account_usage() -> Optional[dict]:
         payload = response.json() or {}
     if not isinstance(payload, dict):
         return None
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    limits = data.get("limits")
-    windows: list[dict] = []
-    if isinstance(limits, list):
-        for item in limits:
-            row = _glm_usage_window(item)
-            if row:
-                windows.append(row)
-    if not windows:
+    return _glm_snapshot_from_payload(payload)
+
+
+def _glm_hermes_api_key() -> Optional[str]:
+    for name in ("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"):
+        value = _hermes_env_value(name)
+        if value:
+            return value
+    return None
+
+
+def _fetch_glm_zcode_usage() -> Optional[dict]:
+    creds = _zcode_coding_credentials()
+    if not creds:
         return None
-    _peak, peak_text = _glm_peak_status()
-    windows.append(_win("Pricing", None, None, peak_text))
-    plan = _title_case_slug(data.get("level"))
-    return _snapshot("glm", plan, windows)
+    token, base_url = creds
+    return _fetch_glm_quota(token, base_url)
+
+
+def _fetch_glm_hermes_api_key_usage() -> Optional[dict]:
+    token = _glm_hermes_api_key()
+    if not token:
+        return None
+    return _fetch_glm_quota(token, "https://api.z.ai")
+
+
+def _fetch_glm_zcode_account_usage() -> Optional[dict]:
+    # ZCode login first. Hermes Z.AI / GLM Coding Plan key is fallback.
+    try:
+        snap = _fetch_glm_zcode_usage()
+        if snap:
+            return snap
+    except Exception:
+        pass
+    return _fetch_glm_hermes_api_key_usage()
 
 
 def _hermes_homes() -> list[Path]:
