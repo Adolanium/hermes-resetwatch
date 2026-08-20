@@ -73,7 +73,8 @@ both `plugin.js` and `probe.py`.
 - A full `/resetwatch` page in the main workspace
 - Sidebar row (watch icon)
 - Palette command and `mod+alt+r`
-- Live cards, polled every 5 minutes while the page is open (Refresh still fetches now)
+- Live cards, polled every 5 minutes while the page is open. Probe also
+  caches vendor API results for 5 minutes; Refresh bypasses that cache.
 - Fold-up sections that start open
 - Manual clocks stored in plugin-scoped `ctx.storage`
 
@@ -97,9 +98,12 @@ Manual clocks are whatever you typed. They do not refresh themselves.
 Live data goes through the desktop plugin SDK (`host.request` JSON-RPC),
 plus `probe.py` through `shell.exec` when a signed-in CLI or app has
 quota the gateway does not expose. The page does not log into vendor
-sites. `probe.py` only reads vendor credential files (it never refreshes
-OAuth tokens or writes them back). It may write a small cache under
-`$HERMES_HOME/cache/resetwatch`. Tokens never go to stdout.
+sites. `probe.py` does not refresh Claude or Codex credentials. For Kimi
+and Grok it may refresh on 401 and write that vendor's file back (after
+re-reading, so a concurrent CLI refresh wins). It may also write a small
+cache under `$HERMES_HOME/cache/resetwatch`, including a 5-minute probe
+result cache so vendor APIs are not hit more often than that (Refresh
+passes `--fresh` to bypass). Tokens never go to stdout.
 
 ## Contributing
 

@@ -5,9 +5,12 @@ the gateway already ships. If Hermes OAuth is missing, Claude Code and
 Codex CLI logins fill those same cards. Cursor, Kimi, Grok, GLM (ZCode),
 and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins.
 
-Read-only for vendor credentials: the probe never exchanges refresh
-tokens and never writes back to ~/.claude, ~/.codex, ~/.kimi-code, or
-~/.grok. It may write a small cache under $HERMES_HOME/cache/resetwatch.
+Read-only for Claude and Codex credentials: the probe never exchanges
+those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
+refresh on 401 and write back only that vendor's file (re-read first so
+a concurrent CLI refresh wins). It may also write a small cache under
+$HERMES_HOME/cache/resetwatch, including a 5-minute probe result cache
+so vendor APIs are not hit more often than that (pass --fresh to bypass).
 No tokens on stdout.
 
 Vendor usage rows call undocumented private APIs with the same client
@@ -28,6 +31,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+
+# Cap how often probe hits vendor APIs (success or empty). Claude 429 may
+# keep a longer Retry-After on top of this.
+PROBE_MIN_INTERVAL_SECONDS = 5 * 60
 
 HERMES_PROVIDERS = ("openai-codex", "openrouter")
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
@@ -56,10 +63,14 @@ GLM_PEAK_END_HOUR = 18
 
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
+KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_CODE_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_CODE_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
+GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 
 def _utc_now() -> datetime:
@@ -207,6 +218,47 @@ def _write_cache_json(path: Path, payload: Any) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
     except Exception:
         return
+
+
+def _write_secret_json(path: Path, payload: dict) -> None:
+    """Atomic write for Kimi/Grok credential files only."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _probe_result_cache_path(*, cli_only: bool) -> Path:
+    name = "probe_snapshots.cli.json" if cli_only else "probe_snapshots.full.json"
+    return _resetwatch_cache_dir() / name
+
+
+def _read_probe_result_cache(*, cli_only: bool, max_age: float = PROBE_MIN_INTERVAL_SECONDS) -> Optional[list]:
+    payload = _read_json_file(_probe_result_cache_path(cli_only=cli_only))
+    if not isinstance(payload, dict):
+        return None
+    fetched_at = payload.get("fetched_at")
+    snapshots = payload.get("snapshots")
+    if not isinstance(fetched_at, (int, float)) or not isinstance(snapshots, list):
+        return None
+    age = datetime.now(timezone.utc).timestamp() - float(fetched_at)
+    if age < 0 or age > float(max_age):
+        return None
+    return snapshots
+
+
+def _store_probe_result_cache(snapshots: list, *, cli_only: bool) -> None:
+    _write_cache_json(
+        _probe_result_cache_path(cli_only=cli_only),
+        {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            "snapshots": snapshots,
+        },
+    )
 
 
 def _anthropic_ratelimit_remaining() -> float:
@@ -534,12 +586,49 @@ def _kimi_code_read_credentials(path: Path) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
-    """Return the Kimi access token on disk. Never refreshes or writes creds.
+def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
+    refresh = creds.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    import httpx
 
-    Expiry on disk is advisory only: we still try the token and let the
-    usage API reject it. Refresh stays with the Kimi Code CLI.
-    """
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            KIMI_CODE_OAUTH_TOKEN_URL,
+            data={
+                "client_id": KIMI_CODE_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh.strip(),
+            },
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        )
+        if response.status_code >= 400:
+            return None
+        body = response.json() or {}
+    if not isinstance(body, dict):
+        return None
+    access = body.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    updated = dict(creds)
+    updated["access_token"] = access.strip()
+    new_refresh = body.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh.strip():
+        updated["refresh_token"] = new_refresh.strip()
+    expires_in = _to_int(body.get("expires_in")) or 900
+    updated["expires_in"] = expires_in
+    updated["expires_at"] = int(_utc_now().timestamp()) + expires_in
+    token_type = body.get("token_type")
+    if isinstance(token_type, str) and token_type.strip():
+        updated["token_type"] = token_type.strip()
+    scope = body.get("scope")
+    if isinstance(scope, str) and scope.strip():
+        updated["scope"] = scope.strip()
+    return updated
+
+
+def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bool = False) -> Optional[str]:
+    """Return a Kimi access token. Refresh+write only when allow_refresh and disk still has previous."""
     path = _kimi_code_credentials_path()
     if not path:
         return None
@@ -547,12 +636,20 @@ def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
     if not creds:
         return None
     token = creds.get("access_token")
-    if not isinstance(token, str) or not token.strip():
+    token = token.strip() if isinstance(token, str) and token.strip() else None
+    if token and (not previous or token != previous.strip()):
+        return token
+    if not allow_refresh:
         return None
-    token = token.strip()
-    if previous and token == previous.strip():
+    refreshed = _kimi_code_refresh_tokens(creds)
+    if not refreshed:
         return None
-    return token
+    try:
+        _write_secret_json(path, refreshed)
+    except OSError:
+        pass
+    access = refreshed.get("access_token")
+    return access.strip() if isinstance(access, str) and access.strip() else None
 
 
 def infer_kimi_plan_name(payload: Optional[dict] = None) -> Optional[str]:
@@ -650,7 +747,7 @@ def _fetch_kimi_account_usage() -> Optional[dict]:
     with httpx.Client(timeout=15.0) as client:
         response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
         if response.status_code == 401:
-            token = _kimi_code_access_token(previous=token)
+            token = _kimi_code_access_token(previous=token, allow_refresh=True)
             if not token:
                 return None
             headers["Authorization"] = f"Bearer {token}"
@@ -738,24 +835,73 @@ def _grok_read_auth() -> Optional[tuple[Path, str, dict, dict]]:
     return path, chosen_key, payload, chosen
 
 
-def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[str, str]]:
-    """Return Grok access token + user id from disk. Never refreshes or writes.
+def _grok_refresh_entry(entry: dict) -> Optional[dict]:
+    refresh = entry.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    import httpx
 
-    Expiry on disk is advisory only: we still try the token and let the
-    billing API reject it. Refresh stays with the Grok CLI.
-    """
+    client_id = str(entry.get("oidc_client_id") or GROK_OAUTH_CLIENT_ID).strip() or GROK_OAUTH_CLIENT_ID
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            GROK_OAUTH_TOKEN_URL,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            data={
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": refresh.strip(),
+            },
+        )
+        if response.status_code >= 400:
+            return None
+        body = response.json() or {}
+    if not isinstance(body, dict):
+        return None
+    access = body.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    updated = dict(entry)
+    updated["key"] = access.strip()
+    new_refresh = body.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh.strip():
+        updated["refresh_token"] = new_refresh.strip()
+    expires_in = _to_int(body.get("expires_in")) or 21600
+    updated["expires_at"] = (
+        datetime.fromtimestamp(_utc_now().timestamp() + expires_in, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    return updated
+
+
+def _grok_access_context(
+    *, previous: Optional[str] = None, allow_refresh: bool = False
+) -> Optional[tuple[str, str]]:
+    """Return Grok access token + user id. Refresh+write only when allow_refresh and disk still has previous."""
     loaded = _grok_read_auth()
     if not loaded:
         return None
-    _path, _map_key, _payload, entry = loaded
+    path, map_key, payload, entry = loaded
     token = entry.get("key") or entry.get("access_token")
     user_id = str(entry.get("user_id") or entry.get("principal_id") or "").strip()
-    if not isinstance(token, str) or not token.strip() or not user_id:
+    token = token.strip() if isinstance(token, str) and token.strip() else None
+    if token and user_id and (not previous or token != previous.strip()):
+        return token, user_id
+    if not allow_refresh:
         return None
-    token = token.strip()
-    if previous and token == previous.strip():
+    refreshed = _grok_refresh_entry(entry)
+    if not refreshed:
         return None
-    return token, user_id
+    payload[map_key] = refreshed
+    try:
+        _write_secret_json(path, payload)
+    except OSError:
+        pass
+    access = refreshed.get("key")
+    user_id = str(refreshed.get("user_id") or refreshed.get("principal_id") or user_id or "").strip()
+    if isinstance(access, str) and access.strip() and user_id:
+        return access.strip(), user_id
+    return None
 
 
 def _grok_proxy_headers(token: str, user_id: str) -> dict[str, str]:
@@ -817,7 +963,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     with httpx.Client(timeout=15.0) as client:
         response = client.get(billing_url, headers=headers)
         if response.status_code == 401:
-            context = _grok_access_context(previous=token)
+            context = _grok_access_context(previous=token, allow_refresh=True)
             if not context:
                 return None
             token, user_id = context
@@ -1728,6 +1874,12 @@ def _collect_cli() -> list[dict]:
 
 def main() -> int:
     cli_only = "--cli-only" in sys.argv
+    fresh = "--fresh" in sys.argv
+    if not fresh:
+        cached = _read_probe_result_cache(cli_only=cli_only)
+        if cached is not None:
+            json.dump(cached, sys.stdout, ensure_ascii=True)
+            return 0
     snapshots = []
     have = set()
     if not cli_only:
@@ -1743,6 +1895,7 @@ def main() -> int:
             continue
         snapshots.append(snap)
         have.add(key)
+    _store_probe_result_cache(snapshots, cli_only=cli_only)
     json.dump(snapshots, sys.stdout, ensure_ascii=True)
     return 0
 

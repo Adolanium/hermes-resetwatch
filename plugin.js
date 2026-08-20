@@ -409,7 +409,13 @@ async function probeStockAccountUsage(opts) {
     const home = hermesHomeFromConfig(shown)
     if (!home) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
     const probe = `${home}/desktop-plugins/resetwatch/probe.py`
-    const flags = opts && opts.cliOnly ? ' --cli-only' : ''
+    const flags = [
+      opts && opts.cliOnly ? '--cli-only' : '',
+      opts && opts.fresh ? '--fresh' : ''
+    ]
+      .filter(Boolean)
+      .map(flag => ` ${flag}`)
+      .join('')
     const failures = []
     for (const python of probePythonCandidates(home)) {
       try {
@@ -418,7 +424,7 @@ async function probeStockAccountUsage(opts) {
         })
         if (!result || result.code) {
           const err = result && result.stderr ? String(result.stderr).trim() : ''
-          failures.push(err || `probe exit ${result && result.code}`)
+          failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
           continue
         }
         const text = String(result.stdout || '').trim()
@@ -446,10 +452,11 @@ function go(route) {
   if (typeof host.navigate === 'function') host.navigate(route)
 }
 
-async function fetchLiveCards(sessionId) {
+async function fetchLiveCards(sessionId, opts) {
   const cards = []
   const errors = []
   const sid = sessionId || readSessionId()
+  const fresh = !!(opts && opts.fresh)
   let haveAccountRpc = false
 
   try {
@@ -484,7 +491,7 @@ async function fetchLiveCards(sessionId) {
     }
   }
 
-  const probeResult = await probeStockAccountUsage({ cliOnly: haveAccountRpc })
+  const probeResult = await probeStockAccountUsage({ cliOnly: haveAccountRpc, fresh })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -853,11 +860,11 @@ function useLiveCardsPolled(gateway, sessionId) {
   const [isFetching, setFetching] = useState(false)
   const genRef = useRef(0)
 
-  const load = () => {
+  const load = (opts) => {
     if (gateway !== 'open') return
     const gen = ++genRef.current
     setFetching(true)
-    fetchLiveCards(sid)
+    fetchLiveCards(sid, opts)
       .then(next => {
         if (gen !== genRef.current) return
         setData(next)
@@ -879,25 +886,41 @@ function useLiveCardsPolled(gateway, sessionId) {
 
   useEffect(() => {
     load()
-    const id = setInterval(load, POLL_MS)
+    const id = setInterval(() => load(), POLL_MS)
     return () => {
       genRef.current += 1
       clearInterval(id)
     }
   }, [gateway, sid])
 
-  return { data, isFetching, refetch: load }
+  return { data, isFetching, refetch: () => load({ fresh: true }) }
 }
 
 function useLiveCardsQuery(gateway, sessionId) {
   const sid = sessionId || ''
-  return useQuery({
+  const query = useQuery({
     queryKey: [PLUGIN_ID, 'live', sid],
     queryFn: () => fetchLiveCards(sid),
     enabled: gateway === 'open',
     refetchInterval: POLL_MS,
     retry: false
   })
+  const refetch = () => {
+    if (!queryClient || typeof queryClient.fetchQuery !== 'function') {
+      return query.refetch && query.refetch()
+    }
+    return queryClient
+      .fetchQuery({
+        queryKey: [PLUGIN_ID, 'live', sid, 'fresh'],
+        queryFn: () => fetchLiveCards(sid, { fresh: true }),
+        staleTime: 0
+      })
+      .then(data => {
+        queryClient.setQueryData([PLUGIN_ID, 'live', sid], data)
+        return data
+      })
+  }
+  return { data: query.data, isFetching: query.isFetching, refetch }
 }
 
 const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled
