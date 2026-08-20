@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.0'
+const VERSION = '0.2.1'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -125,6 +125,7 @@ function formatReset(resetAt, resetText, nowMs) {
   })
   if (delta <= 0) return `Reset now · ${local}`
   const minutes = Math.round(delta / 60000)
+  if (minutes < 1) return `Reset now · ${local}`
   if (minutes < 60) return `Resets in ${minutes}m · ${local}`
   const hours = Math.floor(minutes / 60)
   const rem = minutes % 60
@@ -155,7 +156,7 @@ function providerKey(name) {
   const key = String(name || '').trim().toLowerCase()
   if (key === 'kimi-coding') return 'kimi'
   if (key === 'xai-oauth' || key === 'xai') return 'grok'
-  if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'zai-coding-plan') return 'glm'
+  if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'glm-coding' || key === 'zai-coding-plan') return 'glm'
   if (key === 'deep-seek') return 'deepseek'
   if (key === 'opencode_go' || key === 'opencode-go-sub' || key === 'go') return 'opencode-go'
   if (key === 'ollama-cloud' || key === 'ollama_cloud') return 'ollama'
@@ -1038,7 +1039,9 @@ function Page() {
                 children: `gateway ${gateway || 'idle'}`
               }),
               jsx(SmallButton, {
+                disabled: !!live.isFetching,
                 onClick: () => {
+                  if (live.isFetching) return
                   tap()
                   if (live.refetch) live.refetch()
                   else if (queryClient) queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'live'] })

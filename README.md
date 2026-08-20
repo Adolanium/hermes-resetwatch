@@ -115,10 +115,12 @@ plus `probe.py` through `shell.exec` when a signed-in CLI or app has
 quota the gateway does not expose. The page does not log into vendor
 sites. `probe.py` does not refresh Claude or Codex credentials. For Kimi
 and Grok it may refresh on 401 and write that vendor's file back (after
-re-reading, so a concurrent CLI refresh wins). It may also write a small
+re-reading so a concurrent CLI refresh wins; Grok merges into a freshly
+read `auth.json`). It may also write a small
 cache under `$HERMES_HOME/cache/resetwatch`, including a 5-minute probe
 result cache so vendor APIs are not hit more often than that (Refresh
-passes `--fresh` to bypass). Tokens never go to stdout.
+passes `--fresh` to bypass). Vendor fetches run in parallel with a time
+budget so one slow API cannot wipe every card. Tokens never go to stdout.
 
 ## Contributing
 

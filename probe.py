@@ -13,11 +13,13 @@ use Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
-refresh on 401 and write back only that vendor's file (re-read first so
-a concurrent CLI refresh wins). It may also write a small cache under
+refresh on 401 and write back only that vendor's file. Before writing,
+the probe re-reads the file so a concurrent CLI refresh wins (Grok merges
+into a freshly read auth.json). It may also write a small cache under
 $HERMES_HOME/cache/resetwatch, including a 5-minute probe result cache
 so vendor APIs are not hit more often than that (pass --fresh to bypass).
-No tokens on stdout.
+Vendor fetchers run in parallel with a hard time budget. No tokens on
+stdout.
 
 Vendor usage rows call undocumented private APIs with the same client
 identity those CLIs use (Claude Code, Codex, Grok CLI). Those rows are
@@ -33,6 +35,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +46,13 @@ from typing import Any, Optional
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
 # keep a longer Retry-After on top of this.
 PROBE_MIN_INTERVAL_SECONDS = 5 * 60
+# Hard ceiling for all vendor fetchers combined (parallel).
+PROBE_TOTAL_BUDGET_SECONDS = 45
+# Anthropic usage cache: short when falling back without a live token,
+# longer while a 429 Retry-After marker is active.
+ANTHROPIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS = 15 * 60
+MINIMAX_HTTP_TIMEOUT = 5.0
 
 HERMES_PROVIDERS = ("openai-codex", "openrouter")
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
@@ -117,13 +129,24 @@ def _title_case_slug(value: Optional[str]) -> Optional[str]:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    if value in {None, ""}:
+    if value is None:
+        return None
+    if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         stamp = float(value)
-        if stamp > 1e12:
-            stamp /= 1000.0
-        return datetime.fromtimestamp(stamp, tz=timezone.utc)
+        if not math.isfinite(stamp):
+            return None
+        # Heuristic: large values are epoch ms (or us after one divide).
+        for _ in range(2):
+            if stamp > 1e12:
+                stamp /= 1000.0
+            else:
+                break
+        try:
+            return datetime.fromtimestamp(stamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -215,16 +238,19 @@ def _is_claude_oauth_token(token: str) -> bool:
 
 
 def _resetwatch_cache_dir() -> Path:
+    """Return a writable cache dir. Never raises; cache is best-effort only."""
+    candidates: list[Path] = []
     for home in _hermes_homes():
-        path = home / "cache" / "resetwatch"
+        candidates.append(home / "cache" / "resetwatch")
+    candidates.append(Path.home() / ".hermes" / "cache" / "resetwatch")
+    candidates.append(Path(tempfile.gettempdir()) / "hermes-resetwatch-cache")
+    for path in candidates:
         try:
             path.mkdir(parents=True, exist_ok=True)
             return path
         except Exception:
             continue
-    fallback = Path.home() / ".hermes" / "cache" / "resetwatch"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    return Path(tempfile.gettempdir()) / "hermes-resetwatch-cache"
 
 
 def _anthropic_cache_path() -> Path:
@@ -244,16 +270,25 @@ def _read_json_file(path: Path) -> Optional[Any]:
 
 
 def _write_cache_json(path: Path, payload: Any) -> None:
-    """Best-effort cache write. Never used for vendor credential files."""
+    """Atomic best-effort cache write. Never used for vendor credential files."""
+    tmp: Optional[Path] = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        os.replace(tmp, path)
+        tmp = None
     except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
         return
 
 
 def _write_secret_json(path: Path, payload: dict) -> None:
-    """Atomic write for Kimi/Grok credential files only."""
+    """Atomic write for Kimi/Grok credential files only. Never Claude/Codex."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -318,19 +353,56 @@ def _clear_anthropic_ratelimit() -> None:
         return
 
 
-def _cached_anthropic_snapshot() -> Optional[dict]:
+def _cached_anthropic_snapshot(*, max_age: Optional[float] = None) -> Optional[dict]:
     payload = _read_json_file(_anthropic_cache_path())
     if not isinstance(payload, dict) or _provider_key(payload.get("provider")) != "anthropic":
         return None
     if not (payload.get("windows") or payload.get("details")):
         return None
-    return payload
+    fetched_at = payload.get("fetched_at")
+    if max_age is None:
+        if _anthropic_ratelimit_remaining() > 0:
+            max_age = float(ANTHROPIC_CACHE_MAX_AGE_SECONDS)
+        else:
+            max_age = float(ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
+    if isinstance(fetched_at, (int, float)) and math.isfinite(fetched_at):
+        age = datetime.now(timezone.utc).timestamp() - float(fetched_at)
+        if age < 0 or age > float(max_age):
+            return None
+    elif max_age < float(ANTHROPIC_CACHE_MAX_AGE_SECONDS):
+        # Old cache files without fetched_at: only reuse under rate-limit.
+        return None
+    out = {
+        "provider": payload.get("provider"),
+        "plan": payload.get("plan"),
+        "details": list(payload.get("details") or []),
+        "windows": list(payload.get("windows") or []),
+    }
+    if isinstance(fetched_at, (int, float)) and math.isfinite(fetched_at):
+        try:
+            stamp = datetime.fromtimestamp(float(fetched_at), tz=timezone.utc).astimezone()
+            as_of = stamp.strftime("%b %d, %I:%M %p").lstrip("0")
+            details = list(out["details"])
+            note = f"Cached as of {as_of}"
+            if note not in details:
+                details.append(note)
+            out["details"] = details
+        except (OverflowError, OSError, ValueError):
+            pass
+    return out
 
 
 def _store_anthropic_snapshot(snap: dict) -> None:
     if not isinstance(snap, dict):
         return
-    _write_cache_json(_anthropic_cache_path(), snap)
+    payload = {
+        "provider": snap.get("provider"),
+        "plan": snap.get("plan"),
+        "details": list(snap.get("details") or []),
+        "windows": list(snap.get("windows") or []),
+        "fetched_at": datetime.now(timezone.utc).timestamp(),
+    }
+    _write_cache_json(_anthropic_cache_path(), payload)
 
 
 def _hermes_anthropic_oauth_token() -> Optional[str]:
@@ -660,7 +732,11 @@ def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
 
 
 def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bool = False) -> Optional[str]:
-    """Return a Kimi access token. Refresh+write only when allow_refresh and disk still has previous."""
+    """Return a Kimi access token. Refresh+write only when allow_refresh.
+
+    Re-reads the credential file immediately before write so a concurrent
+    Kimi Code CLI refresh wins. Never touches Claude/Codex files.
+    """
     path = _kimi_code_credentials_path()
     if not path:
         return None
@@ -676,6 +752,14 @@ def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bo
     refreshed = _kimi_code_refresh_tokens(creds)
     if not refreshed:
         return None
+    # TOCTOU: CLI may have refreshed while we were on the wire.
+    current = _kimi_code_read_credentials(path)
+    current_token = None
+    if isinstance(current, dict):
+        raw = current.get("access_token")
+        current_token = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    if previous and current_token and current_token != previous.strip():
+        return current_token
     try:
         _write_secret_json(path, refreshed)
     except OSError:
@@ -951,7 +1035,12 @@ def _grok_refresh_entry(entry: dict) -> Optional[dict]:
 def _grok_access_context(
     *, previous: Optional[str] = None, allow_refresh: bool = False
 ) -> Optional[tuple[str, str]]:
-    """Return Grok access token + user id. Refresh+write only when allow_refresh and disk still has previous."""
+    """Return Grok access token + user id. Refresh+write only when allow_refresh.
+
+    Re-reads auth.json immediately before write and merges into that fresh
+    payload so concurrent Grok CLI changes to other keys are not reverted.
+    Never touches Claude/Codex files.
+    """
     loaded = _grok_read_auth()
     if not loaded:
         return None
@@ -966,13 +1055,27 @@ def _grok_access_context(
     refreshed = _grok_refresh_entry(entry)
     if not refreshed:
         return None
-    payload[map_key] = refreshed
+    # TOCTOU: re-read full map; abort write if this entry's token changed.
+    reloaded = _grok_read_auth()
+    if not reloaded:
+        return None
+    path2, map_key2, payload2, entry2 = reloaded
+    if path2 != path:
+        return None
+    disk_token = entry2.get("key") or entry2.get("access_token")
+    disk_token = disk_token.strip() if isinstance(disk_token, str) and disk_token.strip() else None
+    disk_user = str(entry2.get("user_id") or entry2.get("principal_id") or user_id or "").strip()
+    if previous and disk_token and disk_token != previous.strip():
+        if disk_user:
+            return disk_token, disk_user
+        return None
+    payload2[map_key2] = refreshed
     try:
-        _write_secret_json(path, payload)
+        _write_secret_json(path2, payload2)
     except OSError:
         pass
     access = refreshed.get("key")
-    user_id = str(refreshed.get("user_id") or refreshed.get("principal_id") or user_id or "").strip()
+    user_id = str(refreshed.get("user_id") or refreshed.get("principal_id") or disk_user or "").strip()
     if isinstance(access, str) and access.strip() and user_id:
         return access.strip(), user_id
     return None
@@ -1271,6 +1374,11 @@ def _claude_token_valid(creds: dict) -> bool:
         expires_ms = float(expires_at)
     except (TypeError, ValueError):
         return True
+    if not math.isfinite(expires_ms):
+        return True
+    # Claude Code usually stores ms; normalize seconds-era values.
+    if expires_ms > 0 and expires_ms < 1e12:
+        expires_ms *= 1000.0
     now_ms = _utc_now().timestamp() * 1000
     return now_ms < (expires_ms - 60_000)
 
@@ -1348,7 +1456,7 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
 
     token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
     if not token:
-        return _cached_anthropic_snapshot()
+        return _cached_anthropic_snapshot(max_age=ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
 
     import httpx
 
@@ -1797,18 +1905,29 @@ def _read_env_file_value(path: Path, name: str) -> Optional[str]:
             text = path.read_text(encoding="latin-1")
         except OSError:
             return None
-    prefix = f"{name}="
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[7:].strip()
-        if not line.startswith(prefix):
+        if "=" not in line:
             continue
-        value = line[len(prefix) :].strip()
+        key, _, value = line.partition("=")
+        if key.strip() != name:
+            continue
+        value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
+        else:
+            # Strip unquoted inline comments: KEY=value # note
+            cut = None
+            for index, char in enumerate(value):
+                if char == "#" and (index == 0 or value[index - 1].isspace()):
+                    cut = index
+                    break
+            if cut is not None:
+                value = value[:cut].rstrip()
         return value.strip() or None
     return None
 
@@ -2070,7 +2189,10 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
     activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
     cost = activity.get("cost") if isinstance(activity, dict) else None
     if isinstance(cost, str) and cost.strip():
-        windows.append(_win("Activity", None, None, f"${cost.strip()} last 4 weeks"))
+        text = cost.strip()
+        if text[:1].isdigit():
+            text = f"${text}"
+        windows.append(_win("Activity", None, None, f"{text} last 4 weeks"))
     elif isinstance(cost, (int, float)) and math.isfinite(cost):
         windows.append(_win("Activity", None, None, f"${float(cost):.5f} last 4 weeks"))
     if not windows:
@@ -2079,14 +2201,6 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
 
 
 def _parse_epoch_ms(value: Any) -> Optional[datetime]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)) and math.isfinite(value):
-        n = float(value)
-        if n > 1e12:
-            return datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
-        if n > 1e9:
-            return datetime.fromtimestamp(n, tz=timezone.utc)
     return _parse_dt(value)
 
 
@@ -2094,7 +2208,7 @@ def _minimax_api_key() -> Optional[str]:
     return _hermes_env_value("MINIMAX_API_KEY") or _hermes_env_value("MINIMAX_CN_API_KEY")
 
 
-def _minimax_remaining_percent(item: dict, *keys: str) -> Optional[float]:
+def _minimax_percent(item: dict, *keys: str) -> Optional[float]:
     for key in keys:
         value = item.get(key)
         if isinstance(value, bool):
@@ -2106,6 +2220,10 @@ def _minimax_remaining_percent(item: dict, *keys: str) -> Optional[float]:
             if 0.0 <= n <= 100.0:
                 return n
     return None
+
+
+def _minimax_remaining_percent(item: dict, *keys: str) -> Optional[float]:
+    return _minimax_percent(item, *keys)
 
 
 def _minimax_used_from_counts(item: dict, remaining_key: str, total_key: str) -> Optional[float]:
@@ -2155,7 +2273,7 @@ def _fetch_minimax_account_usage() -> Optional[dict]:
         "User-Agent": USER_AGENT,
     }
     payload = None
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=MINIMAX_HTTP_TIMEOUT) as client:
         for url in _minimax_token_plan_urls():
             try:
                 response = client.get(url, headers=headers)
@@ -2184,20 +2302,23 @@ def _fetch_minimax_account_usage() -> Optional[dict]:
     if not item:
         return None
     windows: list[dict] = []
+    # *_remaining_percent fields are remaining. usage_percent is used (field name).
     interval_left = _minimax_remaining_percent(
         item,
         "current_interval_remaining_percent",
         "currentIntervalRemainingPercent",
-        "usage_percent",
-        "usagePercent",
     )
     interval_used = None
     if interval_left is not None:
         interval_used = max(0.0, min(100.0, 100.0 - interval_left))
     else:
-        interval_used = _minimax_used_from_counts(
-            item, "current_interval_usage_count", "current_interval_total_count"
-        )
+        usage_pct = _minimax_percent(item, "usage_percent", "usagePercent")
+        if usage_pct is not None:
+            interval_used = usage_pct
+        else:
+            interval_used = _minimax_used_from_counts(
+                item, "current_interval_usage_count", "current_interval_total_count"
+            )
     if interval_used is not None:
         windows.append(
             _win("5h", interval_used, _parse_epoch_ms(item.get("end_time") or item.get("endTime")))
@@ -2211,9 +2332,13 @@ def _fetch_minimax_account_usage() -> Optional[dict]:
     if weekly_left is not None:
         weekly_used = max(0.0, min(100.0, 100.0 - weekly_left))
     else:
-        weekly_used = _minimax_used_from_counts(
-            item, "current_weekly_usage_count", "current_weekly_total_count"
-        )
+        weekly_usage = _minimax_percent(item, "weekly_usage_percent", "weeklyUsagePercent")
+        if weekly_usage is not None:
+            weekly_used = weekly_usage
+        else:
+            weekly_used = _minimax_used_from_counts(
+                item, "current_weekly_usage_count", "current_weekly_total_count"
+            )
     if weekly_used is not None:
         windows.append(
             _win(
@@ -2409,8 +2534,7 @@ def _collect_hermes() -> list[dict]:
 
 
 def _collect_cli() -> list[dict]:
-    snapshots = []
-    for fetch in (
+    fetchers = (
         _fetch_claude_cli_account_usage,
         _fetch_codex_cli_account_usage,
         _fetch_cursor_account_usage,
@@ -2424,13 +2548,24 @@ def _collect_cli() -> list[dict]:
         _fetch_novita_account_usage,
         _fetch_deepinfra_account_usage,
         _fetch_ai_gateway_account_usage,
-    ):
+    )
+    snapshots: list[dict] = []
+    # Providers touch disjoint files/endpoints; run in parallel with a hard budget
+    # so one hung vendor cannot wipe every probe-sourced card.
+    with ThreadPoolExecutor(max_workers=min(8, len(fetchers))) as pool:
+        futures = [pool.submit(fetch) for fetch in fetchers]
         try:
-            snap = fetch()
-        except Exception:
-            continue
-        if snap and (snap.get("windows") or snap.get("details")):
-            snapshots.append(snap)
+            for fut in as_completed(futures, timeout=PROBE_TOTAL_BUDGET_SECONDS):
+                try:
+                    snap = fut.result(timeout=0.5)
+                except Exception:
+                    continue
+                if snap and (snap.get("windows") or snap.get("details")):
+                    snapshots.append(snap)
+        except FuturesTimeout:
+            pass
+        for fut in futures:
+            fut.cancel()
     return snapshots
 
 
