@@ -5,8 +5,9 @@ the gateway already ships. If Hermes OAuth is missing, Claude Code and
 Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
 (ZCode) come from those logins. When CLI login is missing, Kimi Coding
 (KIMI_CODING_API_KEY / KIMI_API_KEY) and GLM (ZAI_API_KEY / GLM_API_KEY)
-fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY) and OpenCode Go
-(OPENCODE_GO_API_KEY) always use Hermes env.
+fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
+(OPENCODE_GO_API_KEY), and Ollama Cloud (OLLAMA_API_KEY) always use
+Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
@@ -55,6 +56,9 @@ DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEEPSEEK_PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
 
 OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+OLLAMA_CLOUD_USAGE_URL = "https://ollama.com/api/usage"
+OLLAMA_CLOUD_ME_URL = "https://ollama.com/api/me"
 
 # Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
 # Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
@@ -176,6 +180,8 @@ def _provider_key(name: Any) -> str:
         return "deepseek"
     if key in {"opencode_go", "opencode-go-sub", "go"}:
         return "opencode-go"
+    if key in {"ollama-cloud", "ollama_cloud"}:
+        return "ollama"
     return key
 
 
@@ -1977,6 +1983,91 @@ def _fetch_opencode_go_account_usage() -> Optional[dict]:
     return _snapshot("opencode-go", "Go", windows)
 
 
+def _ollama_api_key() -> Optional[str]:
+    return _hermes_env_value("OLLAMA_API_KEY")
+
+
+def _ollama_used_percent(value: Any) -> Optional[float]:
+    """Ollama Cloud limits.usage is a 0-1 fraction; accept 0-100 too."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        n = float(value)
+        if 0.0 <= n <= 1.0:
+            return max(0.0, min(100.0, n * 100.0))
+        if 0.0 <= n <= 100.0:
+            return max(0.0, min(100.0, n))
+    return None
+
+
+def _ollama_plan_name(payload: Optional[dict]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("Plan", "plan"):
+        plan = payload.get(key)
+        if isinstance(plan, str) and plan.strip():
+            return _title_case_slug(plan.strip()) or plan.strip()
+    return None
+
+
+def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
+    """Ollama Cloud session/weekly from GET /api/usage (Hermes OLLAMA_API_KEY).
+
+    Undocumented private endpoint the web settings page uses. Best-effort;
+    no reset timestamps in the payload (session ~5h, weekly ~7d on pricing).
+    """
+    token = _ollama_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    plan = None
+    with httpx.Client(timeout=15.0) as client:
+        me = client.post(
+            OLLAMA_CLOUD_ME_URL,
+            headers={**headers, "Content-Type": "application/json"},
+            json={},
+        )
+        if me.status_code == 200:
+            try:
+                body = me.json()
+            except Exception:
+                body = None
+            plan = _ollama_plan_name(body if isinstance(body, dict) else None)
+        response = client.get(OLLAMA_CLOUD_USAGE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    windows: list[dict] = []
+    for key, label, hint in (
+        ("session", "5h", "resets about every 5h"),
+        ("weekly", "Weekly", "resets about every 7 days"),
+    ):
+        item = limits.get(key) if isinstance(limits, dict) else None
+        if not isinstance(item, dict):
+            continue
+        used = _ollama_used_percent(item.get("usage"))
+        if used is None:
+            continue
+        windows.append(_win(label, used, None, hint))
+    activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
+    cost = activity.get("cost") if isinstance(activity, dict) else None
+    if isinstance(cost, str) and cost.strip():
+        windows.append(_win("Activity", None, None, f"${cost.strip()} last 4 weeks"))
+    elif isinstance(cost, (int, float)) and math.isfinite(cost):
+        windows.append(_win("Activity", None, None, f"${float(cost):.5f} last 4 weeks"))
+    if not windows:
+        return None
+    return _snapshot("ollama", plan, windows)
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -2012,6 +2103,7 @@ def _collect_cli() -> list[dict]:
         _fetch_glm_zcode_account_usage,
         _fetch_deepseek_account_usage,
         _fetch_opencode_go_account_usage,
+        _fetch_ollama_cloud_account_usage,
     ):
         try:
             snap = fetch()

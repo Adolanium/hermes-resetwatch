@@ -48,6 +48,7 @@ Live cards fill on their own when that login is already on the machine:
 - **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
 - **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak)
 - **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
+- **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
 
 Gemini, Perplexity, and anything else can be a manual clock. Type the percent
 left and the reset time.
@@ -66,8 +67,8 @@ appear, run "Reload desktop plugins" from the palette.
 Live rows work on stock Hermes. `probe.py` asks the gateway Python for
 Claude, Codex, and OpenRouter. If Hermes OAuth is missing, it reads the
 Claude Code and Codex CLIs instead. Cursor, Kimi, Grok, GLM, DeepSeek,
-and OpenCode Go come from those apps' own CLI, desktop logins, or Hermes
-API keys. Copy both `plugin.js` and `probe.py`.
+OpenCode Go, and Ollama Cloud come from those apps' own CLI, desktop
+logins, or Hermes API keys. Copy both `plugin.js` and `probe.py`.
 
 ## What's inside
 
@@ -91,10 +92,11 @@ Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), Grok
 CLI (`~/.grok`), and GLM via ZCode (`~/.zcode`) come from those logins
 first. If Kimi or GLM CLI login is missing, Hermes env keys fill the same
 cards: `KIMI_CODING_API_KEY` or `KIMI_API_KEY` (Coding Plan), and
-`ZAI_API_KEY` or `GLM_API_KEY`. DeepSeek and OpenCode Go use
-`DEEPSEEK_API_KEY` / `OPENCODE_GO_API_KEY` from Hermes env (process env
-or `$HERMES_HOME/.env` on Windows and Mac). Older `/usage` output is
-still parsed when a session is focused, as a last fallback.
+`ZAI_API_KEY` or `GLM_API_KEY`. DeepSeek, OpenCode Go, and Ollama Cloud
+use `DEEPSEEK_API_KEY` / `OPENCODE_GO_API_KEY` / `OLLAMA_API_KEY` from
+Hermes env (process env or `$HERMES_HOME/.env` on Windows and Mac).
+Older `/usage` output is still parsed when a session is focused, as a
+last fallback.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
 
