@@ -17,7 +17,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 const POLL_MS = 30000
 
 const host = sdk.host
@@ -331,7 +331,7 @@ function cardsFromAccountSnapshots(snapshots) {
         source: 'live',
         provider,
         label: window.label,
-        remaining: clampPercent(window.remaining_percent),
+        remaining: clampPercent(window.remaining_percent) ?? remainingFromUsed(window.used_percent),
         used: clampPercent(window.used_percent),
         resetAt: window.reset_at || null,
         resetText: '',
@@ -359,6 +359,58 @@ function readSessionId() {
   const focused = host.state.focusedSessionId
   const active = host.state.activeSessionId
   return (focused && focused.get && focused.get()) || (active && active.get && active.get()) || ''
+}
+
+function hermesHomeFromConfig(payload) {
+  const sections = (payload && payload.sections) || []
+  for (const section of sections) {
+    for (const row of section.rows || []) {
+      if (row && row[0] === 'Config File' && row[1]) {
+        return String(row[1]).replace(/[\\/]+config\.yaml$/i, '')
+      }
+    }
+  }
+  return ''
+}
+
+function quoteShell(path) {
+  return `"${String(path).replace(/"/g, '\\"')}"`
+}
+
+function probePythonCandidates(home) {
+  const root = String(home || '').replace(/[\\/]+$/, '')
+  return [
+    `${root}/hermes-agent/.venv/bin/python`,
+    `${root}/hermes-agent/venv/bin/python`,
+    `${root}/hermes-agent/.venv/Scripts/python.exe`,
+    `${root}/hermes-agent/venv/Scripts/python.exe`
+  ]
+}
+
+async function probeStockAccountUsage() {
+  try {
+    const shown = await host.request('config.show', {})
+    const home = hermesHomeFromConfig(shown)
+    if (!home) return null
+    const probe = `${home}/desktop-plugins/resetwatch/probe.py`
+    for (const python of probePythonCandidates(home)) {
+      try {
+        const result = await host.request('shell.exec', {
+          command: `${quoteShell(python)} ${quoteShell(probe)}`
+        })
+        if (!result || result.code) continue
+        const text = String(result.stdout || '').trim()
+        if (!text.startsWith('[')) continue
+        const parsed = JSON.parse(text)
+        if (Array.isArray(parsed)) return parsed
+      } catch {
+        continue
+      }
+    }
+  } catch {
+    return null
+  }
+  return null
 }
 
 function go(route) {
@@ -396,6 +448,11 @@ async function fetchLiveCards(sessionId) {
     if (!/unknown method|not found|-32601/i.test(message)) {
       errors.push(message || 'Could not read signed-in account limits')
     }
+  }
+
+  if (!haveAccountRpc) {
+    const probed = await probeStockAccountUsage()
+    if (probed && probed.length) cards.push(...cardsFromAccountSnapshots(probed))
   }
 
   if (!haveAccountRpc && sid) {

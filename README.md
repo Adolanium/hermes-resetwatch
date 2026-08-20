@@ -33,14 +33,15 @@ the same usage calls those apps already make for you.
 
 ## Install
 
-Copy `plugin.js` to `$HERMES_HOME/desktop-plugins/resetwatch/plugin.js`
+Copy `plugin.js` and `probe.py` to `$HERMES_HOME/desktop-plugins/resetwatch/`
 (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` on Mac). The desktop
 picks it up within seconds and hot-reloads on every save. If it does not
 appear, run "Reload desktop plugins" from the palette.
 
-Cursor and Kimi live rows need a gateway that already has `account.usage`
-for those CLIs. If those sections are empty, restart the gateway after that
-update.
+Claude, Codex, and OpenRouter live rows work on stock Hermes. `probe.py`
+asks the gateway Python for those accounts when the newer `account.usage`
+RPC is missing. Cursor and Kimi still need a gateway that already has
+`account.usage` for those CLIs.
 
 ## What's inside
 
@@ -54,13 +55,13 @@ update.
 ## Where the numbers come from
 
 Nous dollars and renewal time come from the gateway (`usage.bars`, then
-`subscription.state` if needed). Claude, Codex, OpenRouter, Cursor, and Kimi
-come from `account.usage`. No focused chat required.
+`subscription.state` if needed). If the gateway has `account.usage`, Claude,
+Codex, OpenRouter, Cursor, and Kimi come from that RPC. On stock Hermes,
+`probe.py` calls the same Claude / Codex / OpenRouter fetchers through
+`shell.exec`, so those cards still fill with no chat open.
 
-Cursor uses the same DashboardService period-usage call the official CLI
-uses, from the Cursor CLI or app login on this machine. Kimi uses the
-official Kimi Code CLI login against `/coding/v1/usages`. Older gateways
-without `account.usage` fall back to `/usage` on the focused session.
+Cursor and Kimi are not in stock Hermes yet. Older `/usage` output is still
+parsed when a session is focused, as a last fallback.
 
 Grok is not a live row. A Grok CLI login does not add a section. Add it as
 a manual clock.
