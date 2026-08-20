@@ -1,4 +1,4 @@
-"""Stock Hermes usage probe for Resetwatch.
+﻿"""Stock Hermes usage probe for Resetwatch.
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
@@ -14,10 +14,13 @@ use Hermes env.
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
 refresh on 401 and write back only that vendor's file. Before writing,
-the probe re-reads the file so a concurrent CLI refresh wins (Grok merges
-into a freshly read auth.json). It may also write a small cache under
-$HERMES_HOME/cache/resetwatch, including a 5-minute probe result cache
-so vendor APIs are not hit more often than that (pass --fresh to bypass).
+the probe re-reads the file and merges token fields into that fresh
+record so concurrent CLI edits to other keys are not reverted. That is
+file-level protection only; it cannot make a shared refresh-token
+exchange protocol-safe if the CLI refreshes in the same window. It may
+also write a small cache under $HERMES_HOME/cache/resetwatch, including
+a 5-minute probe result cache so vendor APIs are not hit more often than
+that (pass --fresh to bypass). Incomplete timed-out runs are not cached.
 Vendor fetchers run in parallel with a hard time budget. No tokens on
 stdout.
 
@@ -29,6 +32,9 @@ best-effort and can break when a vendor changes its API.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
+import contextlib
+import io
 import json
 import math
 import os
@@ -36,8 +42,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from concurrent.futures import TimeoutError as FuturesTimeout
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -46,8 +52,11 @@ from typing import Any, Optional
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
 # keep a longer Retry-After on top of this.
 PROBE_MIN_INTERVAL_SECONDS = 5 * 60
-# Hard ceiling for all vendor fetchers combined (parallel).
+# Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
+# need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
+HTTP_TIMEOUT = 8.0
+CURSOR_CLI_TIMEOUT = 8
 # Anthropic usage cache: short when falling back without a live token,
 # longer while a 429 Retry-After marker is active.
 ANTHROPIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -511,7 +520,7 @@ def _cursor_cli_json(args: list[str]) -> Optional[dict]:
             [exe, *args],
             capture_output=True,
             text=True,
-            timeout=12,
+            timeout=CURSOR_CLI_TIMEOUT,
             check=False,
         )
     except Exception:
@@ -523,12 +532,47 @@ def _cursor_cli_json(args: list[str]) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
+def _cursor_plan_cache_path() -> Path:
+    return _resetwatch_cache_dir() / "cursor_plan.json"
+
+
+def _cursor_cached_plan_name(*, max_age: float = 7 * 24 * 60 * 60) -> Optional[str]:
+    payload = _read_json_file(_cursor_plan_cache_path())
+    if not isinstance(payload, dict):
+        return None
+    plan = payload.get("plan")
+    fetched_at = payload.get("fetched_at")
+    if not isinstance(plan, str) or not plan.strip():
+        return None
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    age = time.time() - float(fetched_at)
+    if age < 0 or age > float(max_age):
+        return None
+    return plan.strip()
+
+
+def _store_cursor_plan_name(plan: str) -> None:
+    text = str(plan or "").strip()
+    if not text:
+        return
+    _write_cache_json(
+        _cursor_plan_cache_path(),
+        {"plan": text, "fetched_at": time.time()},
+    )
+
+
 def _cursor_cli_plan_name() -> Optional[str]:
+    cached = _cursor_cached_plan_name()
+    if cached:
+        return cached
     about = _cursor_cli_json(["about", "--format", "json"])
     if not about:
         return None
     plan = about.get("subscriptionTier")
     text = str(plan or "").strip()
+    if text:
+        _store_cursor_plan_name(text)
     return text or None
 
 
@@ -630,7 +674,7 @@ def _fetch_cursor_account_usage() -> Optional[dict]:
         "Connect-Protocol-Version": "1",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.post(CURSOR_PERIOD_USAGE_URL, headers=headers, json={})
         response.raise_for_status()
         payload = response.json() or {}
@@ -696,7 +740,7 @@ def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
         return None
     import httpx
 
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.post(
             KIMI_CODE_OAUTH_TOKEN_URL,
             data={
@@ -734,8 +778,10 @@ def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
 def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bool = False) -> Optional[str]:
     """Return a Kimi access token. Refresh+write only when allow_refresh.
 
-    Re-reads the credential file immediately before write so a concurrent
-    Kimi Code CLI refresh wins. Never touches Claude/Codex files.
+    Re-reads the credential file before write and merges token fields into
+    that fresh record so concurrent CLI edits to other keys are kept. This
+    is file-level protection only, not a protocol-safe lock against a
+    simultaneous CLI refresh. Never touches Claude/Codex files.
     """
     path = _kimi_code_credentials_path()
     if not path:
@@ -760,11 +806,15 @@ def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bo
         current_token = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if previous and current_token and current_token != previous.strip():
         return current_token
+    merged = dict(current) if isinstance(current, dict) else {}
+    for key in ("access_token", "refresh_token", "expires_in", "expires_at", "token_type", "scope"):
+        if key in refreshed:
+            merged[key] = refreshed[key]
     try:
-        _write_secret_json(path, refreshed)
+        _write_secret_json(path, merged)
     except OSError:
         pass
-    access = refreshed.get("access_token")
+    access = merged.get("access_token")
     return access.strip() if isinstance(access, str) and access.strip() else None
 
 
@@ -884,7 +934,7 @@ def _fetch_kimi_cli_usage() -> Optional[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
         if response.status_code == 401:
             token = _kimi_code_access_token(previous=token, allow_refresh=True)
@@ -918,7 +968,7 @@ def _fetch_kimi_coding_api_key_usage() -> Optional[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -1000,7 +1050,7 @@ def _grok_refresh_entry(entry: dict) -> Optional[dict]:
     import httpx
 
     client_id = str(entry.get("oidc_client_id") or GROK_OAUTH_CLIENT_ID).strip() or GROK_OAUTH_CLIENT_ID
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.post(
             GROK_OAUTH_TOKEN_URL,
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
@@ -1037,9 +1087,10 @@ def _grok_access_context(
 ) -> Optional[tuple[str, str]]:
     """Return Grok access token + user id. Refresh+write only when allow_refresh.
 
-    Re-reads auth.json immediately before write and merges into that fresh
-    payload so concurrent Grok CLI changes to other keys are not reverted.
-    Never touches Claude/Codex files.
+    Re-reads auth.json before write and merges token fields into that fresh
+    entry so concurrent Grok CLI changes to other keys are not reverted.
+    This is file-level protection only, not a protocol-safe lock against a
+    simultaneous CLI refresh. Never touches Claude/Codex files.
     """
     loaded = _grok_read_auth()
     if not loaded:
@@ -1060,7 +1111,7 @@ def _grok_access_context(
     if not reloaded:
         return None
     path2, map_key2, payload2, entry2 = reloaded
-    if path2 != path:
+    if path2 != path or map_key2 != map_key:
         return None
     disk_token = entry2.get("key") or entry2.get("access_token")
     disk_token = disk_token.strip() if isinstance(disk_token, str) and disk_token.strip() else None
@@ -1069,13 +1120,17 @@ def _grok_access_context(
         if disk_user:
             return disk_token, disk_user
         return None
-    payload2[map_key2] = refreshed
+    merged = dict(entry2)
+    for key in ("key", "refresh_token", "expires_at"):
+        if key in refreshed:
+            merged[key] = refreshed[key]
+    payload2[map_key2] = merged
     try:
         _write_secret_json(path2, payload2)
     except OSError:
         pass
-    access = refreshed.get("key")
-    user_id = str(refreshed.get("user_id") or refreshed.get("principal_id") or disk_user or "").strip()
+    access = merged.get("key")
+    user_id = str(merged.get("user_id") or merged.get("principal_id") or disk_user or "").strip()
     if isinstance(access, str) and access.strip() and user_id:
         return access.strip(), user_id
     return None
@@ -1137,7 +1192,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     base = (os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL") or "").strip().rstrip("/")
     billing_url = f"{base}/billing?format=credits" if base else GROK_BILLING_URL
     settings_url = f"{base}/settings" if base else GROK_SETTINGS_URL
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(billing_url, headers=headers)
         if response.status_code == 401:
             context = _grok_access_context(previous=token, allow_refresh=True)
@@ -1195,7 +1250,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
             )
     prepaid = _grok_cent(config.get("prepaidBalance"))
     if prepaid is not None and prepaid > 0:
-        windows.append(_win("Prepaid", 0.0, None, f"${prepaid / 100:.2f} left"))
+        windows.append(_win("Prepaid", None, None, f"${prepaid / 100:.2f} left"))
     demand_cap = _grok_cent(config.get("onDemandCap"))
     demand_used = _grok_cent(config.get("onDemandUsed"))
     if demand_cap is not None and demand_cap > 0 and demand_used is not None:
@@ -1471,7 +1526,7 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
     }
     profile: dict = {}
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
             response = client.get(CLAUDE_OAUTH_USAGE_URL, headers=headers)
             if response.status_code == 429:
                 retry_after = response.headers.get("retry-after")
@@ -1508,8 +1563,13 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
         util = window.get("utilization")
         if util is None:
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
-        windows.append(_win(label, max(0.0, min(100.0, used)), _parse_dt(window.get("resets_at"))))
+        # Anthropic OAuth usage reports utilization as a 0-100 percentage
+        # (not a 0-1 fraction). Treating it as a fraction made real usage
+        # like 7 show as 100% used / 0% left.
+        if not isinstance(util, (int, float)) or isinstance(util, bool) or not math.isfinite(util):
+            continue
+        used = max(0.0, min(100.0, float(util)))
+        windows.append(_win(label, used, _parse_dt(window.get("resets_at"))))
     details: list[str] = []
     extra = payload.get("extra_usage") if isinstance(payload.get("extra_usage"), dict) else {}
     if extra.get("is_enabled"):
@@ -1603,7 +1663,7 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(_codex_usage_url(CODEX_DEFAULT_BASE_URL), headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -1614,9 +1674,11 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) if isinstance(rate_limit.get(key), dict) else {}
         used = window.get("used_percent")
-        if used is None:
+        if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
             continue
-        windows.append(_win(label, float(used), _parse_dt(window.get("reset_at"))))
+        windows.append(
+            _win(label, max(0.0, min(100.0, float(used))), _parse_dt(window.get("reset_at")))
+        )
     details: list[str] = []
     reset_credits = payload.get("rate_limit_reset_credits") if isinstance(payload.get("rate_limit_reset_credits"), dict) else {}
     banked = reset_credits.get("available_count")
@@ -1828,7 +1890,7 @@ def _fetch_glm_quota(token: str, base_url: str) -> Optional[dict]:
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(url, headers=headers)
         if response.status_code in {401, 403}:
             headers["Authorization"] = f"Bearer {token}"
@@ -2006,7 +2068,7 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(DEEPSEEK_BALANCE_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -2081,7 +2143,7 @@ def _fetch_opencode_go_account_usage() -> Optional[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(_opencode_go_usage_url(), headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -2117,15 +2179,11 @@ def _ollama_api_key() -> Optional[str]:
 
 
 def _ollama_used_percent(value: Any) -> Optional[float]:
-    """Ollama Cloud limits.usage is a 0-1 fraction; accept 0-100 too."""
+    """Ollama Cloud limits.usage is a 0-1 fraction. Do not also accept 0-100."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value):
-        n = float(value)
-        if 0.0 <= n <= 1.0:
-            return max(0.0, min(100.0, n * 100.0))
-        if 0.0 <= n <= 100.0:
-            return max(0.0, min(100.0, n))
+    if isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= float(value) <= 1.0:
+        return max(0.0, min(100.0, float(value) * 100.0))
     return None
 
 
@@ -2156,7 +2214,7 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
         "User-Agent": USER_AGENT,
     }
     plan = None
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         me = client.post(
             OLLAMA_CLOUD_ME_URL,
             headers={**headers, "Content-Type": "application/json"},
@@ -2204,21 +2262,14 @@ def _parse_epoch_ms(value: Any) -> Optional[datetime]:
     return _parse_dt(value)
 
 
-def _minimax_api_key() -> Optional[str]:
-    return _hermes_env_value("MINIMAX_API_KEY") or _hermes_env_value("MINIMAX_CN_API_KEY")
-
-
 def _minimax_percent(item: dict, *keys: str) -> Optional[float]:
+    """MiniMax remaining/usage fields are 0-100 percentages, not 0-1 fractions."""
     for key in keys:
         value = item.get(key)
         if isinstance(value, bool):
             continue
-        if isinstance(value, (int, float)) and math.isfinite(value):
-            n = float(value)
-            if 0.0 <= n <= 1.0:
-                return n * 100.0
-            if 0.0 <= n <= 100.0:
-                return n
+        if isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= float(value) <= 100.0:
+            return float(value)
     return None
 
 
@@ -2250,20 +2301,22 @@ def _minimax_pick_row(rows: list) -> Optional[dict]:
     return general or fallback
 
 
-def _minimax_token_plan_urls() -> list[str]:
-    urls = list(MINIMAX_TOKEN_PLAN_URLS)
-    if _hermes_env_value("MINIMAX_CN_API_KEY") and not _hermes_env_value("MINIMAX_API_KEY"):
-        urls = [MINIMAX_CN_TOKEN_PLAN_URL, *urls]
-    elif _hermes_env_value("MINIMAX_CN_API_KEY"):
-        urls.append(MINIMAX_CN_TOKEN_PLAN_URL)
-    return urls
+def _minimax_credentials() -> Optional[tuple[str, list[str]]]:
+    global_key = _hermes_env_value("MINIMAX_API_KEY")
+    if global_key:
+        return global_key, list(MINIMAX_TOKEN_PLAN_URLS)
+    cn_key = _hermes_env_value("MINIMAX_CN_API_KEY")
+    if cn_key:
+        return cn_key, [MINIMAX_CN_TOKEN_PLAN_URL]
+    return None
 
 
 def _fetch_minimax_account_usage() -> Optional[dict]:
     """MiniMax Token Plan windows from GET /v1/token_plan/remains."""
-    token = _minimax_api_key()
-    if not token:
+    creds = _minimax_credentials()
+    if not creds:
         return None
+    token, urls = creds
     import httpx
 
     headers = {
@@ -2274,7 +2327,7 @@ def _fetch_minimax_account_usage() -> Optional[dict]:
     }
     payload = None
     with httpx.Client(timeout=MINIMAX_HTTP_TIMEOUT) as client:
-        for url in _minimax_token_plan_urls():
+        for url in urls:
             try:
                 response = client.get(url, headers=headers)
             except Exception:
@@ -2382,7 +2435,7 @@ def _fetch_novita_account_usage() -> Optional[dict]:
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(NOVITA_BALANCE_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -2416,7 +2469,7 @@ def _fetch_deepinfra_account_usage() -> Optional[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(
             DEEPINFRA_CHECKLIST_URL,
             headers=headers,
@@ -2477,7 +2530,7 @@ def _fetch_ai_gateway_account_usage() -> Optional[dict]:
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(AI_GATEWAY_CREDITS_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -2533,7 +2586,17 @@ def _collect_hermes() -> list[dict]:
     return snapshots
 
 
-def _collect_cli() -> list[dict]:
+def _collect_cli() -> tuple[list[dict], bool]:
+    """Run vendor fetchers in parallel. Returns (snapshots, complete).
+
+    complete is False when the time budget cut the run short. Caller should
+    not cache incomplete results.
+    """
+    try:
+        import httpx  # noqa: F401
+    except Exception as exc:
+        return [_snapshot("resetwatch", None, [], [f"probe cannot import httpx: {exc}"])], True
+
     fetchers = (
         _fetch_claude_cli_account_usage,
         _fetch_codex_cli_account_usage,
@@ -2549,52 +2612,82 @@ def _collect_cli() -> list[dict]:
         _fetch_deepinfra_account_usage,
         _fetch_ai_gateway_account_usage,
     )
-    snapshots: list[dict] = []
-    # Providers touch disjoint files/endpoints; run in parallel with a hard budget
-    # so one hung vendor cannot wipe every probe-sourced card.
-    with ThreadPoolExecutor(max_workers=min(8, len(fetchers))) as pool:
-        futures = [pool.submit(fetch) for fetch in fetchers]
-        try:
-            for fut in as_completed(futures, timeout=PROBE_TOTAL_BUDGET_SECONDS):
+    results: dict[int, dict] = {}
+    complete = True
+    # One worker per fetcher so the tail of the tuple is never starved behind
+    # a slow peer. Do not wait on hung sockets after the budget; process exit
+    # reaps those threads.
+    pool = ThreadPoolExecutor(max_workers=len(fetchers))
+    try:
+        futures = {pool.submit(fetch): index for index, fetch in enumerate(fetchers)}
+        pending = set(futures)
+        deadline = time.monotonic() + PROBE_TOTAL_BUDGET_SECONDS
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                complete = False
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                complete = False
+                break
+            for fut in done:
+                index = futures[fut]
                 try:
-                    snap = fut.result(timeout=0.5)
+                    snap = fut.result(timeout=0)
                 except Exception:
                     continue
                 if snap and (snap.get("windows") or snap.get("details")):
-                    snapshots.append(snap)
-        except FuturesTimeout:
-            pass
-        for fut in futures:
-            fut.cancel()
-    return snapshots
+                    results[index] = snap
+        if pending:
+            complete = False
+            for fut in pending:
+                fut.cancel()
+    finally:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
+    snapshots = [results[index] for index in sorted(results)]
+    return snapshots, complete
 
 
 def main() -> int:
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
+    real_stdout = sys.stdout
     if not fresh:
         cached = _read_probe_result_cache(cli_only=cli_only)
         if cached is not None:
-            json.dump(cached, sys.stdout, ensure_ascii=True)
-            return 0
-    snapshots = []
-    have = set()
-    if not cli_only:
-        for snap in _collect_hermes():
+            json.dump(cached, real_stdout, ensure_ascii=True, allow_nan=False)
+            real_stdout.flush()
+            # Non-daemon pool threads must not keep this process alive.
+            os._exit(0)
+    snapshots: list[dict] = []
+    have: set[str] = set()
+    cli_complete = True
+    # Keep gateway import/print noise off the JSON stdout contract.
+    with contextlib.redirect_stdout(io.StringIO()):
+        if not cli_only:
+            for snap in _collect_hermes():
+                key = _provider_key(snap.get("provider"))
+                if not key or key in have:
+                    continue
+                snapshots.append(snap)
+                have.add(key)
+        cli_snaps, cli_complete = _collect_cli()
+        for snap in cli_snaps:
             key = _provider_key(snap.get("provider"))
             if not key or key in have:
                 continue
             snapshots.append(snap)
             have.add(key)
-    for snap in _collect_cli():
-        key = _provider_key(snap.get("provider"))
-        if not key or key in have:
-            continue
-        snapshots.append(snap)
-        have.add(key)
-    _store_probe_result_cache(snapshots, cli_only=cli_only)
-    json.dump(snapshots, sys.stdout, ensure_ascii=True)
-    return 0
+    if cli_complete:
+        _store_probe_result_cache(snapshots, cli_only=cli_only)
+    json.dump(snapshots, real_stdout, ensure_ascii=True, allow_nan=False)
+    real_stdout.flush()
+    # Non-daemon pool threads must not keep this process alive after JSON is out.
+    os._exit(0)
 
 
 if __name__ == "__main__":

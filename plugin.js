@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.1'
+const VERSION = '0.2.2'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -72,7 +72,16 @@ function remember(key, value) {
 
 function loadClocks() {
   const raw = stored('clocks', [])
-  $clocks.set(Array.isArray(raw) ? raw : [])
+  const list = Array.isArray(raw) ? raw : []
+  $clocks.set(
+    list.filter(
+      clock =>
+        clock &&
+        typeof clock.id === 'string' &&
+        typeof clock.name === 'string' &&
+        clampPercent(clock.remaining) !== null
+    )
+  )
 }
 
 function saveClocks(next) {
@@ -328,7 +337,7 @@ function cardsFromUsageGroups(groups, skipNous) {
     const windows = group.windows || []
     windows.forEach((window, index) => {
       cards.push({
-        id: `usage:${group.provider}:${window.label}`,
+        id: `usage:${group.provider}:${index}:${window.label}`,
         source: 'live',
         provider: group.provider,
         label: window.label,
@@ -364,7 +373,7 @@ function cardsFromAccountSnapshots(snapshots) {
     const windows = snap.windows || []
     windows.forEach((window, index) => {
       cards.push({
-        id: `account:${snap.provider}:${window.label}`,
+        id: `account:${snap.provider}:${index}:${window.label}`,
         source: 'live',
         provider,
         label: window.label,
@@ -403,11 +412,30 @@ function hermesHomeFromConfig(payload) {
   for (const section of sections) {
     for (const row of section.rows || []) {
       if (row && row[0] === 'Config File' && row[1]) {
-        return String(row[1]).replace(/[\\/]+config\.yaml$/i, '')
+        return String(row[1]).replace(/[\\/]+config\.ya?ml$/i, '')
       }
     }
   }
   return ''
+}
+
+function hermesHomeCandidates(fromConfig) {
+  const out = []
+  const push = value => {
+    const text = String(value || '').trim()
+    if (text && !out.includes(text)) out.push(text)
+  }
+  push(fromConfig)
+  try {
+    const env = typeof process !== 'undefined' && process.env ? process.env : null
+    if (env) {
+      push(env.HERMES_HOME)
+      if (env.LOCALAPPDATA) push(`${env.LOCALAPPDATA}\\hermes`)
+      const home = env.HOME || env.USERPROFILE
+      if (home) push(`${home}/.hermes`)
+    }
+  } catch (_) {}
+  return out
 }
 
 function quoteShell(path) {
@@ -417,20 +445,27 @@ function quoteShell(path) {
 
 function probePythonCandidates(home) {
   const root = String(home || '').replace(/[\\/]+$/, '')
-  return [
-    `${root}/hermes-agent/.venv/bin/python`,
-    `${root}/hermes-agent/venv/bin/python`,
+  const posix = [`${root}/hermes-agent/.venv/bin/python`, `${root}/hermes-agent/venv/bin/python`]
+  const win = [
     `${root}/hermes-agent/.venv/Scripts/python.exe`,
     `${root}/hermes-agent/venv/Scripts/python.exe`
   ]
+  const isWin = /^[A-Za-z]:[\\/]/.test(root) || root.includes('\\')
+  return isWin ? [...win, ...posix] : [...posix, ...win]
+}
+
+function pickProbeFailure(failures) {
+  const list = (failures || []).filter(Boolean)
+  if (!list.length) return ''
+  const withTrace = [...list].reverse().find(item => /Error|Traceback|Exception|failed/i.test(item))
+  return withTrace || list[list.length - 1]
 }
 
 async function probeStockAccountUsage(opts) {
   try {
     const shown = await host.request('config.show', {})
-    const home = hermesHomeFromConfig(shown)
-    if (!home) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
-    const probe = `${home}/desktop-plugins/resetwatch/probe.py`
+    const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
+    if (!homes.length) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
     const flags = [
       opts && opts.cliOnly ? '--cli-only' : '',
       opts && opts.fresh ? '--fresh' : ''
@@ -439,31 +474,34 @@ async function probeStockAccountUsage(opts) {
       .map(flag => ` ${flag}`)
       .join('')
     const failures = []
-    for (const python of probePythonCandidates(home)) {
-      try {
-        const result = await host.request('shell.exec', {
-          command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
-        })
-        if (!result || result.code) {
-          const err = result && result.stderr ? String(result.stderr).trim() : ''
-          failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
-          continue
+    for (const home of homes) {
+      const probe = `${home}/desktop-plugins/resetwatch/probe.py`
+      for (const python of probePythonCandidates(home)) {
+        try {
+          const result = await host.request('shell.exec', {
+            command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
+          })
+          if (!result || result.code) {
+            const err = result && result.stderr ? String(result.stderr).trim() : ''
+            failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
+            continue
+          }
+          const text = String(result.stdout || '').trim()
+          if (!text.startsWith('[')) {
+            failures.push('probe returned non-JSON')
+            continue
+          }
+          const parsed = JSON.parse(text)
+          if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
+          failures.push('probe JSON was not a list')
+        } catch (error) {
+          failures.push(errorMessage(error, 'probe failed'))
         }
-        const text = String(result.stdout || '').trim()
-        if (!text.startsWith('[')) {
-          failures.push('probe returned non-JSON')
-          continue
-        }
-        const parsed = JSON.parse(text)
-        if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
-        failures.push('probe JSON was not a list')
-      } catch (error) {
-        failures.push(errorMessage(error, 'probe failed'))
       }
     }
     return {
       snapshots: null,
-      error: failures.find(Boolean) || 'Could not run probe.py (no working Hermes Python)'
+      error: pickProbeFailure(failures) || 'Could not run probe.py (no working Hermes Python)'
     }
   } catch (error) {
     return { snapshots: null, error: errorMessage(error, 'Could not run probe.py') }
@@ -481,10 +519,15 @@ async function fetchLiveCards(sessionId, opts) {
   const fresh = !!(opts && opts.fresh)
   let haveAccountRpc = false
 
-  try {
-    const bars = await host.request('usage.bars', {})
-    cards.push(...cardsFromUsageBars(bars))
-  } catch (error) {
+  const [barsResult, accountResult] = await Promise.allSettled([
+    host.request('usage.bars', {}),
+    host.request('account.usage', {})
+  ])
+
+  if (barsResult.status === 'fulfilled') {
+    cards.push(...cardsFromUsageBars(barsResult.value))
+  } else {
+    const error = barsResult.reason
     errors.push(error && error.message ? error.message : 'Could not read Nous usage')
   }
 
@@ -498,15 +541,16 @@ async function fetchLiveCards(sessionId, opts) {
   }
 
   const accountProviders = new Set()
-  try {
-    const account = await host.request('account.usage', {})
+  if (accountResult.status === 'fulfilled') {
     haveAccountRpc = true
+    const account = accountResult.value
     const snaps = (account && account.snapshots) || []
     for (const snap of snaps) {
       if (snap && snap.provider) accountProviders.add(providerKey(snap.provider))
     }
     cards.push(...cardsFromAccountSnapshots(snaps))
-  } catch (error) {
+  } else {
+    const error = accountResult.reason
     const message = error && error.message ? error.message : ''
     if (!/unknown method|not found|-32601/i.test(message)) {
       errors.push(message || 'Could not read signed-in account limits')
@@ -892,9 +936,11 @@ function useLiveCardsPolled(gateway, sessionId) {
   const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
   const [isFetching, setFetching] = useState(false)
   const genRef = useRef(0)
+  const inFlight = useRef(false)
 
   const load = (opts) => {
-    if (gateway !== 'open') return
+    if (gateway !== 'open' || inFlight.current) return
+    inFlight.current = true
     const gen = ++genRef.current
     setFetching(true)
     fetchLiveCards(sid, opts)
@@ -912,6 +958,7 @@ function useLiveCardsPolled(gateway, sessionId) {
         })
       })
       .finally(() => {
+        inFlight.current = false
         if (gen !== genRef.current) return
         setFetching(false)
       })
@@ -931,6 +978,7 @@ function useLiveCardsPolled(gateway, sessionId) {
 
 function useLiveCardsQuery(gateway, sessionId) {
   const sid = sessionId || ''
+  const [manualFetching, setManualFetching] = useState(false)
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'live', sid],
     queryFn: () => fetchLiveCards(sid),
@@ -942,6 +990,7 @@ function useLiveCardsQuery(gateway, sessionId) {
     if (!queryClient || typeof queryClient.fetchQuery !== 'function') {
       return query.refetch && query.refetch()
     }
+    setManualFetching(true)
     return queryClient
       .fetchQuery({
         queryKey: [PLUGIN_ID, 'live', sid, 'fresh'],
@@ -952,8 +1001,9 @@ function useLiveCardsQuery(gateway, sessionId) {
         queryClient.setQueryData([PLUGIN_ID, 'live', sid], data)
         return data
       })
+      .finally(() => setManualFetching(false))
   }
-  return { data: query.data, isFetching: query.isFetching, refetch }
+  return { data: query.data, isFetching: !!(query.isFetching || manualFetching), refetch }
 }
 
 const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled

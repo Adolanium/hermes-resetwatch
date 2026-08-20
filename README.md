@@ -114,13 +114,16 @@ Live data goes through the desktop plugin SDK (`host.request` JSON-RPC),
 plus `probe.py` through `shell.exec` when a signed-in CLI or app has
 quota the gateway does not expose. The page does not log into vendor
 sites. `probe.py` does not refresh Claude or Codex credentials. For Kimi
-and Grok it may refresh on 401 and write that vendor's file back (after
-re-reading so a concurrent CLI refresh wins; Grok merges into a freshly
-read `auth.json`). It may also write a small
+and Grok it may refresh on 401 and write that vendor's file back. Before
+writing it re-reads the file and merges token fields into that fresh
+record so concurrent CLI edits to other keys are kept. That protects the
+file; it does not make a shared refresh-token exchange safe if the CLI
+refreshes in the same window. It may also write a small
 cache under `$HERMES_HOME/cache/resetwatch`, including a 5-minute probe
 result cache so vendor APIs are not hit more often than that (Refresh
-passes `--fresh` to bypass). Vendor fetches run in parallel with a time
-budget so one slow API cannot wipe every card. Tokens never go to stdout.
+passes `--fresh` to bypass; incomplete timed-out runs are not cached).
+Vendor fetches run in parallel with a time budget so one slow API cannot
+wipe every card. Tokens never go to stdout.
 
 ## Contributing
 
