@@ -275,7 +275,7 @@ function cardsFromUsageBars(bars) {
   if (!bars || bars.available === false) return []
   const cards = []
   const planName = nousPortalTitle(bars.plan_name)
-  const pushBar = (bar, label) => {
+  const pushBar = (bar, label, { showPercent = true } = {}) => {
     if (!bar) return
     const { remaining, used } = remainingFromBar(bar)
     cards.push({
@@ -283,8 +283,8 @@ function cardsFromUsageBars(bars) {
       source: 'live',
       provider: planName,
       label,
-      remaining,
-      used,
+      remaining: showPercent ? remaining : null,
+      used: showPercent ? used : null,
       resetAt: bars.renews_at || null,
       resetText: bars.renews_display || '',
       detail:
@@ -294,7 +294,7 @@ function cardsFromUsageBars(bars) {
     })
   }
   pushBar(bars.plan_bar, 'Subscription')
-  if (bars.has_topup) pushBar(bars.topup_bar, 'Top-up credits')
+  if (bars.has_topup) pushBar(bars.topup_bar, 'Top-up credits', { showPercent: false })
   return cards
 }
 
