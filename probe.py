@@ -1,12 +1,14 @@
 """Stock Hermes usage probe for Resetwatch.
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
-the gateway already ships, plus Cursor, Kimi, and Grok from those apps'
-own CLI or desktop logins. No tokens on stdout. No extra RPC.
+the gateway already ships. If Hermes OAuth is missing, Claude Code and
+Codex CLI logins fill those same cards. Cursor, Kimi, and Grok always
+come from those apps' own CLI or desktop logins. No tokens on stdout.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -20,6 +22,19 @@ from typing import Any, Optional
 
 HERMES_PROVIDERS = ("anthropic", "openai-codex", "openrouter")
 USER_AGENT = "resetwatch"
+
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+CLAUDE_OAUTH_TOKEN_URLS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
+
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CODEX_TOKEN_SKEW_SECONDS = 120
 
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
@@ -119,6 +134,40 @@ def _win(
         "reset_at": reset_at.isoformat() if reset_at is not None else None,
         "detail": detail,
     }
+
+
+def _provider_key(name: Any) -> str:
+    key = str(name or "").strip().lower()
+    if key == "kimi-coding":
+        return "kimi"
+    if key in {"xai-oauth", "xai"}:
+        return "grok"
+    return key
+
+
+def _is_claude_oauth_token(token: str) -> bool:
+    if not token:
+        return False
+    if token.startswith("sk-ant-api"):
+        return False
+    if token.startswith("sk-ant-") or token.startswith("eyJ") or token.startswith("cc-"):
+        return True
+    return False
+
+
+def _jwt_exp(token: str) -> Optional[float]:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1] + ("=" * (-len(parts[1]) % 4))
+        data = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+    exp = data.get("exp") if isinstance(data, dict) else None
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    return None
 
 
 def _snapshot(provider: str, plan: Optional[str], windows: list[dict], details: Optional[list[str]] = None) -> dict:
@@ -856,6 +905,500 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     return _snapshot("grok", plan, windows)
 
 
+def _claude_home() -> Path:
+    override = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _user_home() / ".claude"
+
+
+def _claude_credentials_path() -> Path:
+    return _claude_home() / ".credentials.json"
+
+
+def _claude_oauth_from_payload(payload: Any, *, source: str) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return {
+        "accessToken": token.strip(),
+        "refreshToken": str(oauth.get("refreshToken") or "").strip(),
+        "expiresAt": oauth.get("expiresAt") or 0,
+        "source": source,
+        "raw": payload,
+    }
+
+
+def _read_claude_code_file() -> Optional[dict]:
+    path = _claude_credentials_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return _claude_oauth_from_payload(payload, source="file")
+
+
+def _read_generic_windows_credential(target: str) -> Optional[str]:
+    if not _is_windows():
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.c_void_p),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    cred_read = advapi32.CredReadW
+    cred_read.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(CREDENTIAL)),
+    ]
+    cred_read.restype = wintypes.BOOL
+    cred_free = advapi32.CredFree
+    cred_free.argtypes = [ctypes.c_void_p]
+    cred_ptr = ctypes.POINTER(CREDENTIAL)()
+    if not cred_read(target, 1, 0, ctypes.byref(cred_ptr)):
+        return None
+    try:
+        blob = ctypes.string_at(cred_ptr.contents.CredentialBlob, cred_ptr.contents.CredentialBlobSize)
+    finally:
+        cred_free(cred_ptr)
+    if not blob:
+        return None
+    for encoding in ("utf-16-le", "utf-8"):
+        try:
+            text = blob.decode(encoding).rstrip("\x00").strip()
+        except UnicodeError:
+            continue
+        if text:
+            return text
+    return None
+
+
+def _claude_windows_cred_targets() -> list[str]:
+    targets = ["Claude Code-credentials"]
+    try:
+        import hashlib
+
+        digest = hashlib.sha256(str(_claude_home().resolve()).encode("utf-8")).hexdigest()[:8]
+        targets.append(f"Claude Code-credentials-{digest}")
+    except Exception:
+        pass
+    return targets
+
+
+def _read_claude_code_os_store() -> Optional[dict]:
+    if _is_macos():
+        try:
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            return None
+        raw = (result.stdout or "").strip()
+        if result.returncode != 0 or not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return _claude_oauth_from_payload(payload, source="keychain")
+    if _is_windows():
+        for target in _claude_windows_cred_targets():
+            raw = _read_generic_windows_credential(target)
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            creds = _claude_oauth_from_payload(payload, source="windows_credential")
+            if creds:
+                return creds
+    return None
+
+
+def _claude_token_valid(creds: dict) -> bool:
+    token = creds.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return False
+    expires_at = creds.get("expiresAt") or 0
+    if not expires_at:
+        return True
+    try:
+        expires_ms = float(expires_at)
+    except (TypeError, ValueError):
+        return True
+    now_ms = _utc_now().timestamp() * 1000
+    return now_ms < (expires_ms - 60_000)
+
+
+def _read_claude_code_credentials() -> Optional[dict]:
+    keychain = _read_claude_code_os_store()
+    file_creds = _read_claude_code_file()
+    if keychain and file_creds:
+        key_ok = _claude_token_valid(keychain)
+        file_ok = _claude_token_valid(file_creds)
+        if key_ok and not file_ok:
+            return keychain
+        if file_ok and not key_ok:
+            return file_creds
+        key_exp = keychain.get("expiresAt") or 0
+        file_exp = file_creds.get("expiresAt") or 0
+        return keychain if key_exp >= file_exp else file_creds
+    return keychain or file_creds
+
+
+def _write_claude_code_file(creds: dict, access: str, refresh: str, expires_at_ms: int) -> None:
+    path = _claude_credentials_path()
+    existing = creds.get("raw") if creds.get("source") == "file" else None
+    if not isinstance(existing, dict):
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    oauth = existing.get("claudeAiOauth") if isinstance(existing.get("claudeAiOauth"), dict) else {}
+    oauth = dict(oauth)
+    oauth["accessToken"] = access
+    oauth["refreshToken"] = refresh
+    oauth["expiresAt"] = expires_at_ms
+    existing["claudeAiOauth"] = oauth
+    _write_json_file(path, existing)
+
+
+def _refresh_claude_code_tokens(creds: dict) -> Optional[str]:
+    live = _read_claude_code_credentials()
+    if live and _claude_token_valid(live) and live.get("accessToken") != creds.get("accessToken"):
+        return str(live.get("accessToken") or "").strip() or None
+    refresh = str((live or {}).get("refreshToken") or creds.get("refreshToken") or "").strip()
+    if not refresh:
+        return None
+    import httpx
+
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        payload = None
+        for url in CLAUDE_OAUTH_TOKEN_URLS:
+            try:
+                response = client.post(
+                    url,
+                    data=body,
+                    headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                )
+            except Exception:
+                continue
+            if response.status_code >= 400:
+                continue
+            loaded = response.json() or {}
+            if isinstance(loaded, dict) and isinstance(loaded.get("access_token"), str):
+                payload = loaded
+                break
+        if not payload:
+            return None
+    access = str(payload.get("access_token") or "").strip()
+    if not access:
+        return None
+    next_refresh = str(payload.get("refresh_token") or refresh).strip() or refresh
+    expires_in = _to_int(payload.get("expires_in")) or 3600
+    expires_at_ms = int(_utc_now().timestamp() * 1000) + (expires_in * 1000)
+    try:
+        _write_claude_code_file(live or creds, access, next_refresh, expires_at_ms)
+    except OSError:
+        pass
+    return access
+
+
+def _claude_code_access_token() -> Optional[str]:
+    creds = _read_claude_code_credentials()
+    if not creds:
+        return None
+    token = str(creds.get("accessToken") or "").strip()
+    if token and _claude_token_valid(creds) and _is_claude_oauth_token(token):
+        return token
+    refreshed = _refresh_claude_code_tokens(creds)
+    if refreshed and _is_claude_oauth_token(refreshed):
+        return refreshed
+    return None
+
+
+def infer_claude_plan_name(profile: Optional[dict] = None, usage_payload: Optional[dict] = None) -> Optional[str]:
+    profile = profile or {}
+    usage_payload = usage_payload or {}
+    org = profile.get("organization") if isinstance(profile.get("organization"), dict) else {}
+    account = profile.get("account") if isinstance(profile.get("account"), dict) else {}
+    tier = str(org.get("rate_limit_tier") or "").strip().lower()
+    org_type = str(org.get("organization_type") or "").strip().lower()
+    if "max_20x" in tier or tier.endswith("_20x"):
+        return "Max 20x"
+    if "max_5x" in tier or tier.endswith("_5x"):
+        return "Max 5x"
+    if "max" in tier or org_type == "claude_max" or account.get("has_claude_max"):
+        return "Max"
+    if "pro" in tier or org_type in {"claude_pro", "claude_ai"} or account.get("has_claude_pro"):
+        return "Pro"
+    if "team" in tier or org_type == "claude_team":
+        return "Team"
+    if "enterprise" in tier or org_type == "claude_enterprise":
+        return "Enterprise"
+    if usage_payload.get("seven_day_opus"):
+        return "Max"
+    extra = usage_payload.get("extra_usage") if isinstance(usage_payload.get("extra_usage"), dict) else {}
+    if extra.get("is_enabled"):
+        return "Max"
+    if usage_payload.get("five_hour") or usage_payload.get("seven_day"):
+        return "Pro"
+    return None
+
+
+def _fetch_claude_cli_account_usage() -> Optional[dict]:
+    token = _claude_code_access_token()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.0",
+    }
+    profile: dict = {}
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(CLAUDE_OAUTH_USAGE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+        try:
+            profile_resp = client.get(CLAUDE_OAUTH_PROFILE_URL, headers=headers)
+            if profile_resp.status_code < 400:
+                loaded = profile_resp.json() or {}
+                if isinstance(loaded, dict):
+                    profile = loaded
+        except Exception:
+            profile = {}
+    if not isinstance(payload, dict):
+        return None
+    windows: list[dict] = []
+    mapping = (
+        ("five_hour", "Current session"),
+        ("seven_day", "Current week"),
+        ("seven_day_opus", "Opus week"),
+        ("seven_day_sonnet", "Sonnet week"),
+    )
+    for key, label in mapping:
+        window = payload.get(key) if isinstance(payload.get(key), dict) else {}
+        util = window.get("utilization")
+        if util is None:
+            continue
+        used = float(util) * 100 if float(util) <= 1 else float(util)
+        windows.append(_win(label, max(0.0, min(100.0, used)), _parse_dt(window.get("resets_at"))))
+    details: list[str] = []
+    extra = payload.get("extra_usage") if isinstance(payload.get("extra_usage"), dict) else {}
+    if extra.get("is_enabled"):
+        used_credits = extra.get("used_credits")
+        monthly_limit = extra.get("monthly_limit")
+        currency = extra.get("currency") or "USD"
+        if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
+            details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}")
+    if not windows and not details:
+        return None
+    return _snapshot("anthropic", infer_claude_plan_name(profile, payload), windows, details)
+
+
+def _codex_home() -> Path:
+    override = (os.environ.get("CODEX_HOME") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _user_home() / ".codex"
+
+
+def _codex_auth_path() -> Path:
+    return _codex_home() / "auth.json"
+
+
+def _codex_token_expiring(token: str, *, skew: int = CODEX_TOKEN_SKEW_SECONDS) -> bool:
+    exp = _jwt_exp(token)
+    if exp is None:
+        return False
+    return exp <= (_utc_now().timestamp() + skew)
+
+
+def _read_codex_cli_auth() -> Optional[tuple[Path, dict, dict]]:
+    path = _codex_auth_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    access = tokens.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    return path, payload, tokens
+
+
+def _refresh_codex_cli_tokens(tokens: dict) -> Optional[dict]:
+    refresh = tokens.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    import httpx
+
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            CODEX_OAUTH_TOKEN_URL,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh.strip(),
+                "client_id": CODEX_OAUTH_CLIENT_ID,
+            },
+        )
+        if response.status_code >= 400:
+            return None
+        body = response.json() or {}
+    if not isinstance(body, dict):
+        return None
+    access = body.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    updated = dict(tokens)
+    updated["access_token"] = access.strip()
+    next_refresh = body.get("refresh_token")
+    if isinstance(next_refresh, str) and next_refresh.strip():
+        updated["refresh_token"] = next_refresh.strip()
+    return updated
+
+
+def _codex_cli_access_context() -> Optional[tuple[str, Optional[str]]]:
+    loaded = _read_codex_cli_auth()
+    if not loaded:
+        return None
+    path, payload, tokens = loaded
+    access = str(tokens.get("access_token") or "").strip()
+    account_id = str(tokens.get("account_id") or "").strip() or None
+    if access and not _codex_token_expiring(access):
+        return access, account_id
+    refreshed = _refresh_codex_cli_tokens(tokens)
+    if not refreshed:
+        return (access, account_id) if access else None
+    payload["tokens"] = refreshed
+    try:
+        _write_json_file(path, payload)
+    except OSError:
+        pass
+    access = str(refreshed.get("access_token") or "").strip()
+    account_id = str(refreshed.get("account_id") or tokens.get("account_id") or "").strip() or None
+    return (access, account_id) if access else None
+
+
+def _codex_usage_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        normalized = CODEX_DEFAULT_BASE_URL
+    if normalized.endswith("/codex"):
+        normalized = normalized[: -len("/codex")]
+    prefix = normalized + ("/wham" if "/backend-api" in normalized else "/api/codex")
+    return prefix + "/usage"
+
+
+def _fetch_codex_cli_account_usage() -> Optional[dict]:
+    context = _codex_cli_access_context()
+    if not context:
+        return None
+    token, account_id = context
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_codex_usage_url(CODEX_DEFAULT_BASE_URL), headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+    windows: list[dict] = []
+    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+        window = rate_limit.get(key) if isinstance(rate_limit.get(key), dict) else {}
+        used = window.get("used_percent")
+        if used is None:
+            continue
+        windows.append(_win(label, float(used), _parse_dt(window.get("reset_at"))))
+    details: list[str] = []
+    reset_credits = payload.get("rate_limit_reset_credits") if isinstance(payload.get("rate_limit_reset_credits"), dict) else {}
+    banked = reset_credits.get("available_count")
+    if isinstance(banked, (int, float)) and int(banked) > 0:
+        count = int(banked)
+        plural = "s" if count != 1 else ""
+        details.append(f"You have {count} reset{plural} banked")
+    credits = payload.get("credits") if isinstance(payload.get("credits"), dict) else {}
+    if credits.get("has_credits"):
+        balance = credits.get("balance")
+        if isinstance(balance, (int, float)):
+            details.append(f"Credits balance: ${float(balance):.2f}")
+        elif credits.get("unlimited"):
+            details.append("Credits balance: unlimited")
+    if not windows and not details:
+        return None
+    plan = _title_case_slug(payload.get("plan_type"))
+    return _snapshot("openai-codex", plan, windows, details)
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -882,12 +1425,18 @@ def _collect_hermes() -> list[dict]:
 
 def _collect_cli() -> list[dict]:
     snapshots = []
-    for fetch in (_fetch_cursor_account_usage, _fetch_kimi_account_usage, _fetch_grok_account_usage):
+    for fetch in (
+        _fetch_claude_cli_account_usage,
+        _fetch_codex_cli_account_usage,
+        _fetch_cursor_account_usage,
+        _fetch_kimi_account_usage,
+        _fetch_grok_account_usage,
+    ):
         try:
             snap = fetch()
         except Exception:
             continue
-        if snap and snap.get("windows"):
+        if snap and (snap.get("windows") or snap.get("details")):
             snapshots.append(snap)
     return snapshots
 
@@ -895,9 +1444,20 @@ def _collect_cli() -> list[dict]:
 def main() -> int:
     cli_only = "--cli-only" in sys.argv
     snapshots = []
+    have = set()
     if not cli_only:
-        snapshots.extend(_collect_hermes())
-    snapshots.extend(_collect_cli())
+        for snap in _collect_hermes():
+            key = _provider_key(snap.get("provider"))
+            if not key or key in have:
+                continue
+            snapshots.append(snap)
+            have.add(key)
+    for snap in _collect_cli():
+        key = _provider_key(snap.get("provider"))
+        if not key or key in have:
+            continue
+        snapshots.append(snap)
+        have.add(key)
     json.dump(snapshots, sys.stdout, ensure_ascii=True)
     return 0
 

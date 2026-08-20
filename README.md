@@ -40,8 +40,10 @@ picks it up within seconds and hot-reloads on every save. If it does not
 appear, run "Reload desktop plugins" from the palette.
 
 Live rows work on stock Hermes. `probe.py` asks the gateway Python for
-Claude, Codex, and OpenRouter, and also reads Cursor, Kimi, and Grok from
-those apps' own CLI or desktop logins. Copy both `plugin.js` and `probe.py`.
+Claude, Codex, and OpenRouter. If Hermes OAuth is missing, it reads the
+Claude Code and Codex CLIs instead. Cursor, Kimi, and Grok come from
+those apps' own CLI or desktop logins. Copy both `plugin.js` and
+`probe.py`.
 
 ## What's inside
 
@@ -58,10 +60,11 @@ Nous dollars and renewal time come from the gateway (`usage.bars`, then
 `subscription.state` if needed). If the gateway has `account.usage`, that
 RPC fills Claude, Codex, OpenRouter, and any other providers it already
 knows. On stock Hermes, `probe.py` fills the rest through `shell.exec`:
-the same Claude / Codex / OpenRouter fetchers, plus Cursor (app or
-`cursor-agent` login), Kimi Code (`~/.kimi-code`), and Grok CLI
-(`~/.grok`). Older `/usage` output is still parsed when a session is
-focused, as a last fallback.
+the same Claude / Codex / OpenRouter fetchers. If Hermes OAuth is missing,
+Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards.
+Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), and Grok
+CLI (`~/.grok`) always come from those logins. Older `/usage` output is
+still parsed when a session is focused, as a last fallback.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
 

@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.3'
+const VERSION = '0.1.4'
 const POLL_MS = 30000
 
 const host = sdk.host
@@ -970,7 +970,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth, plus Claude, Codex, Cursor, Kimi, and Grok when those CLIs or apps are logged in. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, and Grok CLIs or apps when those are logged in. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
