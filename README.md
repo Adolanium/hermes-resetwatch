@@ -45,7 +45,8 @@ Live cards fill on their own when that login is already on the machine:
 - **Cursor:** Cursor app or `cursor-agent`
 - **Kimi:** Kimi Code
 - **Grok:** Grok CLI
-- **GLM:** ZCode, with a Coding Plan login
+- **GLM:** ZCode, with a Coding Plan login (includes peak / off-peak pricing)
+- **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak)
 
 Gemini, Perplexity, and anything else can be a manual clock. Type the percent
 left and the reset time.
@@ -63,9 +64,9 @@ appear, run "Reload desktop plugins" from the palette.
 
 Live rows work on stock Hermes. `probe.py` asks the gateway Python for
 Claude, Codex, and OpenRouter. If Hermes OAuth is missing, it reads the
-Claude Code and Codex CLIs instead. Cursor, Kimi, Grok, and GLM (ZCode)
-come from those apps' own CLI or desktop logins. Copy both `plugin.js`
-and `probe.py`.
+Claude Code and Codex CLIs instead. Cursor, Kimi, Grok, GLM (ZCode), and
+DeepSeek come from those apps' own CLI, desktop logins, or API keys. Copy
+both `plugin.js` and `probe.py`.
 
 ## What's inside
 

@@ -2,9 +2,9 @@
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
-Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
-(ZCode) come from those apps' own CLI or desktop logins. No tokens on
-stdout.
+Codex CLI logins fill those same cards. Cursor, Kimi, Grok, GLM (ZCode),
+and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins. No tokens
+on stdout.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +36,17 @@ CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_TOKEN_SKEW_SECONDS = 120
+
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+# Official DeepSeek peak windows (UTC). Off-peak is half price.
+DEEPSEEK_PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
+
+# Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
+# Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
+GLM_PEAK_TZ = timezone(timedelta(hours=8))
+GLM_PEAK_WEEKDAYS = frozenset({0, 1, 2, 3, 4})  # Monday-Friday
+GLM_PEAK_START_HOUR = 14
+GLM_PEAK_END_HOUR = 18
 
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
@@ -145,6 +156,8 @@ def _provider_key(name: Any) -> str:
         return "grok"
     if key in {"zai", "zcode", "zhipu", "glm-coding", "zai-coding-plan"}:
         return "glm"
+    if key in {"deep-seek"}:
+        return "deepseek"
     return key
 
 
@@ -1541,6 +1554,36 @@ def _glm_usage_window(item: Any) -> Optional[dict]:
     return _win(_glm_window_label(item), used_percent, reset_at, detail)
 
 
+def _clock_label(stamp: datetime) -> str:
+    return stamp.strftime("%I:%M %p").lstrip("0")
+
+
+def _glm_peak_status(now: Optional[datetime] = None) -> tuple[bool, str]:
+    """Peak / off-peak from the machine clock, in Singapore time (UTC+8).
+
+    Z.AI docs: Monday to Friday, 14:00-18:00 Singapore Standard Time (UTC+8).
+    Uses the system clock on Mac and Windows via datetime.now(timezone.utc).
+    """
+    stamp = now or datetime.now(timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    else:
+        stamp = stamp.astimezone(timezone.utc)
+    sg = stamp.astimezone(GLM_PEAK_TZ)
+    local = stamp.astimezone()
+    minute_of_day = sg.hour * 60 + sg.minute
+    peak = (
+        sg.weekday() in GLM_PEAK_WEEKDAYS
+        and GLM_PEAK_START_HOUR * 60 <= minute_of_day < GLM_PEAK_END_HOUR * 60
+    )
+    windows = "Mon-Fri 14:00-18:00 UTC+8"
+    local_clock = _clock_label(local)
+    sg_clock = _clock_label(sg)
+    if peak:
+        return True, f"Peak pricing now · {local_clock} local · {sg_clock} UTC+8 · {windows}"
+    return False, f"Off-peak now · {local_clock} local · {sg_clock} UTC+8 · peak is {windows}"
+
+
 def _fetch_glm_zcode_account_usage() -> Optional[dict]:
     creds = _zcode_coding_credentials()
     if not creds:
@@ -1575,8 +1618,174 @@ def _fetch_glm_zcode_account_usage() -> Optional[dict]:
                 windows.append(row)
     if not windows:
         return None
+    _peak, peak_text = _glm_peak_status()
+    windows.append(_win("Pricing", None, None, peak_text))
     plan = _title_case_slug(data.get("level"))
     return _snapshot("glm", plan, windows)
+
+
+def _hermes_homes() -> list[Path]:
+    roots: list[Path] = []
+    override = (os.environ.get("HERMES_HOME") or "").strip()
+    if override:
+        roots.append(Path(override).expanduser())
+    roots.append(_user_home() / ".hermes")
+    if _is_windows():
+        local = os.environ.get("LOCALAPPDATA") or ""
+        if local:
+            roots.append(Path(local) / "hermes")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def _read_env_file_value(path: Path, name: str) -> Optional[str]:
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        try:
+            text = path.read_text(encoding="latin-1")
+        except OSError:
+            return None
+    prefix = f"{name}="
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        return value.strip() or None
+    return None
+
+
+def _hermes_env_value(name: str) -> Optional[str]:
+    direct = (os.environ.get(name) or "").strip()
+    if direct:
+        return direct
+    for home in _hermes_homes():
+        value = _read_env_file_value(home / ".env", name)
+        if value:
+            return value
+    return None
+
+
+def _deepseek_api_key() -> Optional[str]:
+    return _hermes_env_value("DEEPSEEK_API_KEY")
+
+
+def _deepseek_money(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip().replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def _deepseek_money_text(amount: float, currency: str) -> str:
+    code = (currency or "USD").strip().upper() or "USD"
+    if code == "USD":
+        return f"${amount:,.2f}"
+    if code == "CNY":
+        return f"¥{amount:,.2f}"
+    return f"{amount:,.2f} {code}"
+
+
+def _deepseek_peak_status(now: Optional[datetime] = None) -> tuple[bool, str]:
+    """Peak / off-peak from the machine clock, converted to UTC.
+
+    Uses datetime.now(timezone.utc) so Mac and Windows both follow the
+    system clock. DeepSeek publishes peak windows in UTC.
+    """
+    stamp = now or datetime.now(timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    else:
+        stamp = stamp.astimezone(timezone.utc)
+    minute_of_day = stamp.hour * 60 + stamp.minute
+    peak = False
+    for start_hour, end_hour in DEEPSEEK_PEAK_WINDOWS_UTC:
+        if start_hour * 60 <= minute_of_day < end_hour * 60:
+            peak = True
+            break
+    local = stamp.astimezone()
+    local_clock = _clock_label(local)
+    utc_clock = stamp.strftime("%H:%M")
+    windows = "01:00-04:00 and 06:00-10:00 UTC"
+    if peak:
+        return True, f"Peak pricing now · {local_clock} local · {utc_clock} UTC · {windows}"
+    return False, f"Off-peak now · {local_clock} local · {utc_clock} UTC · peak is {windows}"
+
+
+def _fetch_deepseek_account_usage() -> Optional[dict]:
+    token = _deepseek_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(DEEPSEEK_BALANCE_URL, headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    infos = payload.get("balance_infos")
+    if not isinstance(infos, list) or not infos:
+        return None
+    chosen = None
+    for item in infos:
+        if not isinstance(item, dict):
+            continue
+        total = _deepseek_money(item.get("total_balance"))
+        if total is None:
+            continue
+        currency = str(item.get("currency") or "USD").strip().upper() or "USD"
+        if chosen is None or currency == "USD":
+            chosen = (currency, total, item)
+            if currency == "USD":
+                break
+    if not chosen:
+        return None
+    currency, total, item = chosen
+    granted = _deepseek_money(item.get("granted_balance"))
+    topped = _deepseek_money(item.get("topped_up_balance"))
+    money = _deepseek_money_text(total, currency)
+    detail_parts = [f"{money} left"]
+    if topped is not None and topped > 0:
+        detail_parts.append(f"{_deepseek_money_text(topped, currency)} topped up")
+    if granted is not None and granted > 0:
+        detail_parts.append(f"{_deepseek_money_text(granted, currency)} granted")
+    available = payload.get("is_available")
+    if available is False:
+        detail_parts.append("balance too low for new calls")
+    peak, peak_text = _deepseek_peak_status()
+    windows = [
+        _win("Balance", None, None, " · ".join(detail_parts)),
+        _win("Pricing", None, None, peak_text),
+    ]
+    return _snapshot("deepseek", None, windows)
 
 
 def _collect_hermes() -> list[dict]:
@@ -1612,6 +1821,7 @@ def _collect_cli() -> list[dict]:
         _fetch_kimi_account_usage,
         _fetch_grok_account_usage,
         _fetch_glm_zcode_account_usage,
+        _fetch_deepseek_account_usage,
     ):
         try:
             snap = fetch()
