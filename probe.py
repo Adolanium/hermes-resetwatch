@@ -57,11 +57,9 @@ GLM_PEAK_END_HOUR = 18
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
 KIMI_CODE_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
-KIMI_CODE_TOKEN_SKEW_SECONDS = 60
 
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
-GROK_TOKEN_SKEW_SECONDS = 60
 
 
 def _utc_now() -> datetime:
@@ -536,16 +534,12 @@ def _kimi_code_read_credentials(path: Path) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def _kimi_code_token_expired(creds: dict, *, skew: int = KIMI_CODE_TOKEN_SKEW_SECONDS) -> bool:
-    expires_at = creds.get("expires_at")
-    if isinstance(expires_at, (int, float)) and math.isfinite(expires_at):
-        return float(expires_at) <= (_utc_now().timestamp() + skew)
-    # Missing expiry: use the access token as-is (read-only; no refresh).
-    return False
-
-
 def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
-    """Return the Kimi access token on disk. Never refreshes or writes creds."""
+    """Return the Kimi access token on disk. Never refreshes or writes creds.
+
+    Expiry on disk is advisory only: we still try the token and let the
+    usage API reject it. Refresh stays with the Kimi Code CLI.
+    """
     path = _kimi_code_credentials_path()
     if not path:
         return None
@@ -557,8 +551,6 @@ def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
         return None
     token = token.strip()
     if previous and token == previous.strip():
-        return None
-    if _kimi_code_token_expired(creds):
         return None
     return token
 
@@ -746,16 +738,12 @@ def _grok_read_auth() -> Optional[tuple[Path, str, dict, dict]]:
     return path, chosen_key, payload, chosen
 
 
-def _grok_token_expired(entry: dict, *, skew: int = GROK_TOKEN_SKEW_SECONDS) -> bool:
-    expires = _parse_dt(entry.get("expires_at"))
-    if expires is None:
-        # Missing expiry: use the access token as-is (read-only; no refresh).
-        return False
-    return expires.timestamp() <= (_utc_now().timestamp() + skew)
-
-
 def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[str, str]]:
-    """Return Grok access token + user id from disk. Never refreshes or writes."""
+    """Return Grok access token + user id from disk. Never refreshes or writes.
+
+    Expiry on disk is advisory only: we still try the token and let the
+    billing API reject it. Refresh stays with the Grok CLI.
+    """
     loaded = _grok_read_auth()
     if not loaded:
         return None
@@ -766,8 +754,6 @@ def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[st
         return None
     token = token.strip()
     if previous and token == previous.strip():
-        return None
-    if _grok_token_expired(entry):
         return None
     return token, user_id
 
