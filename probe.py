@@ -3,7 +3,8 @@
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
 Codex CLI logins fill those same cards. Cursor, Kimi, Grok, GLM (ZCode),
-and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins.
+and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins. OpenCode Go
+(Hermes OPENCODE_GO_API_KEY) fills from GET /zen/go/v1/usage.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
@@ -50,6 +51,8 @@ CODEX_TOKEN_SKEW_SECONDS = 120
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 # Official DeepSeek peak windows (UTC). Off-peak is half price.
 DEEPSEEK_PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
+
+OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 
 # Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
 # Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
@@ -169,6 +172,8 @@ def _provider_key(name: Any) -> str:
         return "glm"
     if key in {"deep-seek"}:
         return "deepseek"
+    if key in {"opencode_go", "opencode-go-sub", "go"}:
+        return "opencode-go"
     return key
 
 
@@ -1828,6 +1833,69 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
     return _snapshot("deepseek", None, windows)
 
 
+def _opencode_go_api_key() -> Optional[str]:
+    return _hermes_env_value("OPENCODE_GO_API_KEY")
+
+
+def _opencode_go_base_url() -> str:
+    override = (_hermes_env_value("OPENCODE_GO_BASE_URL") or "").strip().rstrip("/")
+    if not override:
+        return OPENCODE_GO_DEFAULT_BASE_URL
+    # Hermes may store either .../zen/go or .../zen/go/v1.
+    if override.endswith("/v1"):
+        return override
+    if override.rstrip("/").endswith("/go"):
+        return override.rstrip("/") + "/v1"
+    return override
+
+
+def _opencode_go_usage_url() -> str:
+    return f"{_opencode_go_base_url().rstrip('/')}/usage"
+
+
+def _fetch_opencode_go_account_usage() -> Optional[dict]:
+    """OpenCode Go plan windows from GET /zen/go/v1/usage (Hermes API key)."""
+    token = _opencode_go_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_opencode_go_usage_url(), headers=headers)
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else payload
+    if not isinstance(usage, dict):
+        return None
+    windows: list[dict] = []
+    mapping = (
+        ("rolling", "5h"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+    )
+    for key, label in mapping:
+        item = usage.get(key)
+        if not isinstance(item, dict):
+            continue
+        pct = item.get("percent")
+        if not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            continue
+        used = max(0.0, min(100.0, float(pct)))
+        status = str(item.get("status") or "").strip()
+        detail = None if not status or status.lower() == "ok" else status
+        windows.append(_win(label, used, _parse_dt(item.get("resetsAt")), detail))
+    if not windows:
+        return None
+    return _snapshot("opencode-go", "Go", windows)
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -1862,6 +1930,7 @@ def _collect_cli() -> list[dict]:
         _fetch_grok_account_usage,
         _fetch_glm_zcode_account_usage,
         _fetch_deepseek_account_usage,
+        _fetch_opencode_go_account_usage,
     ):
         try:
             snap = fetch()

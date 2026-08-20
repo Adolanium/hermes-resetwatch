@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.6'
+const VERSION = '0.1.7'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -157,6 +157,7 @@ function providerKey(name) {
   if (key === 'xai-oauth' || key === 'xai') return 'grok'
   if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'zai-coding-plan') return 'glm'
   if (key === 'deep-seek') return 'deepseek'
+  if (key === 'opencode_go' || key === 'opencode-go-sub' || key === 'go') return 'opencode-go'
   return key
 }
 
@@ -193,6 +194,9 @@ const PROVIDER_LABELS = {
   'zai-coding-plan': 'GLM',
   deepseek: 'DeepSeek',
   'deep-seek': 'DeepSeek',
+  'opencode-go': 'OpenCode Go',
+  opencode_go: 'OpenCode Go',
+  go: 'OpenCode Go',
   nous: 'Nous'
 }
 
@@ -1031,7 +1035,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM (ZCode), and DeepSeek when those CLIs, apps, or API keys are logged in. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM (ZCode), DeepSeek, and OpenCode Go when those CLIs, apps, or API keys are logged in. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
@@ -1061,7 +1065,7 @@ function Page() {
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children:
-                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenRouter, or Nous, then refresh.'
+                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, OpenRouter, or Nous, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {
