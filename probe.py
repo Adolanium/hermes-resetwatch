@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-HERMES_PROVIDERS = ("anthropic", "openai-codex", "openrouter")
+HERMES_PROVIDERS = ("openai-codex", "openrouter")
+# Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
+# honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
 
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -169,6 +171,103 @@ def _is_claude_oauth_token(token: str) -> bool:
     if token.startswith("sk-ant-") or token.startswith("eyJ") or token.startswith("cc-"):
         return True
     return False
+
+
+def _resetwatch_cache_dir() -> Path:
+    for home in _hermes_homes():
+        path = home / "cache" / "resetwatch"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            continue
+    fallback = Path.home() / ".hermes" / "cache" / "resetwatch"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _anthropic_cache_path() -> Path:
+    return _resetwatch_cache_dir() / "anthropic_usage.json"
+
+
+def _anthropic_ratelimit_path() -> Path:
+    return _resetwatch_cache_dir() / "anthropic_usage.ratelimit"
+
+
+def _read_json_file(path: Path) -> Optional[Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _anthropic_ratelimit_remaining() -> float:
+    payload = _read_json_file(_anthropic_ratelimit_path())
+    if not isinstance(payload, dict):
+        return 0.0
+    until = payload.get("until")
+    if not isinstance(until, (int, float)):
+        return 0.0
+    return max(0.0, float(until) - datetime.now(timezone.utc).timestamp())
+
+
+def _mark_anthropic_ratelimit(retry_after: float) -> None:
+    seconds = max(30.0, min(float(retry_after or 60.0), 6 * 60 * 60))
+    _write_json_file(
+        _anthropic_ratelimit_path(),
+        {"until": datetime.now(timezone.utc).timestamp() + seconds, "retry_after": seconds},
+    )
+
+
+def _clear_anthropic_ratelimit() -> None:
+    try:
+        _anthropic_ratelimit_path().unlink(missing_ok=True)
+    except Exception:
+        return
+
+
+def _cached_anthropic_snapshot() -> Optional[dict]:
+    payload = _read_json_file(_anthropic_cache_path())
+    if not isinstance(payload, dict) or _provider_key(payload.get("provider")) != "anthropic":
+        return None
+    if not (payload.get("windows") or payload.get("details")):
+        return None
+    return payload
+
+
+def _store_anthropic_snapshot(snap: dict) -> None:
+    if not isinstance(snap, dict):
+        return
+    _write_json_file(_anthropic_cache_path(), snap)
+
+
+def _hermes_anthropic_oauth_token() -> Optional[str]:
+    try:
+        from agent.anthropic_adapter import resolve_anthropic_token
+
+        token = (resolve_anthropic_token() or "").strip()
+        if token and _is_claude_oauth_token(token):
+            return token
+    except Exception:
+        pass
+    for home in _hermes_homes():
+        path = home / ".anthropic_oauth.json"
+        payload = _read_json_file(path)
+        if not isinstance(payload, dict):
+            continue
+        token = str(payload.get("accessToken") or payload.get("access_token") or "").strip()
+        if token and _is_claude_oauth_token(token):
+            return token
+    return None
 
 
 def _jwt_exp(token: str) -> Optional[float]:
@@ -1205,10 +1304,25 @@ def infer_claude_plan_name(profile: Optional[dict] = None, usage_payload: Option
     return None
 
 
+def _anthropic_rate_limit_snapshot(remaining: float) -> dict:
+    mins = max(1, int((remaining + 59) // 60))
+    return _snapshot(
+        "anthropic",
+        None,
+        [],
+        [f"Usage API rate-limited · try again in ~{mins}m"],
+    )
+
+
 def _fetch_claude_cli_account_usage() -> Optional[dict]:
-    token = _claude_code_access_token()
+    remaining = _anthropic_ratelimit_remaining()
+    if remaining > 0:
+        return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
+
+    token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
     if not token:
-        return None
+        return _cached_anthropic_snapshot()
+
     import httpx
 
     headers = {
@@ -1219,20 +1333,32 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
         "User-Agent": "claude-code/2.1.0",
     }
     profile: dict = {}
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(CLAUDE_OAUTH_USAGE_URL, headers=headers)
-        response.raise_for_status()
-        payload = response.json() or {}
-        try:
-            profile_resp = client.get(CLAUDE_OAUTH_PROFILE_URL, headers=headers)
-            if profile_resp.status_code < 400:
-                loaded = profile_resp.json() or {}
-                if isinstance(loaded, dict):
-                    profile = loaded
-        except Exception:
-            profile = {}
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(CLAUDE_OAUTH_USAGE_URL, headers=headers)
+            if response.status_code == 429:
+                retry_after = response.headers.get("retry-after")
+                try:
+                    wait = float(retry_after) if retry_after else 3600.0
+                except Exception:
+                    wait = 3600.0
+                _mark_anthropic_ratelimit(wait)
+                return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(wait)
+            response.raise_for_status()
+            payload = response.json() or {}
+            try:
+                profile_resp = client.get(CLAUDE_OAUTH_PROFILE_URL, headers=headers)
+                if profile_resp.status_code < 400:
+                    loaded = profile_resp.json() or {}
+                    if isinstance(loaded, dict):
+                        profile = loaded
+            except Exception:
+                profile = {}
+    except Exception:
+        return _cached_anthropic_snapshot()
+
     if not isinstance(payload, dict):
-        return None
+        return _cached_anthropic_snapshot()
     windows: list[dict] = []
     mapping = (
         ("five_hour", "Current session"),
@@ -1256,8 +1382,11 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
         if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
             details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}")
     if not windows and not details:
-        return None
-    return _snapshot("anthropic", infer_claude_plan_name(profile, payload), windows, details)
+        return _cached_anthropic_snapshot()
+    _clear_anthropic_ratelimit()
+    snap = _snapshot("anthropic", infer_claude_plan_name(profile, payload), windows, details)
+    _store_anthropic_snapshot(snap)
+    return snap
 
 
 def _codex_home() -> Path:

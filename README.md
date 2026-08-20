@@ -73,7 +73,7 @@ both `plugin.js` and `probe.py`.
 - A full `/resetwatch` page in the main workspace
 - Sidebar row (watch icon)
 - Palette command and `mod+alt+r`
-- Live cards, polled every 30s while the page is open
+- Live cards, polled every 5 minutes while the page is open (Refresh still fetches now)
 - Fold-up sections that start open
 - Manual clocks stored in plugin-scoped `ctx.storage`
 

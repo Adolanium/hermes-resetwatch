@@ -7,7 +7,7 @@
  * Manual clocks cover plans with no public remaining-quota API.
  *
  * 1. Import the SDK as a namespace so missing named exports cannot crash load.
- * 2. No hardcoded colours. No polling faster than 30 s.
+ * 2. No hardcoded colours. No polling faster than 5 minutes.
  * 3. No cookies, no scrape, no composer chip, no status bar, no right pane.
  */
 
@@ -19,7 +19,7 @@ const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
 const VERSION = '0.1.6'
-const POLL_MS = 30000
+const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
 const {
@@ -472,21 +472,32 @@ async function fetchLiveCards(sessionId) {
   }
 
   const probed = await probeStockAccountUsage({ cliOnly: haveAccountRpc })
+  let haveClaudeProbe = false
   if (probed && probed.length) {
     const extra = haveAccountRpc
       ? probed.filter(snap => snap && snap.provider && !accountProviders.has(providerKey(snap.provider)))
       : probed
-    cards.push(...cardsFromAccountSnapshots(extra))
+    for (const snap of extra) {
+      const key = providerKey(snap && snap.provider)
+      if (key === 'anthropic' || key === 'claude') haveClaudeProbe = true
+    }
+    if (extra.length) cards.push(...cardsFromAccountSnapshots(extra))
   }
 
-  if (!haveAccountRpc && sid) {
+  // Claude often comes from Hermes /usage when the probe has Codex/etc. but
+  // no Anthropic row. Only skip that fallback once Claude is already present.
+  // Never surface a stale focused-session "session not found".
+  if (!haveAccountRpc && sid && !haveClaudeProbe) {
     try {
       const result = await host.request('slash.exec', { command: 'usage', session_id: sid })
       const output = result && typeof result.output === 'string' ? result.output : ''
       const skipNous = cards.some(card => String(card.id).startsWith('nous:'))
       cards.push(...cardsFromUsageGroups(parseUsageOutput(output), skipNous))
     } catch (error) {
-      errors.push(error && error.message ? error.message : 'Could not run /usage')
+      const message = error && error.message ? error.message : ''
+      if (!/session not found/i.test(message)) {
+        errors.push(message || 'Could not run /usage')
+      }
     }
   }
 
