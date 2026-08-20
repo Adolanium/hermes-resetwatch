@@ -11,13 +11,13 @@
  */
 
 import * as sdk from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.1.0'
+const VERSION = '0.1.1'
 const POLL_MS = 30000
 
 const host = sdk.host
@@ -150,7 +150,23 @@ function isNousProvider(name) {
 }
 
 function isGrokProvider(name) {
-  return /^(grok|xai|xai-oauth)\b/i.test(String(name || '').trim())
+  return /^(grok|xai-oauth|xai)$/i.test(String(name || '').trim())
+}
+
+function isHttpUrl(url) {
+  return /^https?:\/\//i.test(String(url || '').trim())
+}
+
+function newClockId() {
+  return `clock:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+}
+
+function errorMessage(error, fallback) {
+  if (typeof error === 'string' && error && error !== '[object Object]') return error
+  if (error && typeof error.message === 'string' && error.message && error.message !== '[object Object]') {
+    return error.message
+  }
+  return fallback
 }
 
 const PROVIDER_LABELS = {
@@ -231,6 +247,7 @@ function remainingFromBar(bar) {
   const used = clampPercent(bar.pct_used)
   if (used !== null) return { remaining: remainingFromUsed(used), used }
   if (typeof bar.fill_fraction === 'number' && Number.isFinite(bar.fill_fraction)) {
+    // Hermes fill_fraction is remaining (remaining_usd / total_usd), not consumed.
     const remaining = clampPercent(bar.fill_fraction * 100)
     return { remaining, used: remainingFromUsed(remaining) }
   }
@@ -586,7 +603,7 @@ function SectionHeader({ title, open, onToggle, extra }) {
 }
 
 function ProviderBlock({ title, cards, nowMs, empty, actionsFor }) {
-  const [open, toggle] = useSectionOpen(title)
+  const [open, toggle] = useSectionOpen(`provider:${title}`)
   return jsxs('section', {
     style: { display: 'flex', flexDirection: 'column', gap: 8 },
     children: [
@@ -621,6 +638,9 @@ function ClockForm({ onSave, onCancel }) {
       setUrl(next.url)
     }
   }, [presetId])
+
+  const remaining = clampPercent(left)
+  const canSave = Boolean(name.trim()) && remaining !== null
 
   return jsxs('div', {
     style: {
@@ -667,12 +687,12 @@ function ClockForm({ onSave, onCancel }) {
         jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
         jsx(SmallButton, {
           active: true,
+          disabled: !canSave,
           onClick: () => {
-            const remaining = clampPercent(left)
-            if (!name.trim() || remaining === null) return
+            if (!canSave) return
             tap()
             onSave({
-              id: `clock:${Date.now()}`,
+              id: newClockId(),
               name: name.trim(),
               remaining,
               resetAt: fromDatetimeLocal(resetLocal),
@@ -691,6 +711,8 @@ function EditClock({ clock, onSave, onCancel }) {
   const [left, setLeft] = useState(String(clock.remaining))
   const [resetLocal, setResetLocal] = useState(toDatetimeLocal(clock.resetAt))
   const [url, setUrl] = useState(clock.url || '')
+  const remaining = clampPercent(left)
+  const canSave = Boolean(name.trim()) && remaining !== null
   return jsxs('div', {
     style: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 220 },
     children: [
@@ -704,9 +726,9 @@ function EditClock({ clock, onSave, onCancel }) {
         jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
         jsx(SmallButton, {
           active: true,
+          disabled: !canSave,
           onClick: () => {
-            const remaining = clampPercent(left)
-            if (!name.trim() || remaining === null) return
+            if (!canSave) return
             onSave({ ...clock, name: name.trim(), remaining, resetAt: fromDatetimeLocal(resetLocal), url: url.trim() })
           },
           children: 'Save'
@@ -716,26 +738,50 @@ function EditClock({ clock, onSave, onCancel }) {
   })
 }
 
-function useLiveCards(gateway, sessionId) {
+function useLiveCardsPolled(gateway, sessionId) {
   const sid = sessionId || ''
-  if (typeof useQuery !== 'function') {
-    const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
-    const [isFetching, setFetching] = useState(false)
-    const load = () => {
-      if (gateway && gateway !== 'open') return
-      setFetching(true)
-      fetchLiveCards(sid)
-        .then(setData)
-        .catch(error => setData({ cards: [], errors: [String(error)], hadSession: Boolean(sid) }))
-        .finally(() => setFetching(false))
-    }
-    useEffect(() => {
-      load()
-      const id = setInterval(load, POLL_MS)
-      return () => clearInterval(id)
-    }, [gateway, sid])
-    return { data, isFetching, refetch: load }
+  const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
+  const [isFetching, setFetching] = useState(false)
+  const genRef = useRef(0)
+
+  const load = () => {
+    if (gateway !== 'open') return
+    const gen = ++genRef.current
+    setFetching(true)
+    fetchLiveCards(sid)
+      .then(next => {
+        if (gen !== genRef.current) return
+        setData(next)
+      })
+      .catch(error => {
+        if (gen !== genRef.current) return
+        setData({
+          cards: [],
+          errors: [errorMessage(error, 'Could not read live usage')],
+          hadSession: Boolean(sid),
+          haveAccountRpc: false
+        })
+      })
+      .finally(() => {
+        if (gen !== genRef.current) return
+        setFetching(false)
+      })
   }
+
+  useEffect(() => {
+    load()
+    const id = setInterval(load, POLL_MS)
+    return () => {
+      genRef.current += 1
+      clearInterval(id)
+    }
+  }, [gateway, sid])
+
+  return { data, isFetching, refetch: load }
+}
+
+function useLiveCardsQuery(gateway, sessionId) {
+  const sid = sessionId || ''
   return useQuery({
     queryKey: [PLUGIN_ID, 'live', sid],
     queryFn: () => fetchLiveCards(sid),
@@ -744,6 +790,8 @@ function useLiveCards(gateway, sessionId) {
     retry: false
   })
 }
+
+const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled
 
 function groupLiveCards(cards) {
   const groups = []
@@ -782,10 +830,9 @@ function Page() {
   }, [])
 
   const openExternal = url => {
-    if (!url) return
+    if (!isHttpUrl(url)) return
     tap()
     if (os && typeof os.openExternal === 'function') os.openExternal(url)
-    else if (typeof host.navigate === 'function' && url.startsWith('/')) host.navigate(url)
   }
 
   const clockCards = clocks.map(clock => ({
@@ -945,7 +992,7 @@ function Page() {
                             actions: jsxs('div', {
                               style: { display: 'flex', gap: 6 },
                               children: [
-                                card.url
+                                isHttpUrl(card.url)
                                   ? jsx(SmallButton, {
                                       onClick: () => openExternal(card.url),
                                       children: 'Open'
