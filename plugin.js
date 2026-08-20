@@ -183,7 +183,7 @@ const PROVIDER_LABELS = {
   cursor: 'Cursor',
   kimi: 'Kimi',
   'kimi-coding': 'Kimi',
-    grok: 'Grok',
+  grok: 'Grok',
   'xai-oauth': 'Grok',
   xai: 'Grok',
   glm: 'GLM',
@@ -389,6 +389,7 @@ function hermesHomeFromConfig(payload) {
 }
 
 function quoteShell(path) {
+  // shell.exec takes a single command string (no argv). Quote for spaces.
   return `"${String(path).replace(/"/g, '\\"')}"`
 }
 
@@ -406,27 +407,39 @@ async function probeStockAccountUsage(opts) {
   try {
     const shown = await host.request('config.show', {})
     const home = hermesHomeFromConfig(shown)
-    if (!home) return null
+    if (!home) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
     const probe = `${home}/desktop-plugins/resetwatch/probe.py`
     const flags = opts && opts.cliOnly ? ' --cli-only' : ''
+    const failures = []
     for (const python of probePythonCandidates(home)) {
       try {
         const result = await host.request('shell.exec', {
           command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
         })
-        if (!result || result.code) continue
+        if (!result || result.code) {
+          const err = result && result.stderr ? String(result.stderr).trim() : ''
+          failures.push(err || `probe exit ${result && result.code}`)
+          continue
+        }
         const text = String(result.stdout || '').trim()
-        if (!text.startsWith('[')) continue
+        if (!text.startsWith('[')) {
+          failures.push('probe returned non-JSON')
+          continue
+        }
         const parsed = JSON.parse(text)
-        if (Array.isArray(parsed)) return parsed
-      } catch {
-        continue
+        if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
+        failures.push('probe JSON was not a list')
+      } catch (error) {
+        failures.push(errorMessage(error, 'probe failed'))
       }
     }
-  } catch {
-    return null
+    return {
+      snapshots: null,
+      error: failures.find(Boolean) || 'Could not run probe.py (no working Hermes Python)'
+    }
+  } catch (error) {
+    return { snapshots: null, error: errorMessage(error, 'Could not run probe.py') }
   }
-  return null
 }
 
 function go(route) {
@@ -471,7 +484,11 @@ async function fetchLiveCards(sessionId) {
     }
   }
 
-  const probed = await probeStockAccountUsage({ cliOnly: haveAccountRpc })
+  const probeResult = await probeStockAccountUsage({ cliOnly: haveAccountRpc })
+  const probed = probeResult && probeResult.snapshots
+  if (probeResult && probeResult.error && !(probed && probed.length)) {
+    errors.push(probeResult.error)
+  }
   let haveClaudeProbe = false
   if (probed && probed.length) {
     const extra = haveAccountRpc
@@ -1021,7 +1038,7 @@ function Page() {
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children:
-                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, OpenRouter, or Nous, then refresh.'
+                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenRouter, or Nous, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {

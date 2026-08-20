@@ -96,8 +96,10 @@ Manual clocks are whatever you typed. They do not refresh themselves.
 
 Live data goes through the desktop plugin SDK (`host.request` JSON-RPC),
 plus `probe.py` through `shell.exec` when a signed-in CLI or app has
-quota the gateway does not expose. The page only reads. It does not log
-into vendor sites, and it does not write to the gateway host.
+quota the gateway does not expose. The page does not log into vendor
+sites. `probe.py` only reads vendor credential files (it never refreshes
+OAuth tokens or writes them back). It may write a small cache under
+`$HERMES_HOME/cache/resetwatch`. Tokens never go to stdout.
 
 ## Contributing
 

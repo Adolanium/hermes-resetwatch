@@ -3,8 +3,16 @@
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
 Codex CLI logins fill those same cards. Cursor, Kimi, Grok, GLM (ZCode),
-and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins. No tokens
-on stdout.
+and DeepSeek (Hermes DEEPSEEK_API_KEY) come from those logins.
+
+Read-only for vendor credentials: the probe never exchanges refresh
+tokens and never writes back to ~/.claude, ~/.codex, ~/.kimi-code, or
+~/.grok. It may write a small cache under $HERMES_HOME/cache/resetwatch.
+No tokens on stdout.
+
+Vendor usage rows call undocumented private APIs with the same client
+identity those CLIs use (Claude Code, Codex, Grok CLI). Those rows are
+best-effort and can break when a vendor changes its API.
 """
 
 from __future__ import annotations
@@ -26,16 +34,9 @@ HERMES_PROVIDERS = ("openai-codex", "openrouter")
 # honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
 
-CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-CLAUDE_OAUTH_TOKEN_URLS = (
-    "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
-)
 
-CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_TOKEN_SKEW_SECONDS = 120
 
@@ -50,17 +51,16 @@ GLM_PEAK_WEEKDAYS = frozenset({0, 1, 2, 3, 4})  # Monday-Friday
 GLM_PEAK_START_HOUR = 14
 GLM_PEAK_END_HOUR = 18
 
+# Claude / Codex / Grok usage calls use those products' private APIs and
+# client headers. Best-effort only; vendors can change or reject them.
+
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
-KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-KIMI_CODE_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_CODE_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_CODE_TOKEN_SKEW_SECONDS = 60
 
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
-GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
-GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 GROK_TOKEN_SKEW_SECONDS = 60
 
 
@@ -202,7 +202,8 @@ def _read_json_file(path: Path) -> Optional[Any]:
     return payload
 
 
-def _write_json_file(path: Path, payload: Any) -> None:
+def _write_cache_json(path: Path, payload: Any) -> None:
+    """Best-effort cache write. Never used for vendor credential files."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
@@ -222,7 +223,7 @@ def _anthropic_ratelimit_remaining() -> float:
 
 def _mark_anthropic_ratelimit(retry_after: float) -> None:
     seconds = max(30.0, min(float(retry_after or 60.0), 6 * 60 * 60))
-    _write_json_file(
+    _write_cache_json(
         _anthropic_ratelimit_path(),
         {"until": datetime.now(timezone.utc).timestamp() + seconds, "retry_after": seconds},
     )
@@ -247,7 +248,7 @@ def _cached_anthropic_snapshot() -> Optional[dict]:
 def _store_anthropic_snapshot(snap: dict) -> None:
     if not isinstance(snap, dict):
         return
-    _write_json_file(_anthropic_cache_path(), snap)
+    _write_cache_json(_anthropic_cache_path(), snap)
 
 
 def _hermes_anthropic_oauth_token() -> Optional[str]:
@@ -305,17 +306,6 @@ def _hermes_window(window) -> dict:
         "reset_at": reset.isoformat() if reset is not None else None,
         "detail": window.detail,
     }
-
-
-def _write_json_file(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def _cursor_agent_executable() -> Optional[str]:
@@ -470,9 +460,8 @@ def _cursor_access_token() -> Optional[str]:
 
 
 def _fmt_cursor_amount(value: float) -> str:
-    if float(value) == int(value) and abs(value) >= 100:
-        return f"${int(value) / 100:.2f}"
-    return f"${float(value):.2f}"
+    # GetCurrentPeriodUsage planUsage / spendLimitUsage amounts are USD cents.
+    return f"${float(value) / 100.0:.2f}"
 
 
 def _fetch_cursor_account_usage() -> Optional[dict]:
@@ -551,51 +540,12 @@ def _kimi_code_token_expired(creds: dict, *, skew: int = KIMI_CODE_TOKEN_SKEW_SE
     expires_at = creds.get("expires_at")
     if isinstance(expires_at, (int, float)) and math.isfinite(expires_at):
         return float(expires_at) <= (_utc_now().timestamp() + skew)
-    return True
+    # Missing expiry: use the access token as-is (read-only; no refresh).
+    return False
 
 
-def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
-    refresh = creds.get("refresh_token")
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-    import httpx
-
-    with httpx.Client(timeout=15.0) as client:
-        response = client.post(
-            KIMI_CODE_OAUTH_TOKEN_URL,
-            data={
-                "client_id": KIMI_CODE_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh.strip(),
-            },
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-        )
-        if response.status_code >= 400:
-            return None
-        body = response.json() or {}
-    if not isinstance(body, dict):
-        return None
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    updated = dict(creds)
-    updated["access_token"] = access.strip()
-    new_refresh = body.get("refresh_token")
-    if isinstance(new_refresh, str) and new_refresh.strip():
-        updated["refresh_token"] = new_refresh.strip()
-    expires_in = _to_int(body.get("expires_in")) or 900
-    updated["expires_in"] = expires_in
-    updated["expires_at"] = int(_utc_now().timestamp()) + expires_in
-    token_type = body.get("token_type")
-    if isinstance(token_type, str) and token_type.strip():
-        updated["token_type"] = token_type.strip()
-    scope = body.get("scope")
-    if isinstance(scope, str) and scope.strip():
-        updated["scope"] = scope.strip()
-    return updated
-
-
-def _kimi_code_access_token(*, force_refresh: bool = False) -> Optional[str]:
+def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
+    """Return the Kimi access token on disk. Never refreshes or writes creds."""
     path = _kimi_code_credentials_path()
     if not path:
         return None
@@ -603,27 +553,14 @@ def _kimi_code_access_token(*, force_refresh: bool = False) -> Optional[str]:
     if not creds:
         return None
     token = creds.get("access_token")
-    if (
-        isinstance(token, str)
-        and token.strip()
-        and not force_refresh
-        and not _kimi_code_token_expired(creds)
-    ):
-        return token.strip()
-    if force_refresh:
-        creds = _kimi_code_read_credentials(path) or creds
-        token = creds.get("access_token")
-        if isinstance(token, str) and token.strip() and not _kimi_code_token_expired(creds):
-            return token.strip()
-    refreshed = _kimi_code_refresh_tokens(creds)
-    if not refreshed:
+    if not isinstance(token, str) or not token.strip():
         return None
-    try:
-        _write_json_file(path, refreshed)
-    except OSError:
-        pass
-    access = refreshed.get("access_token")
-    return access.strip() if isinstance(access, str) else None
+    token = token.strip()
+    if previous and token == previous.strip():
+        return None
+    if _kimi_code_token_expired(creds):
+        return None
+    return token
 
 
 def infer_kimi_plan_name(payload: Optional[dict] = None) -> Optional[str]:
@@ -721,7 +658,7 @@ def _fetch_kimi_account_usage() -> Optional[dict]:
     with httpx.Client(timeout=15.0) as client:
         response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
         if response.status_code == 401:
-            token = _kimi_code_access_token(force_refresh=True)
+            token = _kimi_code_access_token(previous=token)
             if not token:
                 return None
             headers["Authorization"] = f"Bearer {token}"
@@ -812,80 +749,31 @@ def _grok_read_auth() -> Optional[tuple[Path, str, dict, dict]]:
 def _grok_token_expired(entry: dict, *, skew: int = GROK_TOKEN_SKEW_SECONDS) -> bool:
     expires = _parse_dt(entry.get("expires_at"))
     if expires is None:
-        return True
+        # Missing expiry: use the access token as-is (read-only; no refresh).
+        return False
     return expires.timestamp() <= (_utc_now().timestamp() + skew)
 
 
-def _grok_refresh_entry(entry: dict) -> Optional[dict]:
-    refresh = entry.get("refresh_token")
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-    import httpx
-
-    client_id = str(entry.get("oidc_client_id") or GROK_OAUTH_CLIENT_ID).strip() or GROK_OAUTH_CLIENT_ID
-    with httpx.Client(timeout=15.0) as client:
-        response = client.post(
-            GROK_OAUTH_TOKEN_URL,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            data={
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": refresh.strip(),
-            },
-        )
-        if response.status_code >= 400:
-            return None
-        body = response.json() or {}
-    if not isinstance(body, dict):
-        return None
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    updated = dict(entry)
-    updated["key"] = access.strip()
-    new_refresh = body.get("refresh_token")
-    if isinstance(new_refresh, str) and new_refresh.strip():
-        updated["refresh_token"] = new_refresh.strip()
-    expires_in = _to_int(body.get("expires_in")) or 21600
-    updated["expires_at"] = (
-        datetime.fromtimestamp(_utc_now().timestamp() + expires_in, tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    return updated
-
-
-def _grok_access_context(*, force_refresh: bool = False) -> Optional[tuple[str, str]]:
+def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """Return Grok access token + user id from disk. Never refreshes or writes."""
     loaded = _grok_read_auth()
     if not loaded:
         return None
-    path, map_key, payload, entry = loaded
+    _path, _map_key, _payload, entry = loaded
     token = entry.get("key") or entry.get("access_token")
     user_id = str(entry.get("user_id") or entry.get("principal_id") or "").strip()
-    if isinstance(token, str) and token.strip() and user_id and not force_refresh and not _grok_token_expired(entry):
-        return token.strip(), user_id
-    loaded = _grok_read_auth() or loaded
-    path, map_key, payload, entry = loaded
-    token = entry.get("key") or entry.get("access_token")
-    user_id = str(entry.get("user_id") or entry.get("principal_id") or "").strip()
-    if isinstance(token, str) and token.strip() and user_id and not _grok_token_expired(entry):
-        return token.strip(), user_id
-    refreshed = _grok_refresh_entry(entry)
-    if not refreshed:
+    if not isinstance(token, str) or not token.strip() or not user_id:
         return None
-    payload[map_key] = refreshed
-    try:
-        _write_json_file(path, payload)
-    except OSError:
-        pass
-    access = refreshed.get("key")
-    user_id = str(refreshed.get("user_id") or refreshed.get("principal_id") or user_id or "").strip()
-    if isinstance(access, str) and access.strip() and user_id:
-        return access.strip(), user_id
-    return None
+    token = token.strip()
+    if previous and token == previous.strip():
+        return None
+    if _grok_token_expired(entry):
+        return None
+    return token, user_id
 
 
 def _grok_proxy_headers(token: str, user_id: str) -> dict[str, str]:
+    # Private Grok CLI billing API. Best-effort; xAI may change or reject this.
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -943,7 +831,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     with httpx.Client(timeout=15.0) as client:
         response = client.get(billing_url, headers=headers)
         if response.status_code == 401:
-            context = _grok_access_context(force_refresh=True)
+            context = _grok_access_context(previous=token)
             if not context:
                 return None
             token, user_id = context
@@ -1197,81 +1085,14 @@ def _read_claude_code_credentials() -> Optional[dict]:
     return keychain or file_creds
 
 
-def _write_claude_code_file(creds: dict, access: str, refresh: str, expires_at_ms: int) -> None:
-    path = _claude_credentials_path()
-    existing = creds.get("raw") if creds.get("source") == "file" else None
-    if not isinstance(existing, dict):
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    oauth = existing.get("claudeAiOauth") if isinstance(existing.get("claudeAiOauth"), dict) else {}
-    oauth = dict(oauth)
-    oauth["accessToken"] = access
-    oauth["refreshToken"] = refresh
-    oauth["expiresAt"] = expires_at_ms
-    existing["claudeAiOauth"] = oauth
-    _write_json_file(path, existing)
-
-
-def _refresh_claude_code_tokens(creds: dict) -> Optional[str]:
-    live = _read_claude_code_credentials()
-    if live and _claude_token_valid(live) and live.get("accessToken") != creds.get("accessToken"):
-        return str(live.get("accessToken") or "").strip() or None
-    refresh = str((live or {}).get("refreshToken") or creds.get("refreshToken") or "").strip()
-    if not refresh:
-        return None
-    import httpx
-
-    body = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh,
-        "client_id": CLAUDE_OAUTH_CLIENT_ID,
-    }
-    with httpx.Client(timeout=15.0) as client:
-        payload = None
-        for url in CLAUDE_OAUTH_TOKEN_URLS:
-            try:
-                response = client.post(
-                    url,
-                    data=body,
-                    headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                )
-            except Exception:
-                continue
-            if response.status_code >= 400:
-                continue
-            loaded = response.json() or {}
-            if isinstance(loaded, dict) and isinstance(loaded.get("access_token"), str):
-                payload = loaded
-                break
-        if not payload:
-            return None
-    access = str(payload.get("access_token") or "").strip()
-    if not access:
-        return None
-    next_refresh = str(payload.get("refresh_token") or refresh).strip() or refresh
-    expires_in = _to_int(payload.get("expires_in")) or 3600
-    expires_at_ms = int(_utc_now().timestamp() * 1000) + (expires_in * 1000)
-    try:
-        _write_claude_code_file(live or creds, access, next_refresh, expires_at_ms)
-    except OSError:
-        pass
-    return access
-
-
 def _claude_code_access_token() -> Optional[str]:
+    """Return a live Claude Code access token. Never refreshes or writes creds."""
     creds = _read_claude_code_credentials()
     if not creds:
         return None
     token = str(creds.get("accessToken") or "").strip()
     if token and _claude_token_valid(creds) and _is_claude_oauth_token(token):
         return token
-    refreshed = _refresh_claude_code_tokens(creds)
-    if refreshed and _is_claude_oauth_token(refreshed):
-        return refreshed
     return None
 
 
@@ -1326,6 +1147,8 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
     import httpx
 
     headers = {
+        # Private Anthropic OAuth usage API, same shape Claude Code uses.
+        # Best-effort; Anthropic may change or rate-limit this.
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -1426,62 +1249,17 @@ def _read_codex_cli_auth() -> Optional[tuple[Path, dict, dict]]:
     return path, payload, tokens
 
 
-def _refresh_codex_cli_tokens(tokens: dict) -> Optional[dict]:
-    refresh = tokens.get("refresh_token")
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-    import httpx
-
-    with httpx.Client(timeout=15.0) as client:
-        response = client.post(
-            CODEX_OAUTH_TOKEN_URL,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": USER_AGENT,
-            },
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh.strip(),
-                "client_id": CODEX_OAUTH_CLIENT_ID,
-            },
-        )
-        if response.status_code >= 400:
-            return None
-        body = response.json() or {}
-    if not isinstance(body, dict):
-        return None
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    updated = dict(tokens)
-    updated["access_token"] = access.strip()
-    next_refresh = body.get("refresh_token")
-    if isinstance(next_refresh, str) and next_refresh.strip():
-        updated["refresh_token"] = next_refresh.strip()
-    return updated
-
-
 def _codex_cli_access_context() -> Optional[tuple[str, Optional[str]]]:
+    """Return Codex CLI access token. Never refreshes or writes ~/.codex."""
     loaded = _read_codex_cli_auth()
     if not loaded:
         return None
-    path, payload, tokens = loaded
+    _path, _payload, tokens = loaded
     access = str(tokens.get("access_token") or "").strip()
     account_id = str(tokens.get("account_id") or "").strip() or None
     if access and not _codex_token_expiring(access):
         return access, account_id
-    refreshed = _refresh_codex_cli_tokens(tokens)
-    if not refreshed:
-        return (access, account_id) if access else None
-    payload["tokens"] = refreshed
-    try:
-        _write_json_file(path, payload)
-    except OSError:
-        pass
-    access = str(refreshed.get("access_token") or "").strip()
-    account_id = str(refreshed.get("account_id") or tokens.get("account_id") or "").strip() or None
-    return (access, account_id) if access else None
+    return None
 
 
 def _codex_usage_url(base_url: str) -> str:
@@ -1504,6 +1282,7 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     import httpx
 
     headers = {
+        # Private Codex usage API. Best-effort; OpenAI may change or reject this.
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": "codex-cli",
