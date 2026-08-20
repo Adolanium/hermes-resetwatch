@@ -34,6 +34,26 @@ same CLI and app logins those vendors already use. No browser cookies.
 Nothing is sent off this machine except the same usage calls those apps
 already make for you.
 
+## What's supported
+
+Live cards fill on their own when that login is already on the machine:
+
+- **Nous Portal:** Hermes
+- **Claude:** Hermes OAuth, or Claude Code
+- **Codex:** Hermes OAuth, or the Codex CLI
+- **OpenRouter:** Hermes
+- **Cursor:** Cursor app or `cursor-agent`
+- **Kimi:** Kimi Code
+- **Grok:** Grok CLI
+- **GLM:** ZCode, with a Coding Plan login
+
+Gemini, Perplexity, and anything else can be a manual clock. Type the percent
+left and the reset time.
+
+Want another live row? Open an issue. We can add it if that app or CLI already
+has a remaining-quota path we can read on your machine. We do not scrape vendor
+websites.
+
 ## Install
 
 Copy `plugin.js` and `probe.py` to `$HERMES_HOME/desktop-plugins/resetwatch/`
