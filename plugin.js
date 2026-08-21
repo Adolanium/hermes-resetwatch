@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.4'
+const VERSION = '0.2.5'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -365,15 +365,42 @@ function cardsFromUsageGroups(groups, skipNous) {
   return cards
 }
 
+function maskEmailLabel(label) {
+  const text = String(label || '').trim()
+  const at = text.indexOf('@')
+  if (at <= 0 || at === text.length - 1 || text.includes(' ')) return text
+  return `${text.slice(0, Math.min(2, at))}**${text.slice(at)}`
+}
+
+function snapshotAccountLabel(snap) {
+  return maskEmailLabel(String(snap && snap.account_label ? snap.account_label : '').trim())
+}
+
+function accountIdTag(label) {
+  return String(label || '').trim().replace(/:/g, '-')
+}
+
+function accountCardProvider(id) {
+  const text = String(id || '')
+  if (!text.startsWith('account:')) return ''
+  const rest = text.slice('account:'.length)
+  const colon = rest.indexOf(':')
+  const provider = colon === -1 ? rest : rest.slice(0, colon)
+  return providerKey(provider)
+}
+
 function cardsFromAccountSnapshots(snapshots) {
   const cards = []
   for (const snap of snapshots || []) {
-    const provider = providerTitle(snap.provider, snap.plan)
+    const accountLabel = snapshotAccountLabel(snap)
+    const baseProvider = providerTitle(snap.provider, snap.plan)
+    const provider = accountLabel ? `${baseProvider} · ${accountLabel}` : baseProvider
+    const accountTag = accountLabel ? `:${accountIdTag(accountLabel)}` : ''
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
     windows.forEach((window, index) => {
       cards.push({
-        id: `account:${snap.provider}:${index}:${window.label}`,
+        id: `account:${snap.provider}${accountTag}:${index}:${window.label}`,
         source: 'live',
         provider,
         label: window.label,
@@ -386,7 +413,7 @@ function cardsFromAccountSnapshots(snapshots) {
     })
     if (!windows.length && extra) {
       cards.push({
-        id: `account:${snap.provider}:note`,
+        id: `account:${snap.provider}${accountTag}:note`,
         source: 'live',
         provider,
         label: provider,
@@ -564,8 +591,23 @@ async function fetchLiveCards(sessionId, opts) {
   }
   let haveClaudeProbe = false
   if (probed && probed.length) {
+    const labelledKeys = new Set(
+      probed
+        .filter(snap => snap && snap.provider && snapshotAccountLabel(snap))
+        .map(snap => providerKey(snap.provider))
+    )
+    if (labelledKeys.size) {
+      for (let index = cards.length - 1; index >= 0; index -= 1) {
+        const key = accountCardProvider(cards[index] && cards[index].id)
+        if (key && labelledKeys.has(key)) cards.splice(index, 1)
+      }
+    }
     const extra = haveAccountRpc
-      ? probed.filter(snap => snap && snap.provider && !accountProviders.has(providerKey(snap.provider)))
+      ? probed.filter(snap => {
+          if (!snap || !snap.provider) return false
+          if (snapshotAccountLabel(snap)) return true
+          return !accountProviders.has(providerKey(snap.provider))
+        })
       : probed
     for (const snap of extra) {
       const key = providerKey(snap && snap.provider)

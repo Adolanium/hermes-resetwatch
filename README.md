@@ -41,7 +41,7 @@ Live cards fill on their own when that login is already on the machine:
 
 - **Nous Portal:** Hermes
 - **Claude:** Hermes OAuth, or Claude Code
-- **Codex:** Hermes OAuth, or the Codex CLI
+- **Codex:** every Hermes OAuth account in the credential pool, or the Codex CLI
 - **OpenRouter:** Hermes
 - **Cursor:** Cursor app or `cursor-agent`
 - **Kimi:** Kimi Code CLI, or `KIMI_CODING_API_KEY` / `KIMI_API_KEY` in Hermes env (Coding Plan)
@@ -92,7 +92,9 @@ Nous dollars and renewal time come from the gateway (`usage.bars`, then
 `subscription.state` if needed). If the gateway has `account.usage`, that
 RPC fills Claude, Codex, OpenRouter, and any other providers it already
 knows. On stock Hermes, `probe.py` fills the rest through `shell.exec`:
-the same Claude / Codex / OpenRouter fetchers. If Hermes OAuth is missing,
+the same Claude / Codex / OpenRouter fetchers. Codex also reads every
+`openai-codex` row in `$HERMES_HOME/auth.json` (read only) and shows one
+labelled card set per account. If Hermes OAuth is missing,
 Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards.
 Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), Grok
 CLI (`~/.grok`), and GLM via ZCode (`~/.zcode`) come from those logins

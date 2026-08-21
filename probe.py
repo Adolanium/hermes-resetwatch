@@ -12,7 +12,8 @@ fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
 use Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
-those refresh tokens or writes ~/.claude / ~/.codex. Kimi and Grok may
+those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
+pool cards come from reading $HERMES_HOME/auth.json. Kimi and Grok may
 refresh on 401 and write back only that vendor's file. Before writing,
 the probe re-reads the file and merges token fields into that fresh
 record so concurrent CLI edits to other keys are not reverted. That is
@@ -503,28 +504,42 @@ def _hermes_anthropic_oauth_token() -> Optional[str]:
     return None
 
 
-def _jwt_exp(token: str) -> Optional[float]:
+def _jwt_claims(token: str) -> dict:
     try:
-        parts = token.split(".")
+        parts = str(token or "").split(".")
         if len(parts) < 2:
-            return None
+            return {}
         payload = parts[1] + ("=" * (-len(parts[1]) % 4))
         data = json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
-        return None
-    exp = data.get("exp") if isinstance(data, dict) else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _jwt_exp(token: str) -> Optional[float]:
+    exp = _jwt_claims(token).get("exp")
     if isinstance(exp, (int, float)):
         return float(exp)
     return None
 
 
-def _snapshot(provider: str, plan: Optional[str], windows: list[dict], details: Optional[list[str]] = None) -> dict:
-    return {
+def _snapshot(
+    provider: str,
+    plan: Optional[str],
+    windows: list[dict],
+    details: Optional[list[str]] = None,
+    account_label: Optional[str] = None,
+) -> dict:
+    payload = {
         "provider": provider,
         "plan": plan,
         "details": list(details or ()),
         "windows": windows,
     }
+    label = str(account_label or "").strip()
+    if label:
+        payload["account_label"] = label
+    return payload
 
 
 def _hermes_window(window) -> dict:
@@ -1767,25 +1782,78 @@ def _codex_usage_url(base_url: str) -> str:
     return prefix + "/usage"
 
 
-def _fetch_codex_cli_account_usage() -> Optional[dict]:
-    context = _codex_cli_access_context()
-    if not context:
-        return None
-    token, account_id = context
-    if not token:
+_CODEX_LOGIN_LABELS = {"device_code", "oauth", "openai-codex", "codex", "chatgpt"}
+
+
+def _codex_name_from_token(token: str) -> str:
+    claims = _jwt_claims(token)
+    profile = claims.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        for key in ("email", "name"):
+            value = str(profile.get(key) or "").strip()
+            if value:
+                return value
+    for key in ("email", "preferred_username", "upn"):
+        value = str(claims.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _codex_account_id_from_token(token: str) -> Optional[str]:
+    claims = _jwt_claims(token)
+    auth = claims.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        account_id = str(auth.get("chatgpt_account_id") or "").strip()
+        if account_id:
+            return account_id
+    account_id = str(claims.get("chatgpt_account_id") or "").strip()
+    return account_id or None
+
+
+def _mask_email_label(label: str) -> str:
+    text = str(label or "").strip()
+    at = text.find("@")
+    if at <= 0 or at == len(text) - 1 or " " in text:
+        return text
+    keep = text[: min(2, at)]
+    return f"{keep}**{text[at:]}"
+
+
+def _codex_card_label(entry: dict, token: str) -> str:
+    stored = str(entry.get("label") or "").strip()
+    named = _codex_name_from_token(token)
+    if stored and stored.lower() not in _CODEX_LOGIN_LABELS:
+        return _mask_email_label(stored)
+    if named:
+        return _mask_email_label(named)
+    if stored:
+        return _mask_email_label(stored)
+    return str(entry.get("id") or "").strip() or "Codex"
+
+
+def _fetch_codex_usage(
+    token: str,
+    account_id: Optional[str] = None,
+    base_url: Optional[str] = None,
+    account_label: Optional[str] = None,
+) -> Optional[dict]:
+    access = str(token or "").strip()
+    if not access:
         return None
     import httpx
 
     headers = {
         # Private Codex usage API. Best-effort; OpenAI may change or reject this.
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {access}",
         "Accept": "application/json",
         "User-Agent": "codex-cli",
     }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
+    chatgpt_account = str(account_id or "").strip()
+    if chatgpt_account:
+        headers["ChatGPT-Account-Id"] = chatgpt_account
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        response = client.get(_codex_usage_url(CODEX_DEFAULT_BASE_URL), headers=headers)
+        response = client.get(_codex_usage_url(base_url or CODEX_DEFAULT_BASE_URL), headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
     if not isinstance(payload, dict):
@@ -1817,7 +1885,84 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     if not windows and not details:
         return None
     plan = _title_case_slug(payload.get("plan_type"))
-    return _snapshot("openai-codex", plan, windows, details)
+    return _snapshot("openai-codex", plan, windows, details, account_label=account_label)
+
+
+def _fetch_codex_cli_account_usage() -> Optional[dict]:
+    context = _codex_cli_access_context()
+    if not context:
+        return None
+    token, account_id = context
+    return _fetch_codex_usage(token, account_id)
+
+
+def _read_auth_store(path: Path) -> Optional[dict]:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _codex_pool_entries() -> list[dict]:
+    """Read openai-codex rows from auth.json. Never writes the file."""
+    for home in _hermes_homes():
+        store = _read_auth_store(home / "auth.json")
+        if not store:
+            continue
+        pool = store.get("credential_pool")
+        if not isinstance(pool, dict):
+            continue
+        rows = pool.get("openai-codex")
+        if isinstance(rows, list) and rows:
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _codex_pool_accounts() -> list[dict]:
+    accounts: list[dict] = []
+    seen_tokens: set[str] = set()
+    used_labels: set[str] = set()
+    for entry in _codex_pool_entries():
+        if str(entry.get("last_status") or "").strip().lower() == "dead":
+            continue
+        token = str(entry.get("access_token") or "").strip()
+        if not token or token in seen_tokens:
+            continue
+        if _codex_token_expiring(token):
+            continue
+        seen_tokens.add(token)
+        label = _codex_card_label(entry, token)
+        label_key = label.lower()
+        if label_key in used_labels:
+            extra = str(entry.get("id") or "").strip()
+            if extra:
+                label = f"{label} {extra}"
+                label_key = label.lower()
+        used_labels.add(label_key)
+        accounts.append(
+            {
+                "token": token,
+                "account_id": _codex_account_id_from_token(token),
+                "base_url": str(entry.get("base_url") or "").strip() or None,
+                "label": label,
+            }
+        )
+    return accounts
+
+
+def _codex_pool_fetcher(account: dict):
+    def fetch() -> Optional[dict]:
+        return _fetch_codex_usage(
+            account.get("token") or "",
+            account.get("account_id"),
+            account.get("base_url"),
+            account_label=account.get("label"),
+        )
+
+    return fetch
 
 
 ZCODE_CODING_PROVIDER_IDS = ("builtin:zai-coding-plan", "builtin:bigmodel-coding-plan")
@@ -2723,24 +2868,37 @@ def _collect_cli() -> tuple[list[dict], bool]:
     except Exception as exc:
         return [_snapshot("resetwatch", None, [], [f"probe cannot import httpx: {exc}"])], True
 
-    fetchers = (
-        _fetch_claude_cli_account_usage,
-        _fetch_codex_cli_account_usage,
-        _fetch_cursor_account_usage,
-        _fetch_kimi_account_usage,
-        _fetch_grok_account_usage,
-        _fetch_glm_zcode_account_usage,
-        _fetch_deepseek_account_usage,
-        _fetch_opencode_go_account_usage,
-        _fetch_ollama_cloud_account_usage,
-        _fetch_minimax_account_usage,
-        _fetch_novita_account_usage,
-        _fetch_deepinfra_account_usage,
-        _fetch_ai_gateway_account_usage,
+    pool_accounts = _codex_pool_accounts()
+    cli_token = ""
+    cli_context = _codex_cli_access_context()
+    if cli_context:
+        cli_token = str(cli_context[0] or "").strip()
+    fetchers: list = [_fetch_claude_cli_account_usage]
+    if pool_accounts:
+        fetchers.extend(_codex_pool_fetcher(account) for account in pool_accounts)
+        pool_tokens = {str(account.get("token") or "") for account in pool_accounts}
+        if cli_token and cli_token not in pool_tokens:
+            fetchers.append(_fetch_codex_cli_account_usage)
+    else:
+        fetchers.append(_fetch_codex_cli_account_usage)
+    fetchers.extend(
+        (
+            _fetch_cursor_account_usage,
+            _fetch_kimi_account_usage,
+            _fetch_grok_account_usage,
+            _fetch_glm_zcode_account_usage,
+            _fetch_deepseek_account_usage,
+            _fetch_opencode_go_account_usage,
+            _fetch_ollama_cloud_account_usage,
+            _fetch_minimax_account_usage,
+            _fetch_novita_account_usage,
+            _fetch_deepinfra_account_usage,
+            _fetch_ai_gateway_account_usage,
+        )
     )
     results: dict[int, dict] = {}
     complete = True
-    # One worker per fetcher so the tail of the tuple is never starved behind
+    # One worker per fetcher so the tail of the list is never starved behind
     # a slow peer. Do not wait on hung sockets after the budget; process exit
     # reaps those threads.
     pool = ThreadPoolExecutor(max_workers=len(fetchers))
@@ -2778,6 +2936,37 @@ def _collect_cli() -> tuple[list[dict], bool]:
     return snapshots, complete
 
 
+def _snap_account_label(snap: dict) -> str:
+    return str(snap.get("account_label") or "").strip()
+
+
+def _keep_snapshot(snapshots: list[dict], have: set[str], labelled: set[str], snap: dict) -> None:
+    key = _provider_key(snap.get("provider"))
+    if not key:
+        return
+    account = _snap_account_label(snap)
+    identity = f"{key}:{account.lower()}" if account else key
+    if identity in have:
+        return
+    if account:
+        kept: list[dict] = []
+        for old in snapshots:
+            old_key = _provider_key(old.get("provider"))
+            if old_key == key and not _snap_account_label(old):
+                have.discard(key)
+                continue
+            kept.append(old)
+        snapshots[:] = kept
+        labelled.add(key)
+        snapshots.append(snap)
+        have.add(identity)
+        return
+    if key in labelled:
+        return
+    snapshots.append(snap)
+    have.add(identity)
+
+
 def _emit_json(payload: Any, stream) -> None:
     text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False)
     stream.write(text)
@@ -2797,23 +2986,16 @@ def _main_inner() -> int:
             os._exit(0)
     snapshots: list[dict] = []
     have: set[str] = set()
+    labelled: set[str] = set()
     cli_complete = True
     # Keep gateway import/print noise off the JSON stdout contract.
     with contextlib.redirect_stdout(io.StringIO()):
         if not cli_only:
             for snap in _collect_hermes():
-                key = _provider_key(snap.get("provider"))
-                if not key or key in have:
-                    continue
-                snapshots.append(snap)
-                have.add(key)
+                _keep_snapshot(snapshots, have, labelled, snap)
         cli_snaps, cli_complete = _collect_cli()
         for snap in cli_snaps:
-            key = _provider_key(snap.get("provider"))
-            if not key or key in have:
-                continue
-            snapshots.append(snap)
-            have.add(key)
+            _keep_snapshot(snapshots, have, labelled, snap)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
     _emit_json(snapshots, real_stdout)
