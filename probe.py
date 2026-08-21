@@ -13,7 +13,7 @@ use Hermes env.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
-pool cards come from reading $HERMES_HOME/auth.json. Kimi and Grok may
+and Claude pool cards come from reading $HERMES_HOME/auth.json. Kimi and Grok may
 refresh on 401 and write back only that vendor's file. Before writing,
 the probe re-reads the file and merges token fields into that fresh
 record so concurrent CLI edits to other keys are not reverted. That is
@@ -529,6 +529,7 @@ def _snapshot(
     windows: list[dict],
     details: Optional[list[str]] = None,
     account_label: Optional[str] = None,
+    account_key: Optional[str] = None,
 ) -> dict:
     payload = {
         "provider": provider,
@@ -539,6 +540,9 @@ def _snapshot(
     label = str(account_label or "").strip()
     if label:
         payload["account_label"] = label
+    key = str(account_key or "").strip()
+    if key:
+        payload["account_key"] = key
     return payload
 
 
@@ -1640,21 +1644,83 @@ def _anthropic_rate_limit_snapshot(remaining: float) -> dict:
     )
 
 
-def _fetch_claude_cli_account_usage() -> Optional[dict]:
-    remaining = _anthropic_ratelimit_remaining()
-    if remaining > 0:
-        return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
+_CLAUDE_LOGIN_LABELS = {
+    "dashboard pkce",
+    "hermes_pkce",
+    "claude_code",
+    "oauth",
+    "anthropic",
+    "claude",
+    "device_code",
+}
 
-    token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
-    if not token:
-        return _cached_anthropic_snapshot(max_age=ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
+
+def _claude_name_from_profile(profile: Optional[dict]) -> str:
+    if not isinstance(profile, dict):
+        return ""
+    account = profile.get("account") if isinstance(profile.get("account"), dict) else {}
+    for blob in (account, profile):
+        for key in ("email", "display_name", "name"):
+            value = str(blob.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _claude_card_label(entry: dict, profile: Optional[dict] = None) -> str:
+    stored = str(entry.get("label") or "").strip()
+    named = _claude_name_from_profile(profile)
+    if stored and stored.lower() not in _CLAUDE_LOGIN_LABELS:
+        return _mask_email_label(stored)
+    if named:
+        return _mask_email_label(named)
+    if stored:
+        return _mask_email_label(stored)
+    return str(entry.get("id") or "").strip() or "Claude"
+
+
+def _claude_pool_accounts() -> list[dict]:
+    accounts: list[dict] = []
+    seen_tokens: set[str] = set()
+    for entry in _pool_entries("anthropic"):
+        if str(entry.get("last_status") or "").strip().lower() == "dead":
+            continue
+        token = str(entry.get("access_token") or "").strip()
+        if not token or token in seen_tokens or not _is_claude_oauth_token(token):
+            continue
+        seen_tokens.add(token)
+        accounts.append(
+            {
+                "token": token,
+                "label": _claude_card_label(entry),
+                "entry": entry,
+            }
+        )
+    return accounts
+
+
+def _fetch_claude_usage(
+    token: str,
+    *,
+    account_label: Optional[str] = None,
+    entry: Optional[dict] = None,
+    use_cache: bool = False,
+) -> Optional[dict]:
+    access = str(token or "").strip()
+    if not access:
+        return _cached_anthropic_snapshot() if use_cache else None
+    if _anthropic_ratelimit_remaining() > 0:
+        if use_cache:
+            remaining = _anthropic_ratelimit_remaining()
+            return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
+        return None
 
     import httpx
 
     headers = {
         # Private Anthropic OAuth usage API, same shape Claude Code uses.
         # Best-effort; Anthropic may change or rate-limit this.
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {access}",
         "Accept": "application/json",
         "Content-Type": "application/json",
         "anthropic-beta": "oauth-2025-04-20",
@@ -1671,7 +1737,9 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
                 except Exception:
                     wait = 3600.0
                 _mark_anthropic_ratelimit(wait)
-                return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(wait)
+                if use_cache:
+                    return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(wait)
+                return None
             response.raise_for_status()
             payload = response.json() or {}
             try:
@@ -1683,10 +1751,10 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
             except Exception:
                 profile = {}
     except Exception:
-        return _cached_anthropic_snapshot()
+        return _cached_anthropic_snapshot() if use_cache else None
 
     if not isinstance(payload, dict):
-        return _cached_anthropic_snapshot()
+        return _cached_anthropic_snapshot() if use_cache else None
     windows: list[dict] = []
     mapping = (
         ("five_hour", "Current session"),
@@ -1715,11 +1783,69 @@ def _fetch_claude_cli_account_usage() -> Optional[dict]:
         if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
             details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}")
     if not windows and not details:
-        return _cached_anthropic_snapshot()
+        return _cached_anthropic_snapshot() if use_cache else None
     _clear_anthropic_ratelimit()
-    snap = _snapshot("anthropic", infer_claude_plan_name(profile, payload), windows, details)
-    _store_anthropic_snapshot(snap)
+    label = account_label
+    if entry is not None:
+        label = _claude_card_label(entry, profile)
+    elif not str(label or "").strip():
+        named = _claude_name_from_profile(profile)
+        label = _mask_email_label(named) if named else None
+    snap = _snapshot(
+        "anthropic",
+        infer_claude_plan_name(profile, payload),
+        windows,
+        details,
+        account_label=label,
+        account_key=str((entry or {}).get("id") or "").strip() or None,
+    )
+    if use_cache:
+        _store_anthropic_snapshot(snap)
     return snap
+
+
+def _fetch_claude_cli_account_usage() -> Optional[dict]:
+    remaining = _anthropic_ratelimit_remaining()
+    if remaining > 0:
+        return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
+    token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
+    if not token:
+        return _cached_anthropic_snapshot(max_age=ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
+    return _fetch_claude_usage(token, use_cache=True)
+
+
+def _fetch_claude_accounts_usage() -> Optional[list]:
+    """One worker: walk pooled Claude tokens in order. Stop on 429."""
+    accounts = _claude_pool_accounts()
+    if not accounts:
+        snap = _fetch_claude_cli_account_usage()
+        return [snap] if snap else None
+    out: list[dict] = []
+    pool_tokens = {str(account.get("token") or "") for account in accounts}
+    for account in accounts:
+        if _anthropic_ratelimit_remaining() > 0:
+            break
+        snap = _fetch_claude_usage(
+            account.get("token") or "",
+            account_label=account.get("label"),
+            entry=account.get("entry"),
+            use_cache=False,
+        )
+        if snap:
+            out.append(snap)
+    cli_token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
+    if (
+        cli_token
+        and cli_token not in pool_tokens
+        and _anthropic_ratelimit_remaining() <= 0
+    ):
+        extra = _fetch_claude_usage(cli_token, use_cache=False)
+        if extra:
+            out.append(extra)
+    if out:
+        return out
+    snap = _fetch_claude_cli_account_usage()
+    return [snap] if snap else None
 
 
 def _codex_home() -> Path:
@@ -1837,6 +1963,7 @@ def _fetch_codex_usage(
     account_id: Optional[str] = None,
     base_url: Optional[str] = None,
     account_label: Optional[str] = None,
+    account_key: Optional[str] = None,
 ) -> Optional[dict]:
     access = str(token or "").strip()
     if not access:
@@ -1885,7 +2012,14 @@ def _fetch_codex_usage(
     if not windows and not details:
         return None
     plan = _title_case_slug(payload.get("plan_type"))
-    return _snapshot("openai-codex", plan, windows, details, account_label=account_label)
+    return _snapshot(
+        "openai-codex",
+        plan,
+        windows,
+        details,
+        account_label=account_label,
+        account_key=account_key,
+    )
 
 
 def _fetch_codex_cli_account_usage() -> Optional[dict]:
@@ -1906,8 +2040,11 @@ def _read_auth_store(path: Path) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def _codex_pool_entries() -> list[dict]:
-    """Read openai-codex rows from auth.json. Never writes the file."""
+def _pool_entries(provider: str) -> list[dict]:
+    """Read credential_pool rows from auth.json. Never writes the file."""
+    name = str(provider or "").strip()
+    if not name:
+        return []
     for home in _hermes_homes():
         store = _read_auth_store(home / "auth.json")
         if not store:
@@ -1915,16 +2052,19 @@ def _codex_pool_entries() -> list[dict]:
         pool = store.get("credential_pool")
         if not isinstance(pool, dict):
             continue
-        rows = pool.get("openai-codex")
+        rows = pool.get(name)
         if isinstance(rows, list) and rows:
             return [row for row in rows if isinstance(row, dict)]
     return []
 
 
+def _codex_pool_entries() -> list[dict]:
+    return _pool_entries("openai-codex")
+
+
 def _codex_pool_accounts() -> list[dict]:
     accounts: list[dict] = []
     seen_tokens: set[str] = set()
-    used_labels: set[str] = set()
     for entry in _codex_pool_entries():
         if str(entry.get("last_status") or "").strip().lower() == "dead":
             continue
@@ -1934,20 +2074,13 @@ def _codex_pool_accounts() -> list[dict]:
         if _codex_token_expiring(token):
             continue
         seen_tokens.add(token)
-        label = _codex_card_label(entry, token)
-        label_key = label.lower()
-        if label_key in used_labels:
-            extra = str(entry.get("id") or "").strip()
-            if extra:
-                label = f"{label} {extra}"
-                label_key = label.lower()
-        used_labels.add(label_key)
         accounts.append(
             {
                 "token": token,
                 "account_id": _codex_account_id_from_token(token),
                 "base_url": str(entry.get("base_url") or "").strip() or None,
-                "label": label,
+                "label": _codex_card_label(entry, token),
+                "key": str(entry.get("id") or "").strip(),
             }
         )
     return accounts
@@ -1960,6 +2093,7 @@ def _codex_pool_fetcher(account: dict):
             account.get("account_id"),
             account.get("base_url"),
             account_label=account.get("label"),
+            account_key=account.get("key"),
         )
 
     return fetch
@@ -2873,7 +3007,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
     cli_context = _codex_cli_access_context()
     if cli_context:
         cli_token = str(cli_context[0] or "").strip()
-    fetchers: list = [_fetch_claude_cli_account_usage]
+    fetchers: list = [_fetch_claude_accounts_usage]
     if pool_accounts:
         fetchers.extend(_codex_pool_fetcher(account) for account in pool_accounts)
         pool_tokens = {str(account.get("token") or "") for account in pool_accounts}
@@ -2896,7 +3030,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
             _fetch_ai_gateway_account_usage,
         )
     )
-    results: dict[int, dict] = {}
+    results: dict[tuple[int, int], dict] = {}
     complete = True
     # One worker per fetcher so the tail of the list is never starved behind
     # a slow peer. Do not wait on hung sockets after the budget; process exit
@@ -2921,8 +3055,10 @@ def _collect_cli() -> tuple[list[dict], bool]:
                     snap = fut.result(timeout=0)
                 except Exception:
                     continue
-                if snap and (snap.get("windows") or snap.get("details")):
-                    results[index] = snap
+                items = snap if isinstance(snap, list) else [snap]
+                for sub, item in enumerate(items):
+                    if item and (item.get("windows") or item.get("details")):
+                        results[(index, sub)] = item
         if pending:
             complete = False
             for fut in pending:
@@ -2932,7 +3068,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
             pool.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             pool.shutdown(wait=False)
-    snapshots = [results[index] for index in sorted(results)]
+    snapshots = [results[key] for key in sorted(results)]
     return snapshots, complete
 
 
@@ -2940,11 +3076,18 @@ def _snap_account_label(snap: dict) -> str:
     return str(snap.get("account_label") or "").strip()
 
 
+def _snap_account_key(snap: dict) -> str:
+    key = str(snap.get("account_key") or "").strip()
+    if key:
+        return key
+    return _snap_account_label(snap)
+
+
 def _keep_snapshot(snapshots: list[dict], have: set[str], labelled: set[str], snap: dict) -> None:
     key = _provider_key(snap.get("provider"))
     if not key:
         return
-    account = _snap_account_label(snap)
+    account = _snap_account_key(snap)
     identity = f"{key}:{account.lower()}" if account else key
     if identity in have:
         return

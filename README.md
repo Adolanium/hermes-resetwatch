@@ -40,7 +40,7 @@ already make for you.
 Live cards fill on their own when that login is already on the machine:
 
 - **Nous Portal:** Hermes
-- **Claude:** Hermes OAuth, or Claude Code
+- **Claude:** every Hermes OAuth account in the credential pool, or Claude Code
 - **Codex:** every Hermes OAuth account in the credential pool, or the Codex CLI
 - **OpenRouter:** Hermes
 - **Cursor:** Cursor app or `cursor-agent`
@@ -83,7 +83,8 @@ both `plugin.js` and `probe.py`.
 - Palette command and `mod+alt+r`
 - Live cards, polled every 5 minutes while the page is open. Probe also
   caches vendor API results for 5 minutes; Refresh bypasses that cache.
-- Fold-up sections that start open
+- Fold-up sections that start open. Claude and Codex pool accounts share
+  one fold per vendor.
 - Manual clocks stored in plugin-scoped `ctx.storage`
 
 ## Where the numbers come from
@@ -92,9 +93,9 @@ Nous dollars and renewal time come from the gateway (`usage.bars`, then
 `subscription.state` if needed). If the gateway has `account.usage`, that
 RPC fills Claude, Codex, OpenRouter, and any other providers it already
 knows. On stock Hermes, `probe.py` fills the rest through `shell.exec`:
-the same Claude / Codex / OpenRouter fetchers. Codex also reads every
-`openai-codex` row in `$HERMES_HOME/auth.json` (read only) and shows one
-labelled card set per account. If Hermes OAuth is missing,
+the same Claude / Codex / OpenRouter fetchers. Claude and Codex also read
+every `anthropic` / `openai-codex` row in `$HERMES_HOME/auth.json` (read
+only) and show one labelled card set per account. If Hermes OAuth is missing,
 Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards.
 Cursor (app or `cursor-agent` login), Kimi Code (`~/.kimi-code`), Grok
 CLI (`~/.grok`), and GLM via ZCode (`~/.zcode`) come from those logins

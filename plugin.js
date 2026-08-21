@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.5'
+const VERSION = '0.2.6'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -372,8 +372,21 @@ function maskEmailLabel(label) {
   return `${text.slice(0, Math.min(2, at))}**${text.slice(at)}`
 }
 
+function familyTitle(provider) {
+  const key = providerKey(provider)
+  if (key === 'anthropic' || key === 'claude') return 'Claude'
+  if (key === 'openai-codex') return 'Codex'
+  return PROVIDER_LABELS[key] || String(provider || 'Account')
+}
+
 function snapshotAccountLabel(snap) {
   return maskEmailLabel(String(snap && snap.account_label ? snap.account_label : '').trim())
+}
+
+function snapshotAccountKey(snap) {
+  const key = String(snap && snap.account_key ? snap.account_key : '').trim()
+  if (key) return accountIdTag(key)
+  return accountIdTag(snapshotAccountLabel(snap))
 }
 
 function accountIdTag(label) {
@@ -393,9 +406,9 @@ function cardsFromAccountSnapshots(snapshots) {
   const cards = []
   for (const snap of snapshots || []) {
     const accountLabel = snapshotAccountLabel(snap)
-    const baseProvider = providerTitle(snap.provider, snap.plan)
-    const provider = accountLabel ? `${baseProvider} · ${accountLabel}` : baseProvider
-    const accountTag = accountLabel ? `:${accountIdTag(accountLabel)}` : ''
+    const provider = providerTitle(snap.provider, snap.plan)
+    const group = accountLabel ? familyTitle(snap.provider) : provider
+    const accountTag = snapshotAccountKey(snap) ? `:${snapshotAccountKey(snap)}` : ''
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
     windows.forEach((window, index) => {
@@ -403,6 +416,8 @@ function cardsFromAccountSnapshots(snapshots) {
         id: `account:${snap.provider}${accountTag}:${index}:${window.label}`,
         source: 'live',
         provider,
+        group,
+        account: index === 0 ? accountLabel : '',
         label: window.label,
         remaining: clampPercent(window.remaining_percent) ?? remainingFromUsed(window.used_percent),
         used: clampPercent(window.used_percent),
@@ -416,7 +431,9 @@ function cardsFromAccountSnapshots(snapshots) {
         id: `account:${snap.provider}${accountTag}:note`,
         source: 'live',
         provider,
-        label: provider,
+        group,
+        account: accountLabel,
+        label: accountLabel || provider,
         remaining: null,
         used: null,
         resetAt: null,
@@ -765,6 +782,12 @@ function LimitCard({ card, nowMs, actions }) {
             style: { fontSize: '0.875rem', fontWeight: 600, color: text.primary },
             children: card.label
           }),
+          card.account
+            ? jsx('div', {
+                style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
+                children: card.account
+              })
+            : null,
           reset
             ? jsx('div', {
                 style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
@@ -1070,7 +1093,7 @@ function groupLiveCards(cards) {
   const groups = []
   const index = new Map()
   for (const card of cards || []) {
-    const key = card.provider || 'Account'
+    const key = card.group || card.provider || 'Account'
     if (!index.has(key)) {
       const group = { title: key, cards: [] }
       index.set(key, group)
