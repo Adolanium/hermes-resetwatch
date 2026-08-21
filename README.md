@@ -121,7 +121,8 @@ file; it does not make a shared refresh-token exchange safe if the CLI
 refreshes in the same window. It may also write a small
 cache under `$HERMES_HOME/cache/resetwatch`, including a 5-minute probe
 result cache so vendor APIs are not hit more often than that (Refresh
-passes `--fresh` to bypass; incomplete timed-out runs are not cached).
+passes `--fresh` to bypass; incomplete timed-out runs and empty runs are
+not cached).
 Vendor fetches run in parallel with a time budget so one slow API cannot
 wipe every card. Tokens never go to stdout.
 

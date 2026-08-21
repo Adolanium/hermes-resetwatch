@@ -246,14 +246,40 @@ def _is_claude_oauth_token(token: str) -> bool:
     return False
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite floats so JSON never emits NaN/Infinity."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _resetwatch_cache_dir() -> Path:
     """Return a writable cache dir. Never raises; cache is best-effort only."""
     candidates: list[Path] = []
+    # Prefer homes that already exist so we do not invent ~/.hermes on Windows
+    # ahead of the real %LOCALAPPDATA%\\hermes install.
+    existing: list[Path] = []
+    missing: list[Path] = []
     for home in _hermes_homes():
-        candidates.append(home / "cache" / "resetwatch")
+        target = home / "cache" / "resetwatch"
+        if home.is_dir():
+            existing.append(target)
+        else:
+            missing.append(target)
+    candidates.extend(existing)
+    candidates.extend(missing)
     candidates.append(Path.home() / ".hermes" / "cache" / "resetwatch")
     candidates.append(Path(tempfile.gettempdir()) / "hermes-resetwatch-cache")
+    seen: set[str] = set()
     for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             path.mkdir(parents=True, exist_ok=True)
             return path
@@ -271,8 +297,15 @@ def _anthropic_ratelimit_path() -> Path:
 
 
 def _read_json_file(path: Path) -> Optional[Any]:
+    def _reject_nonfinite(_name: str) -> Any:
+        raise ValueError("non-finite json")
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        # Reject non-standard NaN/Infinity so a poisoned cache cannot crash stdout.
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_nonfinite,
+        )
     except Exception:
         return None
     return payload
@@ -284,7 +317,10 @@ def _write_cache_json(path: Path, payload: Any) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False),
+            encoding="utf-8",
+        )
         os.replace(tmp, path)
         tmp = None
     except Exception:
@@ -459,15 +495,31 @@ def _snapshot(provider: str, plan: Optional[str], windows: list[dict], details: 
 
 
 def _hermes_window(window) -> dict:
-    used = window.used_percent
-    remaining = None if used is None else max(0.0, min(100.0, 100.0 - float(used)))
+    used = getattr(window, "used_percent", None)
+    if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+        used = None
+    else:
+        used = float(used)
+    remaining = None if used is None else max(0.0, min(100.0, 100.0 - used))
     reset = getattr(window, "reset_at", None)
+    reset_iso = None
+    if reset is not None:
+        if hasattr(reset, "isoformat"):
+            try:
+                reset_iso = reset.isoformat()
+            except Exception:
+                reset_iso = None
+        else:
+            parsed = _parse_dt(reset)
+            reset_iso = parsed.isoformat() if parsed is not None else None
+    label = getattr(window, "label", None)
+    label_text = str(label).strip() if label is not None else ""
     return {
-        "label": window.label,
+        "label": label_text or "Limit",
         "used_percent": used,
         "remaining_percent": remaining,
-        "reset_at": reset.isoformat() if reset is not None else None,
-        "detail": window.detail,
+        "reset_at": reset_iso,
+        "detail": getattr(window, "detail", None),
     }
 
 
@@ -800,19 +852,23 @@ def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bo
         return None
     # TOCTOU: CLI may have refreshed while we were on the wire.
     current = _kimi_code_read_credentials(path)
+    if not isinstance(current, dict):
+        # Do not clobber a file we could not read. Use the refreshed token
+        # for this run only and leave disk alone.
+        access = refreshed.get("access_token")
+        return access.strip() if isinstance(access, str) and access.strip() else None
     current_token = None
-    if isinstance(current, dict):
-        raw = current.get("access_token")
-        current_token = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    raw = current.get("access_token")
+    current_token = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if previous and current_token and current_token != previous.strip():
         return current_token
-    merged = dict(current) if isinstance(current, dict) else {}
+    merged = dict(current)
     for key in ("access_token", "refresh_token", "expires_in", "expires_at", "token_type", "scope"):
         if key in refreshed:
             merged[key] = refreshed[key]
     try:
         _write_secret_json(path, merged)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass
     access = merged.get("access_token")
     return access.strip() if isinstance(access, str) and access.strip() else None
@@ -1941,11 +1997,13 @@ def _hermes_homes() -> list[Path]:
     override = (os.environ.get("HERMES_HOME") or "").strip()
     if override:
         roots.append(Path(override).expanduser())
-    roots.append(_user_home() / ".hermes")
+    # Match plugin.js / README: Windows real home is %LOCALAPPDATA%\\hermes
+    # before the legacy ~/.hermes path.
     if _is_windows():
         local = os.environ.get("LOCALAPPDATA") or ""
         if local:
             roots.append(Path(local) / "hermes")
+    roots.append(_user_home() / ".hermes")
     unique: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -2571,18 +2629,18 @@ def _collect_hermes() -> list[dict]:
     for provider in HERMES_PROVIDERS:
         try:
             snap = fetch_account_usage(provider)
+            if not snap or not getattr(snap, "available", False):
+                continue
+            snapshots.append(
+                {
+                    "provider": snap.provider,
+                    "plan": snap.plan,
+                    "details": list(snap.details or ()),
+                    "windows": [_hermes_window(item) for item in (snap.windows or ())],
+                }
+            )
         except Exception:
             continue
-        if not snap or not getattr(snap, "available", False):
-            continue
-        snapshots.append(
-            {
-                "provider": snap.provider,
-                "plan": snap.plan,
-                "details": list(snap.details or ()),
-                "windows": [_hermes_window(item) for item in (snap.windows or ())],
-            }
-        )
     return snapshots
 
 
@@ -2652,15 +2710,20 @@ def _collect_cli() -> tuple[list[dict], bool]:
     return snapshots, complete
 
 
-def main() -> int:
+def _emit_json(payload: Any, stream) -> None:
+    text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False)
+    stream.write(text)
+    stream.flush()
+
+
+def _main_inner() -> int:
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout
     if not fresh:
         cached = _read_probe_result_cache(cli_only=cli_only)
         if cached is not None:
-            json.dump(cached, real_stdout, ensure_ascii=True, allow_nan=False)
-            real_stdout.flush()
+            _emit_json(cached, real_stdout)
             # Non-daemon pool threads must not keep this process alive.
             os._exit(0)
     snapshots: list[dict] = []
@@ -2682,12 +2745,31 @@ def main() -> int:
                 continue
             snapshots.append(snap)
             have.add(key)
-    if cli_complete:
+    if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
-    json.dump(snapshots, real_stdout, ensure_ascii=True, allow_nan=False)
-    real_stdout.flush()
+    _emit_json(snapshots, real_stdout)
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)
+
+
+def main() -> int:
+    try:
+        return _main_inner()
+    except BaseException as exc:
+        # Never leave stdout empty: plugin contract is always a JSON array.
+        payload = [
+            _snapshot(
+                "resetwatch",
+                None,
+                [],
+                [f"probe failed: {type(exc).__name__}: {exc}"],
+            )
+        ]
+        try:
+            _emit_json(payload, sys.stdout)
+        except Exception:
+            pass
+        return 0
 
 
 if __name__ == "__main__":

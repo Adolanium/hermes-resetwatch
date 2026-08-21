@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.2'
+const VERSION = '0.2.3'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -995,12 +995,14 @@ function useLiveCardsQuery(gateway, sessionId) {
       .fetchQuery({
         queryKey: [PLUGIN_ID, 'live', sid, 'fresh'],
         queryFn: () => fetchLiveCards(sid, { fresh: true }),
-        staleTime: 0
+        staleTime: 0,
+        retry: false
       })
       .then(data => {
         queryClient.setQueryData([PLUGIN_ID, 'live', sid], data)
         return data
       })
+      .catch(() => null)
       .finally(() => setManualFetching(false))
   }
   return { data: query.data, isFetching: !!(query.isFetching || manualFetching), refetch }
