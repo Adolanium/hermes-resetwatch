@@ -41,7 +41,7 @@ Live cards fill on their own when that login is already on the machine:
 
 - **Nous Portal:** Hermes
 - **Claude:** Hermes OAuth, or Claude Code
-- **Codex:** Hermes OAuth, or the Codex CLI
+- **Codex:** every Hermes OAuth account in the credential pool, or the Codex CLI
 - **OpenRouter:** Hermes
 - **Cursor:** Cursor app or `cursor-agent`
 - **Kimi:** Kimi Code CLI, or `KIMI_CODING_API_KEY` / `KIMI_API_KEY` in Hermes env (Coding Plan)

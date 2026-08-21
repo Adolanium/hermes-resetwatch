@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.4'
+const VERSION = '0.2.5'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -368,12 +368,15 @@ function cardsFromUsageGroups(groups, skipNous) {
 function cardsFromAccountSnapshots(snapshots) {
   const cards = []
   for (const snap of snapshots || []) {
-    const provider = providerTitle(snap.provider, snap.plan)
+    const accountLabel = String(snap.account_label || '').trim()
+    const baseProvider = providerTitle(snap.provider, snap.plan)
+    const provider = accountLabel ? `${baseProvider} — ${accountLabel}` : baseProvider
+    const accountKey = accountLabel ? `:${accountLabel}` : ''
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
     windows.forEach((window, index) => {
       cards.push({
-        id: `account:${snap.provider}:${index}:${window.label}`,
+        id: `account:${snap.provider}${accountKey}:${index}:${window.label}`,
         source: 'live',
         provider,
         label: window.label,
@@ -386,7 +389,7 @@ function cardsFromAccountSnapshots(snapshots) {
     })
     if (!windows.length && extra) {
       cards.push({
-        id: `account:${snap.provider}:note`,
+        id: `account:${snap.provider}${accountKey}:note`,
         source: 'live',
         provider,
         label: provider,
@@ -513,7 +516,7 @@ function go(route) {
 }
 
 async function fetchLiveCards(sessionId, opts) {
-  const cards = []
+  let cards = []
   const errors = []
   const sid = sessionId || readSessionId()
   const fresh = !!(opts && opts.fresh)
@@ -557,15 +560,31 @@ async function fetchLiveCards(sessionId, opts) {
     }
   }
 
-  const probeResult = await probeStockAccountUsage({ cliOnly: haveAccountRpc, fresh })
+  const probeResult = await probeStockAccountUsage({ cliOnly: false, fresh })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
   }
   let haveClaudeProbe = false
   if (probed && probed.length) {
+    const labelledProviders = new Set(
+      probed
+        .filter(snap => snap && snap.provider && String(snap.account_label || '').trim())
+        .map(snap => providerKey(snap.provider))
+    )
+    if (labelledProviders.size) {
+      cards = cards.filter(card => {
+        const match = /^account:([^:]+)/.exec(String(card.id || ''))
+        return !match || !labelledProviders.has(providerKey(match[1]))
+      })
+    }
     const extra = haveAccountRpc
-      ? probed.filter(snap => snap && snap.provider && !accountProviders.has(providerKey(snap.provider)))
+      ? probed.filter(
+          snap =>
+            snap &&
+            snap.provider &&
+            (String(snap.account_label || '').trim() || !accountProviders.has(providerKey(snap.provider)))
+        )
       : probed
     for (const snap of extra) {
       const key = providerKey(snap && snap.provider)

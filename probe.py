@@ -2690,11 +2690,50 @@ def _fetch_ai_gateway_account_usage() -> Optional[dict]:
 
 def _collect_hermes() -> list[dict]:
     try:
-        from agent.account_usage import fetch_account_usage
+        from agent.account_usage import _fetch_codex_account_usage, fetch_account_usage
     except Exception:
         return []
     snapshots = []
     for provider in HERMES_PROVIDERS:
+        if provider == "openai-codex":
+            try:
+                from agent.credential_pool import load_pool
+
+                entries = [entry for entry in load_pool(provider).entries() if entry.runtime_api_key]
+
+                def fetch_entry(entry):
+                    snap = _fetch_codex_account_usage(
+                        base_url=entry.runtime_base_url,
+                        api_key=entry.runtime_api_key,
+                    )
+                    return entry, snap
+
+                if entries:
+                    results: dict[int, tuple[Any, Any]] = {}
+                    with ThreadPoolExecutor(max_workers=min(len(entries), 8)) as pool:
+                        futures = {pool.submit(fetch_entry, entry): index for index, entry in enumerate(entries)}
+                        for future, index in ((future, futures[future]) for future in futures):
+                            try:
+                                results[index] = future.result(timeout=HTTP_TIMEOUT + 2)
+                            except Exception:
+                                continue
+                    for index in sorted(results):
+                        entry, snap = results[index]
+                        if not snap or not getattr(snap, "available", False):
+                            continue
+                        snapshots.append(
+                            {
+                                "provider": snap.provider,
+                                "plan": snap.plan,
+                                "account_label": entry.label,
+                                "details": list(snap.details or ()),
+                                "windows": [_hermes_window(item) for item in (snap.windows or ())],
+                            }
+                        )
+                    if snapshots:
+                        continue
+            except Exception:
+                pass
         try:
             snap = fetch_account_usage(provider)
             if not snap or not getattr(snap, "available", False):
@@ -2797,23 +2836,28 @@ def _main_inner() -> int:
             os._exit(0)
     snapshots: list[dict] = []
     have: set[str] = set()
+    covered_providers: set[str] = set()
     cli_complete = True
     # Keep gateway import/print noise off the JSON stdout contract.
     with contextlib.redirect_stdout(io.StringIO()):
         if not cli_only:
             for snap in _collect_hermes():
                 key = _provider_key(snap.get("provider"))
-                if not key or key in have:
+                account = str(snap.get("account_label") or "").strip().lower()
+                identity = f"{key}:{account}" if account else key
+                if not key or identity in have:
                     continue
                 snapshots.append(snap)
-                have.add(key)
+                have.add(identity)
+                covered_providers.add(key)
         cli_snaps, cli_complete = _collect_cli()
         for snap in cli_snaps:
             key = _provider_key(snap.get("provider"))
-            if not key or key in have:
+            if not key or key in covered_providers or key in have:
                 continue
             snapshots.append(snap)
             have.add(key)
+            covered_providers.add(key)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
     _emit_json(snapshots, real_stdout)
