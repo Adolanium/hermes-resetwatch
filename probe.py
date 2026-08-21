@@ -42,6 +42,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,34 @@ CURSOR_CLI_TIMEOUT = 8
 ANTHROPIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS = 15 * 60
 MINIMAX_HTTP_TIMEOUT = 5.0
+# Credential write grace: wait briefly before os._exit so a finishing
+# Kimi/Grok refresh can land on disk.
+CREDENTIAL_WRITE_GRACE_SECONDS = 5.0
+
+_refresh_writes = 0
+_refresh_writes_lock = threading.Lock()
+
+
+def _begin_secret_write() -> None:
+    global _refresh_writes
+    with _refresh_writes_lock:
+        _refresh_writes += 1
+
+
+def _end_secret_write() -> None:
+    global _refresh_writes
+    with _refresh_writes_lock:
+        _refresh_writes = max(0, _refresh_writes - 1)
+
+
+def _wait_for_credential_writes(timeout: float = CREDENTIAL_WRITE_GRACE_SECONDS) -> None:
+    deadline = time.monotonic() + float(timeout)
+    while time.monotonic() < deadline:
+        with _refresh_writes_lock:
+            if _refresh_writes <= 0:
+                return
+        time.sleep(0.05)
+
 
 HERMES_PROVIDERS = ("openai-codex", "openrouter")
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
@@ -334,14 +363,18 @@ def _write_cache_json(path: Path, payload: Any) -> None:
 
 def _write_secret_json(path: Path, payload: dict) -> None:
     """Atomic write for Kimi/Grok credential files only. Never Claude/Codex."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    _begin_secret_write()
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        _end_secret_write()
 
 
 def _probe_result_cache_path(*, cli_only: bool) -> Path:
@@ -523,6 +556,19 @@ def _hermes_window(window) -> dict:
     }
 
 
+def _version_key(name: str) -> tuple:
+    parts: list[int] = []
+    for part in str(name or "").split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else -1)
+    return tuple(parts)
+
+
 def _cursor_agent_executable() -> Optional[str]:
     override = (os.environ.get("CURSOR_AGENT") or os.environ.get("CURSOR_USAGE_AGENT") or "").strip()
     if override:
@@ -541,7 +587,7 @@ def _cursor_agent_executable() -> Optional[str]:
         if versions.is_dir():
             version_bins = sorted(
                 (item / "cursor-agent" for item in versions.iterdir() if item.is_dir()),
-                key=lambda item: item.parent.name,
+                key=lambda item: _version_key(item.parent.name),
                 reverse=True,
             )
             candidates.extend(version_bins)
@@ -574,6 +620,7 @@ def _cursor_cli_json(args: list[str]) -> Optional[dict]:
             text=True,
             timeout=CURSOR_CLI_TIMEOUT,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     except Exception:
         return None
@@ -687,6 +734,7 @@ def _cursor_macos_keychain_token() -> Optional[str]:
             text=True,
             timeout=5,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     except Exception:
         return None
@@ -714,6 +762,12 @@ def _fmt_cursor_amount(value: float) -> str:
     return f"${float(value) / 100.0:.2f}"
 
 
+def _finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def _fetch_cursor_account_usage() -> Optional[dict]:
     token = _cursor_access_token()
     if not token:
@@ -735,27 +789,27 @@ def _fetch_cursor_account_usage() -> Optional[dict]:
     plan_usage = payload.get("planUsage") if isinstance(payload.get("planUsage"), dict) else {}
     reset_at = _parse_dt(payload.get("billingCycleEnd"))
     windows: list[dict] = []
-    limit = plan_usage.get("limit")
-    remaining = plan_usage.get("remaining")
-    if isinstance(limit, (int, float)) and float(limit) > 0 and isinstance(remaining, (int, float)):
-        used_percent = max(0.0, min(100.0, (1.0 - float(remaining) / float(limit)) * 100.0))
+    limit = _finite_number(plan_usage.get("limit"))
+    remaining = _finite_number(plan_usage.get("remaining"))
+    if limit is not None and limit > 0 and remaining is not None:
+        used_percent = max(0.0, min(100.0, (1.0 - remaining / limit) * 100.0))
         windows.append(
             _win(
                 "Included spend",
                 used_percent,
                 reset_at,
-                f"{_fmt_cursor_amount(float(remaining))} of {_fmt_cursor_amount(float(limit))} left",
+                f"{_fmt_cursor_amount(remaining)} of {_fmt_cursor_amount(limit)} left",
             )
         )
     for key, label in (("autoPercentUsed", "Auto"), ("apiPercentUsed", "API models")):
-        pct = plan_usage.get(key)
-        if isinstance(pct, (int, float)):
-            windows.append(_win(label, max(0.0, min(100.0, float(pct))), reset_at))
+        pct = _finite_number(plan_usage.get(key))
+        if pct is not None:
+            windows.append(_win(label, max(0.0, min(100.0, pct)), reset_at))
     spend = payload.get("spendLimitUsage") if isinstance(payload.get("spendLimitUsage"), dict) else {}
-    spend_limit = spend.get("limit")
-    spend_used = spend.get("used")
-    if isinstance(spend_limit, (int, float)) and float(spend_limit) > 0 and isinstance(spend_used, (int, float)):
-        used_percent = max(0.0, min(100.0, float(spend_used) / float(spend_limit) * 100.0))
+    spend_limit = _finite_number(spend.get("limit"))
+    spend_used = _finite_number(spend.get("used"))
+    if spend_limit is not None and spend_limit > 0 and spend_used is not None:
+        used_percent = max(0.0, min(100.0, spend_used / spend_limit * 100.0))
         windows.append(_win("Spend limit", used_percent, reset_at))
     if not windows:
         return None
@@ -932,11 +986,11 @@ def _kimi_extra_usage_window(payload: dict) -> Optional[dict]:
         return None
     amount = _to_int(balance.get("amount"))
     amount_left = _to_int(balance.get("amountLeft"))
-    if amount is None or amount <= 0:
+    if amount is None or amount <= 0 or amount_left is None:
         return None
     scale = 1_000_000
     total = amount / scale
-    left = (amount_left / scale) if amount_left is not None else 0.0
+    left = amount_left / scale
     if 0 < total < 0.01:
         total = 0.01
     if 0 < left < 0.01:
@@ -1155,8 +1209,12 @@ def _grok_access_context(
     token = entry.get("key") or entry.get("access_token")
     user_id = str(entry.get("user_id") or entry.get("principal_id") or "").strip()
     token = token.strip() if isinstance(token, str) and token.strip() else None
-    if token and user_id and (not previous or token != previous.strip()):
-        return token, user_id
+    # Token freshness and user_id are separate. A missing user_id cannot be
+    # fixed by burning a rotating refresh token.
+    if token and (not previous or token != previous.strip()):
+        if user_id:
+            return token, user_id
+        return None
     if not allow_refresh:
         return None
     refreshed = _grok_refresh_entry(entry)
@@ -1180,15 +1238,15 @@ def _grok_access_context(
     for key in ("key", "refresh_token", "expires_at"):
         if key in refreshed:
             merged[key] = refreshed[key]
+    merged_user = str(merged.get("user_id") or merged.get("principal_id") or disk_user or "").strip()
     payload2[map_key2] = merged
     try:
         _write_secret_json(path2, payload2)
     except OSError:
         pass
     access = merged.get("key")
-    user_id = str(merged.get("user_id") or merged.get("principal_id") or disk_user or "").strip()
-    if isinstance(access, str) and access.strip() and user_id:
-        return access.strip(), user_id
+    if isinstance(access, str) and access.strip() and merged_user:
+        return access.strip(), merged_user
     return None
 
 
@@ -1494,6 +1552,15 @@ def _claude_token_valid(creds: dict) -> bool:
     return now_ms < (expires_ms - 60_000)
 
 
+def _expires_ms(creds: dict) -> float:
+    raw = creds.get("expiresAt") or 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
 def _read_claude_code_credentials() -> Optional[dict]:
     keychain = _read_claude_code_os_store()
     file_creds = _read_claude_code_file()
@@ -1504,9 +1571,7 @@ def _read_claude_code_credentials() -> Optional[dict]:
             return keychain
         if file_ok and not key_ok:
             return file_creds
-        key_exp = keychain.get("expiresAt") or 0
-        file_exp = file_creds.get("expiresAt") or 0
-        return keychain if key_exp >= file_exp else file_creds
+        return keychain if _expires_ms(keychain) >= _expires_ms(file_creds) else file_creds
     return keychain or file_creds
 
 
@@ -2273,17 +2338,20 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
     }
     plan = None
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        me = client.post(
-            OLLAMA_CLOUD_ME_URL,
-            headers={**headers, "Content-Type": "application/json"},
-            json={},
-        )
-        if me.status_code == 200:
-            try:
-                body = me.json()
-            except Exception:
-                body = None
-            plan = _ollama_plan_name(body if isinstance(body, dict) else None)
+        try:
+            me = client.post(
+                OLLAMA_CLOUD_ME_URL,
+                headers={**headers, "Content-Type": "application/json"},
+                json={},
+            )
+            if me.status_code == 200:
+                try:
+                    body = me.json()
+                except Exception:
+                    body = None
+                plan = _ollama_plan_name(body if isinstance(body, dict) else None)
+        except Exception:
+            plan = None
         response = client.get(OLLAMA_CLOUD_USAGE_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
@@ -2724,6 +2792,7 @@ def _main_inner() -> int:
         cached = _read_probe_result_cache(cli_only=cli_only)
         if cached is not None:
             _emit_json(cached, real_stdout)
+            _wait_for_credential_writes()
             # Non-daemon pool threads must not keep this process alive.
             os._exit(0)
     snapshots: list[dict] = []
@@ -2748,6 +2817,7 @@ def _main_inner() -> int:
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
     _emit_json(snapshots, real_stdout)
+    _wait_for_credential_writes()
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)
 

@@ -12,13 +12,13 @@
  */
 
 import * as sdk from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.3'
+const VERSION = '0.2.4'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -685,6 +685,20 @@ function displayDetail(card) {
   return detail
 }
 
+function renderDetailText(detail) {
+  const value = String(detail || '')
+  const marker = 'Peak pricing now'
+  const index = value.indexOf(marker)
+  if (index < 0) return value
+  return jsxs(Fragment, {
+    children: [
+      value.slice(0, index),
+      jsx('span', { style: { fontWeight: 700 }, children: marker }),
+      value.slice(index + marker.length)
+    ]
+  })
+}
+
 function LimitCard({ card, nowMs, actions }) {
   const remaining = card.remaining
   const tone = toneForRemaining(remaining)
@@ -718,7 +732,7 @@ function LimitCard({ card, nowMs, actions }) {
           detail
             ? jsx('div', {
                 style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
-                children: detail
+                children: renderDetailText(detail)
               })
             : null
         ]
@@ -1042,6 +1056,7 @@ function Page() {
   )
 
   useEffect(() => {
+    $now.set(Date.now())
     const id = setInterval(() => $now.set(Date.now()), 30000)
     return () => clearInterval(id)
   }, [])
