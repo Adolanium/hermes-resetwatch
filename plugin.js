@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.7'
+const VERSION = '0.2.8'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -518,28 +518,33 @@ async function probeStockAccountUsage(opts) {
       .map(flag => ` ${flag}`)
       .join('')
     const failures = []
+    // The plugin folder is "resetwatch" when installed by hand, but a plain
+    // clone of the repo lands as "hermes-resetwatch". Accept both.
+    const folders = ['resetwatch', 'hermes-resetwatch']
     for (const home of homes) {
-      const probe = `${home}/desktop-plugins/resetwatch/probe.py`
-      for (const python of probePythonCandidates(home)) {
-        try {
-          const result = await host.request('shell.exec', {
-            command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
-          })
-          if (!result || result.code) {
-            const err = result && result.stderr ? String(result.stderr).trim() : ''
-            failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
-            continue
+      for (const folder of folders) {
+        const probe = `${home}/desktop-plugins/${folder}/probe.py`
+        for (const python of probePythonCandidates(home)) {
+          try {
+            const result = await host.request('shell.exec', {
+              command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
+            })
+            if (!result || result.code) {
+              const err = result && result.stderr ? String(result.stderr).trim() : ''
+              failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
+              continue
+            }
+            const text = String(result.stdout || '').trim()
+            if (!text.startsWith('[')) {
+              failures.push('probe returned non-JSON')
+              continue
+            }
+            const parsed = JSON.parse(text)
+            if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
+            failures.push('probe JSON was not a list')
+          } catch (error) {
+            failures.push(errorMessage(error, 'probe failed'))
           }
-          const text = String(result.stdout || '').trim()
-          if (!text.startsWith('[')) {
-            failures.push('probe returned non-JSON')
-            continue
-          }
-          const parsed = JSON.parse(text)
-          if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
-          failures.push('probe JSON was not a list')
-        } catch (error) {
-          failures.push(errorMessage(error, 'probe failed'))
         }
       }
     }
