@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.6'
+const VERSION = '0.2.7'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host

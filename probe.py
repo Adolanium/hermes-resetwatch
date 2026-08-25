@@ -1958,6 +1958,18 @@ def _codex_card_label(entry: dict, token: str) -> str:
     return str(entry.get("id") or "").strip() or "Codex"
 
 
+_CODEX_WEEKLY_SECONDS = 7 * 24 * 3600
+
+
+def _codex_window_label(window: dict, fallback: str) -> str:
+    # Some plans put the weekly limit in primary_window, so position alone
+    # cannot tell which window this is.
+    seconds = window.get("limit_window_seconds")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds <= 0:
+        return fallback
+    return "Weekly" if seconds >= _CODEX_WEEKLY_SECONDS else "Session"
+
+
 def _fetch_codex_usage(
     token: str,
     account_id: Optional[str] = None,
@@ -1987,13 +1999,17 @@ def _fetch_codex_usage(
         return None
     rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
     windows: list[dict] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key, fallback in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) if isinstance(rate_limit.get(key), dict) else {}
         used = window.get("used_percent")
         if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
             continue
         windows.append(
-            _win(label, max(0.0, min(100.0, float(used))), _parse_dt(window.get("reset_at")))
+            _win(
+                _codex_window_label(window, fallback),
+                max(0.0, min(100.0, float(used))),
+                _parse_dt(window.get("reset_at")),
+            )
         )
     details: list[str] = []
     reset_credits = payload.get("rate_limit_reset_credits") if isinstance(payload.get("rate_limit_reset_credits"), dict) else {}
