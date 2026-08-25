@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -1679,6 +1680,26 @@ def _claude_card_label(entry: dict, profile: Optional[dict] = None) -> str:
     return str(entry.get("id") or "").strip() or "Claude"
 
 
+def _claude_account_key(profile: Optional[dict], entry: Optional[dict]) -> Optional[str]:
+    # The same account can be reachable through two OAuth grants (Hermes pool
+    # and the Claude Code CLI). Key on who the account is, not which token or
+    # pool entry reached it, so the duplicates collapse into one card.
+    identity = ""
+    if isinstance(profile, dict):
+        account = profile.get("account") if isinstance(profile.get("account"), dict) else {}
+        for blob in (account, profile):
+            for field in ("uuid", "email"):
+                value = str(blob.get(field) or "").strip().lower()
+                if value:
+                    identity = value
+                    break
+            if identity:
+                break
+    if identity:
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    return str((entry or {}).get("id") or "").strip() or None
+
+
 def _claude_pool_accounts() -> list[dict]:
     accounts: list[dict] = []
     seen_tokens: set[str] = set()
@@ -1797,7 +1818,7 @@ def _fetch_claude_usage(
         windows,
         details,
         account_label=label,
-        account_key=str((entry or {}).get("id") or "").strip() or None,
+        account_key=_claude_account_key(profile, entry),
     )
     if use_cache:
         _store_anthropic_snapshot(snap)
