@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.10'
+const VERSION = '0.2.11'
 const POLL_MS = 5 * 60 * 1000
 
 const host = sdk.host
@@ -224,6 +224,7 @@ const PROVIDER_LABELS = {
   'ai-gateway': 'AI Gateway',
   vercel: 'AI Gateway',
   'vercel-ai-gateway': 'AI Gateway',
+  commandcode: 'Command Code',
   nous: 'Nous'
 }
 
@@ -1203,7 +1204,7 @@ function Page() {
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
             children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Click a section name to fold it up.'
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMAND_CODE_API_KEY. Click a section name to fold it up.'
           }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
@@ -1233,7 +1234,7 @@ function Page() {
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children:
-                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, OpenRouter, or Nous, then refresh.'
+                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, Command Code, OpenRouter, or Nous, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {
