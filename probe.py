@@ -9,7 +9,8 @@ fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
 (OPENCODE_GO_API_KEY), Ollama Cloud (OLLAMA_API_KEY), MiniMax
 (MINIMAX_API_KEY), Novita (NOVITA_API_KEY), DeepInfra
 (DEEPINFRA_API_KEY), and Vercel AI Gateway (AI_GATEWAY_API_KEY) always
-use Hermes env.
+use Hermes env. Command Code uses COMMANDCODE_API_KEY from Hermes env,
+or the `cmd` CLI login in ~/.commandcode/auth.json.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
@@ -57,6 +58,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
@@ -147,6 +149,7 @@ MINIMAX_CN_TOKEN_PLAN_URL = "https://api.minimaxi.com/v1/token_plan/remains"
 NOVITA_BALANCE_URL = "https://api.novita.ai/openapi/v1/billing/balance/detail"
 DEEPINFRA_CHECKLIST_URL = "https://api.deepinfra.com/payment/checklist"
 AI_GATEWAY_CREDITS_URL = "https://ai-gateway.vercel.sh/v1/credits"
+COMMANDCODE_DEFAULT_BASE_URL = "https://api.commandcode.ai"
 
 # Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
 # Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
@@ -3184,6 +3187,204 @@ def _fetch_ai_gateway_account_usage() -> Optional[dict]:
     return _snapshot("ai-gateway", None, [_win("Credits", None, None, " · ".join(parts))])
 
 
+def _commandcode_auth_path() -> Path:
+    override = (os.environ.get("COMMANDCODE_HOME") or "").strip()
+    root = Path(override).expanduser() if override else _user_home() / ".commandcode"
+    return root / "auth.json"
+
+
+def _commandcode_api_key() -> Optional[str]:
+    # Hermes' own Command Code provider uses COMMANDCODE_API_KEY. Accept the
+    # underscored spelling too, then fall back to the `cmd` CLI login file.
+    for name in ("COMMANDCODE_API_KEY", "COMMAND_CODE_API_KEY"):
+        value = _hermes_env_value(name)
+        if value:
+            return value
+    payload = _read_json_file(_commandcode_auth_path())
+    if not isinstance(payload, dict):
+        return None
+    for key in ("apiKey", "api_key", "token", "accessToken"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _commandcode_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
+
+
+def _commandcode_url(path: str, *, org_id: Optional[str] = None, since: Optional[str] = None) -> str:
+    params = {}
+    if org_id:
+        params["orgId"] = org_id
+    if since:
+        params["since"] = since
+    query = urlencode(params)
+    return f"{COMMANDCODE_DEFAULT_BASE_URL}{path}{'?' + query if query else ''}"
+
+
+def _commandcode_get(client: Any, url: str, headers: dict[str, str]) -> Optional[dict]:
+    """Optional endpoint: any failure is a missing section, not a missing card."""
+    try:
+        response = client.get(url, headers=headers)
+        if getattr(response, "status_code", 500) >= 400:
+            return None
+        payload = response.json() or {}
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _commandcode_get_required(client: Any, url: str, headers: dict[str, str]) -> dict:
+    """Required endpoint: raise so a bad key shows as an error card, not silence."""
+    response = client.get(url, headers=headers)
+    response.raise_for_status()
+    payload = response.json() or {}
+    if not isinstance(payload, dict):
+        raise ValueError("Command Code returned a non-object body")
+    return payload
+
+
+def _commandcode_account(payload: Optional[dict]) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    org = payload.get("org") if isinstance(payload.get("org"), dict) else {}
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    login = str(org.get("login") or user.get("userName") or user.get("name") or "").strip()
+    if not login:
+        return None
+    org_id = str(org.get("id") or "").strip() or None
+    key_name = str(user.get("keyName") or user.get("displayName") or "").strip() or None
+    return {"login": login, "org_id": org_id, "key_name": key_name}
+
+
+def _commandcode_snapshot(
+    account: dict,
+    credits_payload: Optional[dict],
+    subscription_payload: Optional[dict],
+    summary_payload: Optional[dict],
+) -> Optional[dict]:
+    credits = credits_payload.get("credits") if isinstance(credits_payload, dict) else None
+    credits = credits if isinstance(credits, dict) else {}
+    monthly = _commandcode_number(credits.get("monthlyCredits")) or 0.0
+    purchased = _commandcode_number(credits.get("purchasedCredits")) or 0.0
+    free = _commandcode_number(credits.get("freeCredits")) or 0.0
+    has_credit_balance = any(
+        _commandcode_number(credits.get(name)) is not None
+        for name in ("monthlyCredits", "purchasedCredits", "freeCredits")
+    )
+
+    windows: list[dict] = []
+    window_limits = credits_payload.get("windowLimits") if isinstance(credits_payload, dict) else None
+    if isinstance(window_limits, dict):
+        for key, label in (("fiveHour", "5-hour"), ("weekly", "Weekly")):
+            item = window_limits.get(key)
+            if not isinstance(item, dict):
+                continue
+            used = _commandcode_number(item.get("used"))
+            cap = _commandcode_number(item.get("cap"))
+            if used is None or cap is None or cap <= 0:
+                continue
+            used = min(used, cap)
+            windows.append(
+                _win(
+                    label,
+                    used / cap * 100.0,
+                    _parse_dt(item.get("resetAt")),
+                    f"${max(0.0, cap - used):,.2f} of ${cap:,.2f} credits left",
+                )
+            )
+
+    subscription_data = (
+        subscription_payload.get("data") if isinstance(subscription_payload, dict) else None
+    )
+    subscription_data = subscription_data if isinstance(subscription_data, dict) else {}
+    plan_raw = str(subscription_data.get("planId") or "").strip()
+    plan = _title_case_slug(plan_raw) if plan_raw else None
+
+    summary = summary_payload if isinstance(summary_payload, dict) else {}
+    total_cost = _commandcode_number(summary.get("totalCost"))
+    total_count = _commandcode_number(summary.get("totalCount"))
+    total_tokens = _commandcode_number(summary.get("totalTokens"))
+    if total_tokens is None:
+        total_tokens = _commandcode_number(summary.get("tokens"))
+    has_summary = total_cost is not None and total_count is not None
+
+    details: list[str] = []
+    if has_credit_balance:
+        remaining = monthly + purchased + free
+        sources = [f"monthly ${monthly:,.2f}", f"purchased ${purchased:,.2f}"]
+        if free > 0:
+            sources.append(f"free ${free:,.2f}")
+        details.append(f"${remaining:,.2f} credits left · " + " / ".join(sources))
+    if has_summary:
+        usage = f"${total_cost:,.2f} used · {int(total_count):,} requests"
+        if total_tokens is not None:
+            usage += f" · {int(total_tokens):,} tokens"
+        details.append(usage)
+    if not windows and not details:
+        return None
+    return _snapshot(
+        "commandcode",
+        plan,
+        windows,
+        details,
+        account_label=account.get("key_name") or account.get("login"),
+        account_key=account.get("org_id") or account.get("login"),
+    )
+
+
+def _fetch_commandcode_account_usage() -> Optional[dict]:
+    """Command Code credits, usage windows, and billing-period spend."""
+    token = _commandcode_api_key()
+    if not token:
+        return None
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        # whoami is required: a 401 here means the key is bad, and that
+        # should show on the card. The billing calls below are optional.
+        account = _commandcode_account(
+            _commandcode_get_required(client, _commandcode_url("/alpha/whoami"), headers)
+        )
+        if not account:
+            raise ValueError("whoami did not include an org or user login")
+        org_id = account.get("org_id")
+        subscription = _commandcode_get(
+            client,
+            _commandcode_url("/alpha/billing/subscriptions", org_id=org_id),
+            headers,
+        )
+        credits = _commandcode_get(
+            client,
+            _commandcode_url("/alpha/billing/credits", org_id=org_id),
+            headers,
+        )
+        period_start = None
+        if isinstance(subscription, dict) and isinstance(subscription.get("data"), dict):
+            period_start = str(subscription["data"].get("currentPeriodStart") or "").strip() or None
+        # Without a period start the summary would be all-time spend dressed
+        # up as this period's. Skip it rather than mislabel it.
+        summary = None
+        if period_start:
+            summary = _commandcode_get(
+                client,
+                _commandcode_url("/alpha/usage/summary", org_id=org_id, since=period_start),
+                headers,
+            )
+    return _commandcode_snapshot(account, credits, subscription, summary)
+
+
 def _collect_hermes() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -3257,6 +3458,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
             ("novita", None, None, _fetch_novita_account_usage),
             ("deepinfra", None, None, _fetch_deepinfra_account_usage),
             ("ai-gateway", None, None, _fetch_ai_gateway_account_usage),
+            ("commandcode", None, None, _fetch_commandcode_account_usage),
         )
     )
     results: dict[tuple[int, int], dict] = {}

@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.11</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.12</sub>
 
   <br /><br />
 
@@ -68,6 +68,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Novita:** `NOVITA_API_KEY` in Hermes env (dollar balance)
 - **DeepInfra:** `DEEPINFRA_API_KEY` in Hermes env (prepaid balance)
 - **AI Gateway:** `AI_GATEWAY_API_KEY` in Hermes env (Vercel credits)
+- **Command Code:** `COMMANDCODE_API_KEY` in Hermes env, or the `cmd` CLI login (credits, 5-hour / weekly windows, plan, and this period's spend)
 
 Gemini, Perplexity, and anything else can be a manual clock. Type the percent left and the reset time.
 
@@ -101,7 +102,7 @@ Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs th
 - **Gateway accounts.** If Hermes has `account.usage`, that RPC fills Claude, Codex, OpenRouter, and any other providers it already knows.
 - **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also read every `anthropic` / `openai-codex` row in `$HERMES_HOME/auth.json` (read only) and show one labelled card set per account.
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
-- **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`).
+- **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`). Command Code uses Hermes env first, then `~/.commandcode/auth.json`.
 - **Last resort.** Older `/usage` output is still parsed when a session is focused.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
