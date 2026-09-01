@@ -518,8 +518,13 @@ function probePythonCandidates(home) {
     `${root}/hermes-agent/.venv/Scripts/python.exe`,
     `${root}/hermes-agent/venv/Scripts/python.exe`
   ]
+  const generic = ['$HERMES_PYTHON', 'python3', 'python']
+  try {
+    const env = typeof process !== 'undefined' && process.env ? process.env : null
+    if (env && env.HERMES_PYTHON) generic.unshift(env.HERMES_PYTHON)
+  } catch (_) {}
   const isWin = /^[A-Za-z]:[\\/]/.test(root) || root.includes('\\')
-  return isWin ? [...win, ...posix] : [...posix, ...win]
+  return isWin ? [...generic, ...win, ...posix] : [...generic, ...posix, ...win]
 }
 
 // Python itself reports a missing script this way. Anything else that
