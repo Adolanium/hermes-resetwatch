@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.10</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.11</sub>
 
   <br /><br />
 
@@ -40,8 +40,9 @@ It does not scrape vendor websites. Live rows come from Hermes OAuth plus the sa
 ## Leave it open
 
 - Live cards refresh every 5 minutes while the page is open.
-- Probe results are cached for 5 minutes. Refresh skips that cache.
-- Claude and Codex pool accounts share one fold per vendor.
+- Probe results are cached for 5 minutes. Refresh skips that cache, with a one-minute floor so repeated clicks do not hammer vendor APIs.
+- If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
+- Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
 - Codex extra limits like Spark show up when that account has them.
 - Vendor fetches run in parallel with a time budget, so one slow API cannot wipe the page.
 - Tokens never go to stdout.
@@ -110,6 +111,8 @@ Manual clocks are whatever you typed. They do not refresh themselves.
 Live data goes through the desktop plugin SDK (`host.request` JSON-RPC), plus `probe.py` through `shell.exec` when a signed-in CLI or app has quota the gateway does not expose. The page does not log into vendor sites.
 
 `probe.py` does not refresh Claude or Codex credentials. For Kimi and Grok it may refresh on 401 and write that vendor's file back. Before writing it re-reads the file and merges token fields into that fresh record so concurrent CLI edits to other keys are kept. That protects the file. It does not make a shared refresh-token exchange safe if the CLI refreshes in the same window.
+
+**Heads up on Kimi and Grok.** Those vendors rotate refresh tokens. If Resetwatch and the CLI both refresh close together, one of them can get signed out and you will need to log into that CLI again. It is rare, it is harmless, and when Resetwatch did refresh a token the card says so. If you would rather it never happen, run the CLI once so its token is fresh before opening the page.
 
 It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached.
 

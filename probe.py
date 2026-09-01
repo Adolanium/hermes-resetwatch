@@ -18,12 +18,19 @@ refresh on 401 and write back only that vendor's file. Before writing,
 the probe re-reads the file and merges token fields into that fresh
 record so concurrent CLI edits to other keys are not reverted. That is
 file-level protection only; it cannot make a shared refresh-token
-exchange protocol-safe if the CLI refreshes in the same window. It may
-also write a small cache under $HERMES_HOME/cache/resetwatch, including
-a 5-minute probe result cache so vendor APIs are not hit more often than
-that (pass --fresh to bypass). Incomplete timed-out runs are not cached.
-Vendor fetchers run in parallel with a hard time budget. No tokens on
-stdout.
+exchange protocol-safe if the CLI refreshes in the same window. If the
+vendor rotates refresh tokens, whichever side refreshes second can be
+signed out. When this probe did refresh, that vendor's card says so. It
+may also write a small cache under $HERMES_HOME/cache/resetwatch,
+including a 5-minute probe result cache so vendor APIs are not hit more
+often than that (--fresh drops that to a 60-second floor). Incomplete
+timed-out runs are not cached. Vendor fetchers run in parallel with a
+hard time budget. No tokens on stdout.
+
+A vendor with a login on this machine whose fetch fails (HTTP error,
+timeout, changed payload) produces an error snapshot with no windows and
+an "error" field, so the page can show why the card is empty. A vendor
+with no login stays silent.
 
 Vendor usage rows call undocumented private APIs with the same client
 identity those CLIs use (Claude Code, Codex, Grok CLI). Those rows are
@@ -55,6 +62,9 @@ from typing import Any, Optional
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
 # keep a longer Retry-After on top of this.
 PROBE_MIN_INTERVAL_SECONDS = 5 * 60
+# Floor for --fresh. The Refresh button skips the 5-minute cache, but it
+# must not turn into a vendor API hammer when clicked repeatedly.
+FRESH_MIN_INTERVAL_SECONDS = 60
 # Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
 # need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
@@ -71,6 +81,21 @@ CREDENTIAL_WRITE_GRACE_SECONDS = 5.0
 
 _refresh_writes = 0
 _refresh_writes_lock = threading.Lock()
+# Vendors whose login file this run rewrote after a token refresh. Their
+# cards carry a note so a later CLI sign-out is not a mystery.
+_refreshed_vendors: set[str] = set()
+
+
+def _note_vendor_refresh(vendor: str) -> None:
+    with _refresh_writes_lock:
+        _refreshed_vendors.add(vendor)
+
+
+def _vendor_refresh_note(vendor: str, cli_name: str) -> Optional[str]:
+    with _refresh_writes_lock:
+        if vendor not in _refreshed_vendors:
+            return None
+    return f"Resetwatch refreshed this login token. If {cli_name} asks you to sign in again, that is why."
 
 
 def _begin_secret_write() -> None:
@@ -323,8 +348,13 @@ def _anthropic_cache_path() -> Path:
     return _resetwatch_cache_dir() / "anthropic_usage.json"
 
 
-def _anthropic_ratelimit_path() -> Path:
-    return _resetwatch_cache_dir() / "anthropic_usage.ratelimit"
+def _anthropic_ratelimit_scope(token: str) -> str:
+    """Per-token key so one throttled Claude account does not hide the rest."""
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _anthropic_ratelimit_path(scope: str) -> Path:
+    return _resetwatch_cache_dir() / f"anthropic_usage.{scope}.ratelimit"
 
 
 def _read_json_file(path: Path) -> Optional[Any]:
@@ -369,7 +399,18 @@ def _write_secret_json(path: Path, payload: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Create the temp file owner-only from the start so the token is
+        # never briefly world-readable. Mode is ignored on Windows.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2))
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, path)
         try:
             os.chmod(path, 0o600)
@@ -408,8 +449,8 @@ def _store_probe_result_cache(snapshots: list, *, cli_only: bool) -> None:
     )
 
 
-def _anthropic_ratelimit_remaining() -> float:
-    payload = _read_json_file(_anthropic_ratelimit_path())
+def _anthropic_ratelimit_remaining(scope: str) -> float:
+    payload = _read_json_file(_anthropic_ratelimit_path(scope))
     if not isinstance(payload, dict):
         return 0.0
     until = payload.get("until")
@@ -418,22 +459,22 @@ def _anthropic_ratelimit_remaining() -> float:
     return max(0.0, float(until) - datetime.now(timezone.utc).timestamp())
 
 
-def _mark_anthropic_ratelimit(retry_after: float) -> None:
+def _mark_anthropic_ratelimit(scope: str, retry_after: float) -> None:
     seconds = max(30.0, min(float(retry_after or 60.0), 6 * 60 * 60))
     _write_cache_json(
-        _anthropic_ratelimit_path(),
+        _anthropic_ratelimit_path(scope),
         {"until": datetime.now(timezone.utc).timestamp() + seconds, "retry_after": seconds},
     )
 
 
-def _clear_anthropic_ratelimit() -> None:
+def _clear_anthropic_ratelimit(scope: str) -> None:
     try:
-        _anthropic_ratelimit_path().unlink(missing_ok=True)
+        _anthropic_ratelimit_path(scope).unlink(missing_ok=True)
     except Exception:
         return
 
 
-def _cached_anthropic_snapshot(*, max_age: Optional[float] = None) -> Optional[dict]:
+def _cached_anthropic_snapshot(*, scope: Optional[str] = None, max_age: Optional[float] = None) -> Optional[dict]:
     payload = _read_json_file(_anthropic_cache_path())
     if not isinstance(payload, dict) or _provider_key(payload.get("provider")) != "anthropic":
         return None
@@ -441,7 +482,7 @@ def _cached_anthropic_snapshot(*, max_age: Optional[float] = None) -> Optional[d
         return None
     fetched_at = payload.get("fetched_at")
     if max_age is None:
-        if _anthropic_ratelimit_remaining() > 0:
+        if scope and _anthropic_ratelimit_remaining(scope) > 0:
             max_age = float(ANTHROPIC_CACHE_MAX_AGE_SECONDS)
         else:
             max_age = float(ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
@@ -545,6 +586,53 @@ def _snapshot(
     if key:
         payload["account_key"] = key
     return payload
+
+
+def _error_text(exc: BaseException) -> str:
+    """Short, token-free reason for a failed vendor fetch."""
+    try:
+        import httpx
+    except Exception:
+        httpx = None  # type: ignore[assignment]
+    if httpx is not None:
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            reason = str(exc.response.reason_phrase or "").strip()
+            return f"HTTP {code} {reason}".strip()
+        if isinstance(exc, httpx.TimeoutException):
+            return "request timed out"
+        if isinstance(exc, httpx.TransportError):
+            return "network error"
+    name = type(exc).__name__
+    text = str(exc).strip()
+    text = text.splitlines()[0].strip() if text else ""
+    if len(text) > 120:
+        text = text[:117] + "..."
+    return f"{name}: {text}" if text else name
+
+
+def _error_snapshot(
+    provider: str,
+    message: str,
+    *,
+    account_label: Optional[str] = None,
+    account_key: Optional[str] = None,
+) -> dict:
+    """A card with no windows that says why this vendor has no numbers.
+
+    Only produced when a login exists but the fetch failed. A vendor with no
+    login on this machine stays silent (fetcher returns None).
+    """
+    snap = _snapshot(
+        provider,
+        None,
+        [],
+        [f"Could not fetch usage: {message}"],
+        account_label=account_label,
+        account_key=account_key,
+    )
+    snap["error"] = str(message or "").strip() or "unknown error"
+    return snap
 
 
 def _hermes_window(window) -> dict:
@@ -942,6 +1030,7 @@ def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bo
             merged[key] = refreshed[key]
     try:
         _write_secret_json(path, merged)
+        _note_vendor_refresh("kimi")
     except (OSError, TypeError, ValueError):
         pass
     access = merged.get("access_token")
@@ -1076,7 +1165,11 @@ def _fetch_kimi_cli_usage() -> Optional[dict]:
         payload = response.json() or {}
     if not isinstance(payload, dict):
         return None
-    return _kimi_snapshot_from_payload(payload)
+    snap = _kimi_snapshot_from_payload(payload)
+    note = _vendor_refresh_note("kimi", "the Kimi CLI")
+    if snap and note:
+        snap["details"] = [*snap.get("details", []), note]
+    return snap
 
 
 def _kimi_coding_api_key() -> Optional[str]:
@@ -1109,13 +1202,18 @@ def _fetch_kimi_coding_api_key_usage() -> Optional[dict]:
 
 def _fetch_kimi_account_usage() -> Optional[dict]:
     # CLI OAuth first (can refresh on 401). Hermes Coding Plan key is fallback.
+    # If the CLI path failed and the fallback has nothing, surface the CLI error.
+    cli_error: Optional[BaseException] = None
     try:
         snap = _fetch_kimi_cli_usage()
         if snap:
             return snap
-    except Exception:
-        pass
-    return _fetch_kimi_coding_api_key_usage()
+    except Exception as exc:
+        cli_error = exc
+    snap = _fetch_kimi_coding_api_key_usage()
+    if snap is None and cli_error is not None:
+        raise cli_error
+    return snap
 
 
 def _grok_home() -> Path:
@@ -1262,6 +1360,7 @@ def _grok_access_context(
     payload2[map_key2] = merged
     try:
         _write_secret_json(path2, payload2)
+        _note_vendor_refresh("grok")
     except OSError:
         pass
     access = merged.get("key")
@@ -1403,7 +1502,8 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         plan = plan.strip() or None
     else:
         plan = None
-    return _snapshot("grok", plan, windows)
+    note = _vendor_refresh_note("grok", "the Grok CLI")
+    return _snapshot("grok", plan, windows, [note] if note else None)
 
 
 def _claude_home() -> Path:
@@ -1635,13 +1735,18 @@ def infer_claude_plan_name(profile: Optional[dict] = None, usage_payload: Option
     return None
 
 
-def _anthropic_rate_limit_snapshot(remaining: float) -> dict:
+def _anthropic_rate_limit_snapshot(
+    remaining: float,
+    *,
+    account_label: Optional[str] = None,
+    account_key: Optional[str] = None,
+) -> dict:
     mins = max(1, int((remaining + 59) // 60))
-    return _snapshot(
+    return _error_snapshot(
         "anthropic",
-        None,
-        [],
-        [f"Usage API rate-limited · try again in ~{mins}m"],
+        f"usage API rate-limited, try again in ~{mins}m",
+        account_label=account_label,
+        account_key=account_key,
     )
 
 
@@ -1730,11 +1835,20 @@ def _fetch_claude_usage(
     access = str(token or "").strip()
     if not access:
         return _cached_anthropic_snapshot() if use_cache else None
-    if _anthropic_ratelimit_remaining() > 0:
+    scope = _anthropic_ratelimit_scope(access)
+    fallback_label = account_label
+    fallback_key = str((entry or {}).get("id") or "").strip() or None
+    if entry is not None and not fallback_label:
+        fallback_label = _claude_card_label(entry)
+    remaining = _anthropic_ratelimit_remaining(scope)
+    if remaining > 0:
         if use_cache:
-            remaining = _anthropic_ratelimit_remaining()
-            return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
-        return None
+            cached = _cached_anthropic_snapshot(scope=scope)
+            if cached:
+                return cached
+        return _anthropic_rate_limit_snapshot(
+            remaining, account_label=fallback_label, account_key=fallback_key
+        )
 
     import httpx
 
@@ -1757,10 +1871,14 @@ def _fetch_claude_usage(
                     wait = float(retry_after) if retry_after else 3600.0
                 except Exception:
                     wait = 3600.0
-                _mark_anthropic_ratelimit(wait)
+                _mark_anthropic_ratelimit(scope, wait)
                 if use_cache:
-                    return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(wait)
-                return None
+                    cached = _cached_anthropic_snapshot(scope=scope)
+                    if cached:
+                        return cached
+                return _anthropic_rate_limit_snapshot(
+                    wait, account_label=fallback_label, account_key=fallback_key
+                )
             response.raise_for_status()
             payload = response.json() or {}
             try:
@@ -1772,10 +1890,20 @@ def _fetch_claude_usage(
             except Exception:
                 profile = {}
     except Exception:
-        return _cached_anthropic_snapshot() if use_cache else None
+        # Serve the recent cache if we have one; otherwise let the caller
+        # turn this into a visible error card instead of a missing row.
+        if use_cache:
+            cached = _cached_anthropic_snapshot(scope=scope)
+            if cached:
+                return cached
+        raise
 
     if not isinstance(payload, dict):
-        return _cached_anthropic_snapshot() if use_cache else None
+        if use_cache:
+            cached = _cached_anthropic_snapshot(scope=scope)
+            if cached:
+                return cached
+        raise ValueError("usage API returned a non-object body")
     windows: list[dict] = []
     mapping = (
         ("five_hour", "Current session"),
@@ -1804,8 +1932,8 @@ def _fetch_claude_usage(
         if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
             details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}")
     if not windows and not details:
-        return _cached_anthropic_snapshot() if use_cache else None
-    _clear_anthropic_ratelimit()
+        return _cached_anthropic_snapshot(scope=scope) if use_cache else None
+    _clear_anthropic_ratelimit(scope)
     label = account_label
     if entry is not None:
         label = _claude_card_label(entry, profile)
@@ -1826,17 +1954,20 @@ def _fetch_claude_usage(
 
 
 def _fetch_claude_cli_account_usage() -> Optional[dict]:
-    remaining = _anthropic_ratelimit_remaining()
-    if remaining > 0:
-        return _cached_anthropic_snapshot() or _anthropic_rate_limit_snapshot(remaining)
     token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
     if not token:
         return _cached_anthropic_snapshot(max_age=ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS)
+    # 429 handling and the per-token marker live inside _fetch_claude_usage.
     return _fetch_claude_usage(token, use_cache=True)
 
 
 def _fetch_claude_accounts_usage() -> Optional[list]:
-    """One worker: walk pooled Claude tokens in order. Stop on 429."""
+    """One worker: walk pooled Claude tokens in order.
+
+    Each account has its own 429 marker, so a throttled account shows a
+    rate-limit card while the others still fetch. A failed fetch becomes an
+    error card for that account instead of a missing row.
+    """
     accounts = _claude_pool_accounts()
     if not accounts:
         snap = _fetch_claude_cli_account_usage()
@@ -1844,23 +1975,29 @@ def _fetch_claude_accounts_usage() -> Optional[list]:
     out: list[dict] = []
     pool_tokens = {str(account.get("token") or "") for account in accounts}
     for account in accounts:
-        if _anthropic_ratelimit_remaining() > 0:
-            break
-        snap = _fetch_claude_usage(
-            account.get("token") or "",
-            account_label=account.get("label"),
-            entry=account.get("entry"),
-            use_cache=False,
-        )
+        entry = account.get("entry") or {}
+        try:
+            snap = _fetch_claude_usage(
+                account.get("token") or "",
+                account_label=account.get("label"),
+                entry=entry,
+                use_cache=False,
+            )
+        except Exception as exc:
+            snap = _error_snapshot(
+                "anthropic",
+                _error_text(exc),
+                account_label=account.get("label"),
+                account_key=str(entry.get("id") or "").strip() or None,
+            )
         if snap:
             out.append(snap)
     cli_token = _claude_code_access_token() or _hermes_anthropic_oauth_token()
-    if (
-        cli_token
-        and cli_token not in pool_tokens
-        and _anthropic_ratelimit_remaining() <= 0
-    ):
-        extra = _fetch_claude_usage(cli_token, use_cache=False)
+    if cli_token and cli_token not in pool_tokens:
+        try:
+            extra = _fetch_claude_usage(cli_token, use_cache=False)
+        except Exception as exc:
+            extra = _error_snapshot("anthropic", _error_text(exc))
         if extra:
             out.append(extra)
     if out:
@@ -2403,13 +2540,17 @@ def _fetch_glm_hermes_api_key_usage() -> Optional[dict]:
 
 def _fetch_glm_zcode_account_usage() -> Optional[dict]:
     # ZCode login first. Hermes Z.AI / GLM Coding Plan key is fallback.
+    cli_error: Optional[BaseException] = None
     try:
         snap = _fetch_glm_zcode_usage()
         if snap:
             return snap
-    except Exception:
-        pass
-    return _fetch_glm_hermes_api_key_usage()
+    except Exception as exc:
+        cli_error = exc
+    snap = _fetch_glm_hermes_api_key_usage()
+    if snap is None and cli_error is not None:
+        raise cli_error
+    return snap
 
 
 def _hermes_homes() -> list[Path]:
@@ -3083,37 +3224,54 @@ def _collect_cli() -> tuple[list[dict], bool]:
     cli_context = _codex_cli_access_context()
     if cli_context:
         cli_token = str(cli_context[0] or "").strip()
-    fetchers: list = [_fetch_claude_accounts_usage]
+    # (provider, label, key, fetcher). provider/label/key name the error card
+    # when a fetcher raises or runs past the budget.
+    fetchers: list[tuple[str, Optional[str], Optional[str], Any]] = [
+        ("anthropic", None, None, _fetch_claude_accounts_usage)
+    ]
     if pool_accounts:
-        fetchers.extend(_codex_pool_fetcher(account) for account in pool_accounts)
+        fetchers.extend(
+            (
+                "openai-codex",
+                account.get("label"),
+                account.get("key") or None,
+                _codex_pool_fetcher(account),
+            )
+            for account in pool_accounts
+        )
         pool_tokens = {str(account.get("token") or "") for account in pool_accounts}
         if cli_token and cli_token not in pool_tokens:
-            fetchers.append(_fetch_codex_cli_account_usage)
+            fetchers.append(("openai-codex", None, None, _fetch_codex_cli_account_usage))
     else:
-        fetchers.append(_fetch_codex_cli_account_usage)
+        fetchers.append(("openai-codex", None, None, _fetch_codex_cli_account_usage))
     fetchers.extend(
         (
-            _fetch_cursor_account_usage,
-            _fetch_kimi_account_usage,
-            _fetch_grok_account_usage,
-            _fetch_glm_zcode_account_usage,
-            _fetch_deepseek_account_usage,
-            _fetch_opencode_go_account_usage,
-            _fetch_ollama_cloud_account_usage,
-            _fetch_minimax_account_usage,
-            _fetch_novita_account_usage,
-            _fetch_deepinfra_account_usage,
-            _fetch_ai_gateway_account_usage,
+            ("cursor", None, None, _fetch_cursor_account_usage),
+            ("kimi", None, None, _fetch_kimi_account_usage),
+            ("grok", None, None, _fetch_grok_account_usage),
+            ("glm", None, None, _fetch_glm_zcode_account_usage),
+            ("deepseek", None, None, _fetch_deepseek_account_usage),
+            ("opencode-go", None, None, _fetch_opencode_go_account_usage),
+            ("ollama", None, None, _fetch_ollama_cloud_account_usage),
+            ("minimax", None, None, _fetch_minimax_account_usage),
+            ("novita", None, None, _fetch_novita_account_usage),
+            ("deepinfra", None, None, _fetch_deepinfra_account_usage),
+            ("ai-gateway", None, None, _fetch_ai_gateway_account_usage),
         )
     )
     results: dict[tuple[int, int], dict] = {}
     complete = True
+
+    def _failed(index: int, message: str) -> None:
+        provider, label, key, _fetch = fetchers[index]
+        results[(index, 0)] = _error_snapshot(provider, message, account_label=label, account_key=key)
+
     # One worker per fetcher so the tail of the list is never starved behind
     # a slow peer. Do not wait on hung sockets after the budget; process exit
     # reaps those threads.
     pool = ThreadPoolExecutor(max_workers=len(fetchers))
     try:
-        futures = {pool.submit(fetch): index for index, fetch in enumerate(fetchers)}
+        futures = {pool.submit(item[3]): index for index, item in enumerate(fetchers)}
         pending = set(futures)
         deadline = time.monotonic() + PROBE_TOTAL_BUDGET_SECONDS
         while pending:
@@ -3129,7 +3287,10 @@ def _collect_cli() -> tuple[list[dict], bool]:
                 index = futures[fut]
                 try:
                     snap = fut.result(timeout=0)
-                except Exception:
+                except Exception as exc:
+                    # A login exists but the call failed. Say so instead of
+                    # silently dropping the vendor from the page.
+                    _failed(index, _error_text(exc))
                     continue
                 items = snap if isinstance(snap, list) else [snap]
                 for sub, item in enumerate(items):
@@ -3139,6 +3300,9 @@ def _collect_cli() -> tuple[list[dict], bool]:
             complete = False
             for fut in pending:
                 fut.cancel()
+                # Cancel only works if the thread never started. Either way the
+                # vendor gave nothing in time; show that rather than nothing.
+                _failed(futures[fut], f"no reply within {PROBE_TOTAL_BUDGET_SECONDS}s")
     finally:
         try:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -3196,13 +3360,15 @@ def _main_inner() -> int:
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout
-    if not fresh:
-        cached = _read_probe_result_cache(cli_only=cli_only)
-        if cached is not None:
-            _emit_json(cached, real_stdout)
-            _wait_for_credential_writes()
-            # Non-daemon pool threads must not keep this process alive.
-            os._exit(0)
+    # --fresh skips the 5-minute cache but still honours a short floor, so
+    # repeated Refresh clicks cannot hammer vendor APIs.
+    max_age = FRESH_MIN_INTERVAL_SECONDS if fresh else PROBE_MIN_INTERVAL_SECONDS
+    cached = _read_probe_result_cache(cli_only=cli_only, max_age=max_age)
+    if cached is not None:
+        _emit_json(cached, real_stdout)
+        _wait_for_credential_writes()
+        # Non-daemon pool threads must not keep this process alive.
+        os._exit(0)
     snapshots: list[dict] = []
     have: set[str] = set()
     labelled: set[str] = set()

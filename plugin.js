@@ -18,8 +18,11 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.10'
+const VERSION = '0.2.11'
 const POLL_MS = 5 * 60 * 1000
+// Manual Refresh floor. probe.py enforces the same 60s on --fresh, so a
+// click inside this window would only replay the cache anyway.
+const REFRESH_COOLDOWN_MS = 60 * 1000
 
 const host = sdk.host
 const {
@@ -411,6 +414,26 @@ function cardsFromAccountSnapshots(snapshots) {
     const accountTag = snapshotAccountKey(snap) ? `:${snapshotAccountKey(snap)}` : ''
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
+    const failed = Boolean(snap.error)
+    if (failed) {
+      // probe.py found a login but the fetch failed. Show why instead of
+      // silently dropping the vendor from the page.
+      cards.push({
+        id: `account:${snap.provider}${accountTag}:error`,
+        source: 'live',
+        provider,
+        group,
+        account: accountLabel,
+        label: accountLabel || provider,
+        remaining: null,
+        used: null,
+        resetAt: null,
+        resetText: '',
+        detail: extra || `Could not fetch usage: ${String(snap.error)}`,
+        error: true
+      })
+      continue
+    }
     windows.forEach((window, index) => {
       cards.push({
         id: `account:${snap.provider}${accountTag}:${index}:${window.label}`,
@@ -498,11 +521,36 @@ function probePythonCandidates(home) {
   return isWin ? [...win, ...posix] : [...posix, ...win]
 }
 
+// Python itself reports a missing script this way. Anything else that
+// looks like "not found" means the interpreter path is wrong.
+function probeFailureKind(result) {
+  const err = result && result.stderr ? String(result.stderr) : ''
+  if (/can't open file|No such file or directory: '.*probe\.py'/i.test(err)) return 'no-probe'
+  if (
+    result &&
+    (result.code === 127 ||
+      result.code === 9009 ||
+      /is not recognized|not found|No such file or directory|cannot find the path/i.test(err))
+  ) {
+    return 'no-python'
+  }
+  return 'failed'
+}
+
 function pickProbeFailure(failures) {
-  const list = (failures || []).filter(Boolean)
+  const list = (failures || []).filter(item => item && item.message)
   if (!list.length) return ''
-  const withTrace = [...list].reverse().find(item => /Error|Traceback|Exception|failed/i.test(item))
-  return withTrace || list[list.length - 1]
+  // A real probe error (traceback, bad JSON) beats path guessing noise.
+  const real = [...list].reverse().find(item => item.kind === 'failed')
+  if (real) return real.message
+  const kinds = new Set(list.map(item => item.kind))
+  if (kinds.has('no-probe') && !kinds.has('no-python')) {
+    return 'probe.py not found under desktop-plugins/resetwatch (copy both plugin files)'
+  }
+  if (kinds.has('no-python') && !kinds.has('no-probe')) {
+    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home)'
+  }
+  return list[list.length - 1].message
 }
 
 async function probeStockAccountUsage(opts) {
@@ -521,29 +569,45 @@ async function probeStockAccountUsage(opts) {
     // The plugin folder is "resetwatch" when installed by hand, but a plain
     // clone of the repo lands as "hermes-resetwatch". Accept both.
     const folders = ['resetwatch', 'hermes-resetwatch']
+    // Each attempt spawns a process, so prune as we learn: an interpreter
+    // that does not exist is skipped for every folder, and a folder Python
+    // could not open is skipped for every interpreter.
+    const deadPythons = new Set()
+    const deadProbes = new Set()
     for (const home of homes) {
-      for (const folder of folders) {
-        const probe = `${home}/desktop-plugins/${folder}/probe.py`
-        for (const python of probePythonCandidates(home)) {
+      for (const python of probePythonCandidates(home)) {
+        if (deadPythons.has(python)) continue
+        for (const folder of folders) {
+          const probe = `${home}/desktop-plugins/${folder}/probe.py`
+          if (deadProbes.has(probe)) continue
           try {
             const result = await host.request('shell.exec', {
               command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
             })
             if (!result || result.code) {
               const err = result && result.stderr ? String(result.stderr).trim() : ''
-              failures.push(err || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
+              const kind = probeFailureKind(result)
+              failures.push({
+                kind,
+                message: err || (result ? `probe exit ${result.code}` : 'probe returned nothing')
+              })
+              if (kind === 'no-python') {
+                deadPythons.add(python)
+                break
+              }
+              if (kind === 'no-probe') deadProbes.add(probe)
               continue
             }
             const text = String(result.stdout || '').trim()
             if (!text.startsWith('[')) {
-              failures.push('probe returned non-JSON')
+              failures.push({ kind: 'failed', message: 'probe returned non-JSON' })
               continue
             }
             const parsed = JSON.parse(text)
             if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
-            failures.push('probe JSON was not a list')
+            failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
           } catch (error) {
-            failures.push(errorMessage(error, 'probe failed'))
+            failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
           }
         }
       }
@@ -573,11 +637,12 @@ async function fetchLiveCards(sessionId, opts) {
     host.request('account.usage', {})
   ])
 
+  let barsError = ''
   if (barsResult.status === 'fulfilled') {
     cards.push(...cardsFromUsageBars(barsResult.value))
   } else {
     const error = barsResult.reason
-    errors.push(error && error.message ? error.message : 'Could not read Nous usage')
+    barsError = error && error.message ? error.message : 'Could not read Nous usage'
   }
 
   if (!cards.length) {
@@ -587,6 +652,10 @@ async function fetchLiveCards(sessionId, opts) {
     } catch (error) {
       errors.push(error && error.message ? error.message : 'Could not read subscription state')
     }
+  }
+  // Only report the usage.bars failure if the fallback did not fill the Nous cards.
+  if (barsError && !cards.some(card => String(card.id).startsWith('nous:'))) {
+    errors.push(barsError)
   }
 
   const accountProviders = new Set()
@@ -807,18 +876,24 @@ function LimitCard({ card, nowMs, actions }) {
             : null
         ]
       }),
-      remaining === null || remaining === undefined
-        ? null
-        : jsxs('div', {
-            style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 },
-            children: [
-              jsx(UsageBar, { remaining }),
-              jsx('div', {
-                style: { fontSize: '0.8125rem', color: toneColor(tone), minWidth: 64, textAlign: 'right' },
-                children: leftLabel
-              })
-            ]
-          }),
+      card.error
+        ? jsx('div', {
+            title: detail,
+            style: { fontSize: '0.75rem', color: text.quaternary, flexShrink: 0 },
+            children: 'unavailable'
+          })
+        : remaining === null || remaining === undefined
+          ? null
+          : jsxs('div', {
+              style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 },
+              children: [
+                jsx(UsageBar, { remaining }),
+                jsx('div', {
+                  style: { fontSize: '0.8125rem', color: toneColor(tone), minWidth: 64, textAlign: 'right' },
+                  children: leftLabel
+                })
+              ]
+            }),
       actions || null
     ]
   })
@@ -1053,6 +1128,9 @@ function useLiveCardsPolled(gateway, sessionId) {
     const id = setInterval(() => load(), POLL_MS)
     return () => {
       genRef.current += 1
+      // A fetch from the old session may still be running. Its result is
+      // discarded above, so it must not block the first load of the new one.
+      inFlight.current = false
       clearInterval(id)
     }
   }, [gateway, sid])
@@ -1063,6 +1141,7 @@ function useLiveCardsPolled(gateway, sessionId) {
 function useLiveCardsQuery(gateway, sessionId) {
   const sid = sessionId || ''
   const [manualFetching, setManualFetching] = useState(false)
+  const [manualError, setManualError] = useState('')
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'live', sid],
     queryFn: () => fetchLiveCards(sid),
@@ -1084,12 +1163,22 @@ function useLiveCardsQuery(gateway, sessionId) {
       })
       .then(data => {
         queryClient.setQueryData([PLUGIN_ID, 'live', sid], data)
+        setManualError('')
         return data
       })
-      .catch(() => null)
+      .catch(error => {
+        // Keep the last good cards, but say the refresh did not land.
+        setManualError(errorMessage(error, 'Refresh failed'))
+        return null
+      })
       .finally(() => setManualFetching(false))
   }
-  return { data: query.data, isFetching: !!(query.isFetching || manualFetching), refetch }
+  let data = query.data
+  if (manualError) {
+    const base = data || { cards: [], errors: [], hadSession: false, haveAccountRpc: false }
+    data = { ...base, errors: [...(base.errors || []), `Refresh failed: ${manualError}`] }
+  }
+  return { data, isFetching: !!(query.isFetching || manualFetching), refetch }
 }
 
 const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled
@@ -1119,6 +1208,9 @@ function Page() {
   const [editingId, setEditingId] = useState(null)
   const [liveOpen, toggleLive] = useSectionOpen('live')
   const [manualOpen, toggleManual] = useSectionOpen('manual')
+  const [cooldownUntil, setCooldownUntil] = useState(0)
+  const [cooldownTick, setCooldownTick] = useState(0)
+  const coolingDown = cooldownUntil > Date.now()
   const payload = live.data || { cards: [], errors: [], hadSession: false }
   const groups = useMemo(
     () => groupLiveCards(payload.cards).filter(group => group.cards.length),
@@ -1130,6 +1222,14 @@ function Page() {
     const id = setInterval(() => $now.set(Date.now()), 30000)
     return () => clearInterval(id)
   }, [])
+
+  // Re-enable the Refresh button exactly when the cooldown ends.
+  useEffect(() => {
+    const wait = cooldownUntil - Date.now()
+    if (wait <= 0) return undefined
+    const id = setTimeout(() => setCooldownTick(tick => tick + 1), wait + 50)
+    return () => clearTimeout(id)
+  }, [cooldownUntil, cooldownTick])
 
   const openExternal = url => {
     if (!isHttpUrl(url)) return
@@ -1176,10 +1276,12 @@ function Page() {
                 children: `gateway ${gateway || 'idle'}`
               }),
               jsx(SmallButton, {
-                disabled: !!live.isFetching,
+                disabled: !!live.isFetching || coolingDown,
+                title: coolingDown ? 'Wait a minute between refreshes' : 'Skip the cache and ask every vendor again',
                 onClick: () => {
-                  if (live.isFetching) return
+                  if (live.isFetching || coolingDown) return
                   tap()
+                  setCooldownUntil(Date.now() + REFRESH_COOLDOWN_MS)
                   if (live.refetch) live.refetch()
                   else if (queryClient) queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'live'] })
                 },
