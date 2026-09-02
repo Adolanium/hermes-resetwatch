@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.12'
+const VERSION = '0.2.13'
 const POLL_MS = 5 * 60 * 1000
 // Manual Refresh floor. probe.py enforces the same 60s on --fresh, so a
 // click inside this window would only replay the cache anyway.
@@ -519,7 +519,25 @@ function probePythonCandidates(home) {
     `${root}/hermes-agent/venv/Scripts/python.exe`
   ]
   const isWin = /^[A-Za-z]:[\\/]/.test(root) || root.includes('\\')
-  return isWin ? [...win, ...posix] : [...posix, ...win]
+  const venv = isWin ? [...win, ...posix] : [...posix, ...win]
+  // Hermes' own interpreter when the install says where it is. Nix and other
+  // packaged installs keep no venv under the Hermes home; Hermes exports
+  // HERMES_PYTHON instead. The literal form is expanded by sh on POSIX.
+  // cmd does not expand $VAR, so skip it on Windows.
+  const runtime = []
+  try {
+    const env = typeof process !== 'undefined' && process.env ? process.env : null
+    if (env && env.HERMES_PYTHON) runtime.push(String(env.HERMES_PYTHON))
+  } catch (_) {}
+  if (!isWin) runtime.push('$HERMES_PYTHON')
+  // Bare interpreters last. On Mac and Windows these are usually a system
+  // Python without httpx, which would "succeed" with an import error card.
+  const generic = ['python3', 'python']
+  const out = []
+  for (const item of [...runtime, ...venv, ...generic]) {
+    if (item && !out.includes(item)) out.push(item)
+  }
+  return out
 }
 
 // Python itself reports a missing script this way. Anything else that
@@ -529,13 +547,25 @@ function probeFailureKind(result) {
   if (/can't open file|No such file or directory: '.*probe\.py'/i.test(err)) return 'no-probe'
   if (
     result &&
-    (result.code === 127 ||
+    (result.code === 126 ||
+      result.code === 127 ||
       result.code === 9009 ||
-      /is not recognized|not found|No such file or directory|cannot find the path/i.test(err))
+      /is not recognized|not found|No such file or directory|cannot find the path|Permission denied/i.test(err))
   ) {
     return 'no-python'
   }
   return 'failed'
+}
+
+// probe.py always exits 0 with a JSON list. When the interpreter lacks httpx
+// that list is one note card saying so. Treat it as "wrong Python" and keep
+// looking rather than accepting it as the result.
+function probeMissingDeps(parsed) {
+  if (!Array.isArray(parsed) || parsed.length !== 1) return ''
+  const snap = parsed[0]
+  if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') return ''
+  const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
+  return note ? String(note) : ''
 }
 
 function pickProbeFailure(failures) {
@@ -545,11 +575,14 @@ function pickProbeFailure(failures) {
   const real = [...list].reverse().find(item => item.kind === 'failed')
   if (real) return real.message
   const kinds = new Set(list.map(item => item.kind))
+  if (kinds.has('no-deps')) {
+    return 'Found a Python but not the Hermes one (no httpx). Looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON.'
+  }
   if (kinds.has('no-probe') && !kinds.has('no-python')) {
     return 'probe.py not found under desktop-plugins/resetwatch (copy both plugin files)'
   }
   if (kinds.has('no-python') && !kinds.has('no-probe')) {
-    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home)'
+    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON)'
   }
   return list[list.length - 1].message
 }
@@ -605,6 +638,13 @@ async function probeStockAccountUsage(opts) {
               continue
             }
             const parsed = JSON.parse(text)
+            const missingDeps = probeMissingDeps(parsed)
+            if (missingDeps) {
+              // Wrong interpreter for every home, not just this one.
+              failures.push({ kind: 'no-deps', message: missingDeps })
+              deadPythons.add(python)
+              break
+            }
             if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
             failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
           } catch (error) {

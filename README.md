@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.12</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.13</sub>
 
   <br /><br />
 
@@ -121,7 +121,7 @@ It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplet
 
 Resetwatch uses the desktop plugin SDK and the standard Hermes gateway methods. It is one uncompiled `plugin.js` plus `probe.py`. No package manager.
 
-It runs on Windows and Mac with stock Hermes Desktop.
+It runs on Windows, Mac, and Linux with stock Hermes Desktop. `probe.py` runs with the Hermes interpreter: `hermes-agent/.venv` under the Hermes home, or `$HERMES_PYTHON` on Nix and other packaged installs.
 
 ## Contributing
 
