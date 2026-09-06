@@ -1,4 +1,4 @@
-﻿"""Stock Hermes usage probe for Resetwatch.
+"""Stock Hermes usage probe for Resetwatch.
 
 Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
 the gateway already ships. If Hermes OAuth is missing, Claude Code and
