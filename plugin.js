@@ -18,7 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.13'
+const VERSION = '0.2.14'
 const POLL_MS = 5 * 60 * 1000
 // Manual Refresh floor. probe.py enforces the same 60s on --fresh, so a
 // click inside this window would only replay the cache anyway.
@@ -1239,7 +1239,7 @@ function groupLiveCards(cards) {
   return groups
 }
 
-function Page() {
+function PluginPageContent() {
   const gateway = useValue(host.state.gateway)
   const nowMs = useValue($now)
   const clocks = useValue($clocks)
@@ -1473,12 +1473,273 @@ function Page() {
   })
 }
 
+
+// BEGIN SIGNED DESKTOP UPDATER
+// Kept inline: Desktop loads this file directly, without sibling module imports.
+function createDesktopUpdater(config) {
+  const model = sdk.atom({ busy: false, open: false, message: '', error: '', offer: null, backup: null });
+  const lock = Symbol.for(config.repo + '.desktop-update');
+  const limit = 500000;
+  let storage = null, alive = false;
+  const patch = value => { if (alive) model.set({ ...model.get(), ...value }); };
+  const keyFor = dir => 'signed-updater:backup:' + dir;
+  const bytes = text => new TextEncoder().encode(text);
+  const decode = value => {
+    if (typeof value !== 'string' || value.length > 16000) throw Error('Invalid signed release.');
+    return Uint8Array.from(atob(value), c => c.charCodeAt(0));
+  };
+  async function hash(text) {
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes(text))), b => b.toString(16).padStart(2, '0')).join('');
+  }
+  function parts(version) {
+    if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) throw Error('Invalid release version.');
+    const result = version.split('.').map(Number);
+    if (!result.every(Number.isSafeInteger)) throw Error('Invalid release version.');
+    return result;
+  }
+  function newer(a, b) {
+    const x = parts(a), y = parts(b);
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+    return false;
+  }
+  const declaredVersion = text => text.match(/const VERSION\s*=\s*["']([0-9]+\.[0-9]+\.[0-9]+)["']/)?.[1];
+  const declaredId = text => text.match(/const PLUGIN_ID\s*=\s*["']([^"']+)["']/)?.[1];
+  async function verify(release) {
+    if (release.draft || release.prerelease) throw Error('Only stable releases can be installed.');
+    const block = String(release.body || '').match(/```hermes-desktop-update\s*\n([\s\S]*?)\n```/);
+    if (!block) throw Error('This release has no signed update. Nothing was installed.');
+    const envelope = JSON.parse(block[1]), payload = decode(envelope.payload);
+    const key = await crypto.subtle.importKey('spki', decode(config.key), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    if (!await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, decode(envelope.signature), payload)) throw Error('The release signature is invalid. Nothing was installed.');
+    const info = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payload));
+    parts(info.version);
+    if (info.schema !== 2 || info.plugin !== config.id || info.repo !== config.repo || release.tag_name !== 'v' + info.version ||
+        !/^[a-f0-9]{40}$/.test(info.commit) || !Array.isArray(info.files) || info.files.length !== config.files.length)
+      throw Error('The signed release does not match this plugin.');
+    for (const name of config.files) {
+      const rows = info.files.filter(file => file.name === name);
+      if (rows.length !== 1 || !/^[a-f0-9]{64}$/.test(rows[0].sha256) || !Number.isInteger(rows[0].bytes) || rows[0].bytes < 1 || rows[0].bytes > limit)
+        throw Error('The signed release file list is invalid.');
+    }
+    return info;
+  }
+  async function download(url, max = limit) {
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(url, { signal: controller.signal, credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store', redirect: 'error' });
+      if (!response.ok) {
+        const error = Error(response.status === 403 || response.status === 429 ? 'GitHub is limiting update checks. Try again later.' : `GitHub download failed (${response.status}). Try again later.`);
+        error.status = response.status; throw error;
+      }
+      if (!response.body || Number(response.headers.get('content-length')) > max) throw Error('The download is empty or too large.');
+      const reader = response.body.getReader(), chunks = [];
+      let size = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > max) { await reader.cancel(); throw Error('The download is too large.'); }
+        chunks.push(value);
+      }
+      const data = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+      return new TextDecoder('utf-8', { fatal: true }).decode(data);
+    } catch (error) {
+      if (error.name === 'AbortError') throw Error('The update check timed out. Try again.');
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
+  function desktop() {
+    const bridge = globalThis.window?.hermesDesktop;
+    if (!bridge?.desktopPluginsRoot || !bridge?.readFileText || !bridge?.writeTextFile || !bridge?.renamePath)
+      throw Error('Updating requires Hermes Desktop with local plugin file support.');
+    return bridge;
+  }
+  async function read(bridge, file) {
+    const result = await bridge.readFileText(file);
+    if (result.truncated || typeof result.text !== 'string' || bytes(result.text).length > limit) throw Error('Could not read the complete file: ' + file);
+    return result.text;
+  }
+  async function location(bridge) {
+    const root = await bridge.desktopPluginsRoot();
+    if (typeof root !== 'string' || !root.trim()) throw Error('The local Desktop plugin folder is unavailable.');
+    const matches = [];
+    for (const folder of config.folders) {
+      const dir = root.replace(/[\\/]+$/, '') + '/' + folder;
+      let source;
+      try { source = await read(bridge, dir + '/plugin.js'); } catch { continue; }
+      if (declaredId(source) === config.id) matches.push(dir);
+    }
+    if (matches.length !== 1) throw Error(matches.length ? 'Multiple copies of this plugin are installed. Keep one copy and reload Desktop.' : 'Could not locate this plugin. Install it in desktop-plugins/' + config.folders[0] + ' and reload Desktop.');
+    return matches[0];
+  }
+  async function snapshot(bridge, dir) {
+    const texts = {}, hashes = {};
+    for (const name of config.files) { texts[name] = await read(bridge, dir + '/' + name); hashes[name] = await hash(texts[name]); }
+    return { texts, hashes };
+  }
+  const sameHashes = (a, b) => config.files.every(name => a[name] === b[name]);
+  function validBackup(record) {
+    return record?.plugin === config.id && Array.isArray(record.files) && record.files.length === config.files.length && config.files.every(name => {
+      const rows = record.files.filter(file => file.name === name);
+      return rows.length === 1 && /^update-[a-f0-9-]{36}-backup-[a-z.]+$/.test(rows[0].backup) && rows[0].backup.endsWith('-backup-' + name) && /^[a-f0-9]{64}$/.test(rows[0].sha256);
+    });
+  }
+  // Electron-local only. Stage every file; replace plugin.js last so helpers are ready at reload.
+  async function replace(bridge, dir, before, next, store) {
+    const token = crypto.randomUUID(), staged = {}, moved = [];
+    const order = [...config.files.filter(name => name !== 'plugin.js'), 'plugin.js'];
+    const backup = { plugin: config.id, version: declaredVersion(before.texts['plugin.js']) || null,
+      files: order.map(name => ({ name, backup: 'update-' + token + '-backup-' + name, sha256: before.hashes[name] })) };
+    for (const name of order) {
+      staged[name] = 'update-' + token + '-staged-' + name;
+      await bridge.writeTextFile(dir + '/' + staged[name], next[name]);
+      if (await read(bridge, dir + '/' + staged[name]) !== next[name]) throw Error('The staged files did not verify. Nothing was replaced.');
+    }
+    if (!alive || await location(bridge) !== dir || !sameHashes((await snapshot(bridge, dir)).hashes, before.hashes))
+      throw Error('The Desktop profile or plugin files changed. Check again before installing.');
+    const previous = await store.get(keyFor(dir), null);
+    try {
+      await store.set(keyFor(dir), backup);
+      for (const file of backup.files) {
+        await bridge.renamePath(dir + '/' + file.name, file.backup);
+        const step = { ...file, installed: false }; moved.push(step);
+        await bridge.renamePath(dir + '/' + staged[file.name], file.name);
+        step.installed = true;
+      }
+    } catch (error) {
+      let failed = false;
+      for (const file of moved.reverse()) {
+        try {
+          if (file.installed) await bridge.renamePath(dir + '/' + file.name, staged[file.name]);
+          await bridge.renamePath(dir + '/' + file.backup, file.name);
+        } catch { failed = true; }
+      }
+      if (failed) throw Error(`Replacement failed. Close Desktop and restore the update-${token}-backup-* files in ${dir} to their original names.`);
+      await store.set(keyFor(dir), previous);
+      throw Error('Replacement failed. The original files were restored. ' + error.message);
+    }
+    return backup;
+  }
+  function cancel() { if (!model.get().busy) patch({ offer: null, error: '', message: '' }); }
+  async function run(action = 'check') {
+    if (!alive || globalThis[lock] || !['check', 'install', 'restore', 'restore-confirm'].includes(action)) return;
+    const offer = model.get().offer;
+    if (action === 'install' && offer?.kind !== 'update' || action === 'restore-confirm' && offer?.kind !== 'restore') return;
+    globalThis[lock] = true;
+    patch({ open: true, busy: true, error: '', offer: null, message: action === 'check' ? 'Checking for updates…' : action === 'restore' ? 'Checking the backup…' : 'Verifying the selected version…' });
+    try {
+      const bridge = desktop(), dir = await location(bridge), store = storage;
+      if (!store) throw Error('Plugin storage is unavailable. Reload Desktop.');
+      const before = await snapshot(bridge, dir);
+      if (declaredVersion(before.texts['plugin.js']) !== config.version || !before.texts['plugin.js'].includes(config.key)) throw Error('The installed copy differs from the loaded plugin. Reload Desktop and try again.');
+      if (action.endsWith('confirm') || action === 'install') {
+        if (offer.dir !== dir || !sameHashes(offer.hashes, before.hashes)) throw Error('The installation changed. Check again before confirming.');
+      }
+      const next = {};
+      let message;
+      if (action === 'restore' || action === 'restore-confirm') {
+        const record = await store.get(keyFor(dir), null);
+        if (!validBackup(record)) throw Error('No complete backup is available.');
+        if (action === 'restore-confirm' && JSON.stringify(record) !== JSON.stringify(offer.backup)) throw Error('The backup changed. Choose Restore previous version again.');
+        for (const file of record.files) {
+          next[file.name] = await read(bridge, dir + '/' + file.backup);
+          if (await hash(next[file.name]) !== file.sha256) throw Error('A backup file has changed. Nothing was restored.');
+        }
+        if (action === 'restore') {
+          patch({ offer: { kind: 'restore', dir, hashes: before.hashes, backup: JSON.parse(JSON.stringify(record)) },
+            message: `Restore ${record.version ? config.name + ' v' + record.version : 'the previous version'}? The plugin will reload. Finish active work first.` });
+          return;
+        }
+        message = 'Previous version restored. Reload desktop plugins if needed.';
+      } else {
+        let release = offer?.release;
+        if (action === 'check') {
+          try { release = JSON.parse(await download(`https://api.github.com/repos/${config.repo}/releases/latest`, 100000)); }
+          catch (error) { if (error.status !== 404) throw error; patch({ message: 'No signed release is published yet.' }); return; }
+        }
+        const info = await verify(release);
+        if (!newer(info.version, config.version)) { patch({ message: `You're up to date. ${config.name} v${config.version}.` }); return; }
+        if (action === 'check') {
+          patch({ offer: { kind: 'update', dir, hashes: before.hashes, release },
+            message: `${config.name} v${info.version} is available. Update now? The plugin will reload. Finish active work first.` });
+          return;
+        }
+        for (const file of info.files) {
+          patch({ message: 'Downloading ' + file.name + '…' });
+          next[file.name] = await download(`https://raw.githubusercontent.com/${config.repo}/${info.commit}/${file.name}`);
+          if (bytes(next[file.name]).length !== file.bytes || await hash(next[file.name]) !== file.sha256) throw Error('The download does not match the signed release. Nothing was installed.');
+        }
+        if (declaredId(next['plugin.js']) !== config.id || declaredVersion(next['plugin.js']) !== info.version) throw Error('The downloaded plugin identity or version does not match.');
+        message = `Updated to v${info.version}. Reload desktop plugins if needed.`;
+      }
+      patch({ message: 'Backing up and replacing plugin files…' });
+      const backup = await replace(bridge, dir, before, next, store);
+      patch({ backup, message });
+    } catch (error) { patch({ error: error.message || 'Could not check for updates. Try again.', message: '' }); }
+    finally { globalThis[lock] = false; patch({ busy: false }); }
+  }
+  function register(ctx) {
+    storage = ctx.storage; alive = true;
+    ctx.onDispose?.(() => { alive = false; storage = null; });
+    (async () => {
+      try { const dir = await location(desktop()); const backup = await storage?.get(keyFor(dir), null); patch({ backup: validBackup(backup) ? backup : null }); }
+      catch { /* Other plugin features remain available on older Desktop versions. */ }
+    })();
+  }
+  function Panel() {
+    const s = sdk.useValue(model);
+    const button = (label, onClick, primary = false) => jsx('button', {
+      type: 'button', disabled: s.busy, onClick,
+      style: { padding: '6px 10px', minHeight: 32, borderRadius: 6, border: '1px solid var(--ui-stroke-secondary)',
+        background: primary ? 'var(--ui-bg-secondary)' : 'transparent', color: 'var(--ui-text-primary)', cursor: s.busy ? 'wait' : 'pointer', font: 'inherit', opacity: s.busy ? 0.6 : 1 }, children: label
+    });
+    return jsxs('section', {
+      'aria-label': config.name + ' updates',
+      style: { flexShrink: 0, padding: '8px 16px', borderTop: '1px solid var(--ui-stroke-secondary)', color: 'var(--ui-text-secondary)', fontSize: 12 },
+      children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }, children: [
+          jsx('span', { style: { marginRight: 'auto' }, children: `${config.name} v${config.version}` }),
+          button(s.busy ? 'Please wait…' : 'Check for updates', () => run()),
+          s.backup && !s.offer && button('Restore previous version', () => run('restore'))
+        ] }),
+        (s.message || s.error) && jsx('p', { role: s.error ? 'alert' : 'status',
+          style: { margin: '8px 0', overflowWrap: 'anywhere', color: s.error ? 'var(--ui-red)' : 'inherit' }, children: s.error || s.message }),
+        s.offer && jsxs('div', { role: 'group', 'aria-label': s.offer.kind === 'restore' ? 'Confirm restore' : 'Confirm update',
+          style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }, children: [
+            button(s.offer.kind === 'restore' ? 'Restore now' : 'Update now', () => run(s.offer.kind === 'restore' ? 'restore-confirm' : 'install'), true),
+            button(s.offer.kind === 'restore' ? 'Cancel' : 'Later', cancel)
+          ] })
+      ]
+    });
+  }
+  return { register, Panel, run, cancel, model, verify, newer, replace, snapshot, location, validBackup };
+}
+// END SIGNED DESKTOP UPDATER
+
+const UPDATE_KEY = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdDcg2pf4qQg4y89ZLfoIhfJqyKP+bJMA0Q0YVDK0VAbAgyVi5CaodDuUgibOqTx1zQg9xrXdzYbCvpgMjIFBCw==";
+const desktopUpdater = createDesktopUpdater({
+  id: PLUGIN_ID, name: "Resetwatch", version: VERSION, key: UPDATE_KEY,
+  repo: "Adolanium/hermes-resetwatch", folders: ["hermes-resetwatch","resetwatch"], files: ["plugin.js","probe.py"]
+});
+function Page() {
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsx('div', { style: { flex: 1, minHeight: 0, overflow: 'hidden' }, children: jsx(PluginPageContent, {}) }),
+      jsx(desktopUpdater.Panel, {})
+    ]
+  });
+}
+
 export default {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
   description: 'Remaining quota and reset clocks for the plans you already pay for.',
   defaultEnabled: true,
   register(ctx) {
+    desktopUpdater.register(ctx);
     const onDispose = typeof ctx.onDispose === 'function' ? fn => ctx.onDispose(fn) : () => {}
     storage = ctx.storage || null
     os = ctx.os || null
