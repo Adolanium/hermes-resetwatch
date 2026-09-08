@@ -531,7 +531,7 @@ def _store_anthropic_snapshot(snap: dict) -> None:
 
 def _hermes_anthropic_oauth_token() -> Optional[str]:
     try:
-        from agent.anthropic_adapter import resolve_anthropic_token
+        from agent.anthropic_credentials import resolve_anthropic_token
 
         token = (resolve_anthropic_token() or "").strip()
         if token and _is_claude_oauth_token(token):
