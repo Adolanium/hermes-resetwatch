@@ -3558,7 +3558,29 @@ def _emit_json(payload: Any, stream) -> None:
     stream.flush()
 
 
+def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Path]:
+    """Find <hermes-home>/profiles/<name> by walking up from this script.
+
+    The probe can be installed under the base home or under a profile's own
+    home; either way the named profile lives at an ancestor's profiles/ dir.
+    Returns None when no such profile exists.
+    """
+    start = (here or Path(__file__)).resolve()
+    for ancestor in [start, *start.parents]:
+        candidate = ancestor / "profiles" / name
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def _main_inner() -> int:
+    if "--profile" in sys.argv:
+        index = sys.argv.index("--profile")
+        if index + 1 >= len(sys.argv):
+            raise ValueError("--profile requires a name")
+        target = _resolve_profile_home(sys.argv[index + 1].strip())
+        if target is not None:
+            os.environ["HERMES_HOME"] = str(target)
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout

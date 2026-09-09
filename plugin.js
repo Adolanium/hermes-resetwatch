@@ -587,12 +587,26 @@ function pickProbeFailure(failures) {
   return list[list.length - 1].message
 }
 
-async function probeStockAccountUsage(opts) {
+async function profileRequester(connectionId, profile) {
+  const active = String(profile || '').trim()
+  if (!active || !connectionId || typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+    return (method, params = {}) => host.request(method, params)
+  }
+  const routes = await host.profileRoutes()
+  const sourceRoutes = routes.filter(item => item && item.connectionId === connectionId)
+  const route = sourceRoutes.find(item => item.profile === active) || sourceRoutes.find(item => item.targetProfile === active)
+  if (!route) throw new Error(`No Desktop route for ${active}`)
+  return (method, params = {}) => host.requestProfile(route, method, params)
+}
+
+async function probeStockAccountUsage(request, opts) {
   try {
-    const shown = await host.request('config.show', {})
+    const shown = await request('config.show', {})
     const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
     if (!homes.length) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
+    const profileArg = String((opts && opts.profile) || '').trim()
     const flags = [
+      profileArg ? `--profile ${quoteShell(profileArg)}` : '',
       opts && opts.cliOnly ? '--cli-only' : '',
       opts && opts.fresh ? '--fresh' : ''
     ]
@@ -615,7 +629,7 @@ async function probeStockAccountUsage(opts) {
           const probe = `${home}/desktop-plugins/${folder}/probe.py`
           if (deadProbes.has(probe)) continue
           try {
-            const result = await host.request('shell.exec', {
+            const result = await request('shell.exec', {
               command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
             })
             if (!result || result.code) {
@@ -666,16 +680,17 @@ function go(route) {
   if (typeof host.navigate === 'function') host.navigate(route)
 }
 
-async function fetchLiveCards(sessionId, opts) {
+async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   const cards = []
   const errors = []
   const sid = sessionId || readSessionId()
   const fresh = !!(opts && opts.fresh)
   let haveAccountRpc = false
+  const request = await profileRequester(connectionId, profile)
 
   const [barsResult, accountResult] = await Promise.allSettled([
-    host.request('usage.bars', {}),
-    host.request('account.usage', {})
+    request('usage.bars', {}),
+    request('account.usage', {})
   ])
 
   let barsError = ''
@@ -688,7 +703,7 @@ async function fetchLiveCards(sessionId, opts) {
 
   if (!cards.length) {
     try {
-      const sub = await host.request('subscription.state', {})
+      const sub = await request('subscription.state', {})
       if (sub && sub.usage) cards.push(...cardsFromUsageBars(sub.usage))
     } catch (error) {
       errors.push(error && error.message ? error.message : 'Could not read subscription state')
@@ -716,7 +731,7 @@ async function fetchLiveCards(sessionId, opts) {
     }
   }
 
-  const probeResult = await probeStockAccountUsage({ cliOnly: haveAccountRpc, fresh })
+  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -753,7 +768,7 @@ async function fetchLiveCards(sessionId, opts) {
   // Never surface a stale focused-session "session not found".
   if (!haveAccountRpc && sid && !haveClaudeProbe) {
     try {
-      const result = await host.request('slash.exec', { command: 'usage', session_id: sid })
+      const result = await request('slash.exec', { command: 'usage', session_id: sid })
       const output = result && typeof result.output === 'string' ? result.output : ''
       const skipNous = cards.some(card => String(card.id).startsWith('nous:'))
       cards.push(...cardsFromUsageGroups(parseUsageOutput(output), skipNous))
@@ -1131,7 +1146,7 @@ function EditClock({ clock, onSave, onCancel }) {
   })
 }
 
-function useLiveCardsPolled(gateway, sessionId) {
+function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
   const sid = sessionId || ''
   const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
   const [isFetching, setFetching] = useState(false)
@@ -1143,7 +1158,7 @@ function useLiveCardsPolled(gateway, sessionId) {
     inFlight.current = true
     const gen = ++genRef.current
     setFetching(true)
-    fetchLiveCards(sid, opts)
+    fetchLiveCards(sid, opts, connectionId, profile)
       .then(next => {
         if (gen !== genRef.current) return
         setData(next)
@@ -1174,18 +1189,18 @@ function useLiveCardsPolled(gateway, sessionId) {
       inFlight.current = false
       clearInterval(id)
     }
-  }, [gateway, sid])
+  }, [gateway, sid, connectionId, profile])
 
   return { data, isFetching, refetch: () => load({ fresh: true }) }
 }
 
-function useLiveCardsQuery(gateway, sessionId) {
+function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
   const sid = sessionId || ''
   const [manualFetching, setManualFetching] = useState(false)
   const [manualError, setManualError] = useState('')
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'live', sid],
-    queryFn: () => fetchLiveCards(sid),
+    queryKey: [PLUGIN_ID, 'live', connectionId || '', profile || '', sid],
+    queryFn: () => fetchLiveCards(sid, {}, connectionId, profile),
     enabled: gateway === 'open',
     refetchInterval: POLL_MS,
     retry: false
@@ -1197,13 +1212,13 @@ function useLiveCardsQuery(gateway, sessionId) {
     setManualFetching(true)
     return queryClient
       .fetchQuery({
-        queryKey: [PLUGIN_ID, 'live', sid, 'fresh'],
-        queryFn: () => fetchLiveCards(sid, { fresh: true }),
+        queryKey: [PLUGIN_ID, 'live', connectionId || '', profile || '', sid, 'fresh'],
+        queryFn: () => fetchLiveCards(sid, { fresh: true }, connectionId, profile),
         staleTime: 0,
         retry: false
       })
       .then(data => {
-        queryClient.setQueryData([PLUGIN_ID, 'live', sid], data)
+        queryClient.setQueryData([PLUGIN_ID, 'live', connectionId || '', profile || '', sid], data)
         setManualError('')
         return data
       })
@@ -1244,7 +1259,13 @@ function PluginPageContent() {
   const nowMs = useValue($now)
   const clocks = useValue($clocks)
   const sessionId = useValue(host.state.focusedSessionId)
-  const live = useLiveCards(gateway, sessionId)
+  const owner = useValue(host.state.focusedSessionOwner)
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  const activeConnectionId = useValue(host.state.connectionId)
+  const activeProfile = useValue(host.state.profile)
+  const connectionId = (owner && owner.connectionId) || activeConnectionId || ''
+  const profile = focusedProfile || activeProfile
+  const live = useLiveCards(gateway, sessionId, connectionId, profile)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [liveOpen, toggleLive] = useSectionOpen('live')
