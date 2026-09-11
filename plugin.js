@@ -64,6 +64,7 @@ let os = null
 
 const $clocks = atom([])
 const $now = atom(Date.now())
+const $missingState = atom(null)
 
 function stored(key, fallback) {
   return storage ? storage.get(key, fallback) : fallback
@@ -492,6 +493,9 @@ function hermesHomeCandidates(fromConfig) {
   const push = value => {
     const text = String(value || '').trim()
     if (text && !out.includes(text)) out.push(text)
+    // Profiles share the base home's plugin install and Python runtime.
+    const base = text.replace(/[\\/]profiles[\\/][^\\/]+[\\/]*$/i, '')
+    if (base && base !== text && !out.includes(base)) out.push(base)
   }
   push(fromConfig)
   try {
@@ -588,15 +592,19 @@ function pickProbeFailure(failures) {
 }
 
 async function profileRequester(connectionId, profile) {
+  if (connectionId === null) throw new Error('Could not find the owner of the focused session')
   const active = String(profile || '').trim()
   if (!active || !connectionId || typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
-    return (method, params = {}) => host.request(method, params)
+    return { request: (method, params = {}) => host.request(method, params), profile: active }
   }
   const routes = await host.profileRoutes()
   const sourceRoutes = routes.filter(item => item && item.connectionId === connectionId)
   const route = sourceRoutes.find(item => item.profile === active) || sourceRoutes.find(item => item.targetProfile === active)
   if (!route) throw new Error(`No Desktop route for ${active}`)
-  return (method, params = {}) => host.requestProfile(route, method, params)
+  return {
+    request: (method, params = {}) => host.requestProfile(route, method, params),
+    profile: route.targetProfile || route.profile
+  }
 }
 
 async function probeStockAccountUsage(request, opts) {
@@ -605,6 +613,9 @@ async function probeStockAccountUsage(request, opts) {
     const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
     if (!homes.length) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
     const profileArg = String((opts && opts.profile) || '').trim()
+    if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
+      return { snapshots: null, error: 'Invalid Hermes profile name' }
+    }
     const flags = [
       profileArg ? `--profile ${quoteShell(profileArg)}` : '',
       opts && opts.cliOnly ? '--cli-only' : '',
@@ -622,8 +633,10 @@ async function probeStockAccountUsage(request, opts) {
     // could not open is skipped for every interpreter.
     const deadPythons = new Set()
     const deadProbes = new Set()
+    const pythons = [...new Set(homes.flatMap(probePythonCandidates).filter(item => item !== 'python3' && item !== 'python')),
+      'python3', 'python']
     for (const home of homes) {
-      for (const python of probePythonCandidates(home)) {
+      for (const python of pythons) {
         if (deadPythons.has(python)) continue
         for (const folder of folders) {
           const probe = `${home}/desktop-plugins/${folder}/probe.py`
@@ -686,7 +699,8 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   const sid = sessionId || readSessionId()
   const fresh = !!(opts && opts.fresh)
   let haveAccountRpc = false
-  const request = await profileRequester(connectionId, profile)
+  const target = await profileRequester(connectionId, profile)
+  const request = target.request
 
   const [barsResult, accountResult] = await Promise.allSettled([
     request('usage.bars', {}),
@@ -731,7 +745,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
   }
 
-  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile })
+  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -1173,13 +1187,14 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
         })
       })
       .finally(() => {
-        inFlight.current = false
         if (gen !== genRef.current) return
+        inFlight.current = false
         setFetching(false)
       })
   }
 
   useEffect(() => {
+    setData({ cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false })
     load()
     const id = setInterval(() => load(), POLL_MS)
     return () => {
@@ -1196,10 +1211,13 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
 
 function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
   const sid = sessionId || ''
-  const [manualFetching, setManualFetching] = useState(false)
-  const [manualError, setManualError] = useState('')
+  const key = [PLUGIN_ID, 'live', connectionId, profile || '', sid]
+  const contextKey = JSON.stringify(key)
+  const [manual, setManual] = useState({ key: '', fetching: false, error: '' })
+  const manualFetching = manual.key === contextKey && manual.fetching
+  const manualError = manual.key === contextKey ? manual.error : ''
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'live', connectionId || '', profile || '', sid],
+    queryKey: key,
     queryFn: () => fetchLiveCards(sid, {}, connectionId, profile),
     enabled: gateway === 'open',
     refetchInterval: POLL_MS,
@@ -1209,27 +1227,32 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
     if (!queryClient || typeof queryClient.fetchQuery !== 'function') {
       return query.refetch && query.refetch()
     }
-    setManualFetching(true)
+    setManual({ key: contextKey, fetching: true, error: '' })
     return queryClient
       .fetchQuery({
-        queryKey: [PLUGIN_ID, 'live', connectionId || '', profile || '', sid, 'fresh'],
+        queryKey: [...key, 'fresh'],
         queryFn: () => fetchLiveCards(sid, { fresh: true }, connectionId, profile),
         staleTime: 0,
         retry: false
       })
       .then(data => {
-        queryClient.setQueryData([PLUGIN_ID, 'live', connectionId || '', profile || '', sid], data)
-        setManualError('')
+        queryClient.setQueryData(key, data)
+        setManual(previous => previous.key === contextKey ? { key: contextKey, fetching: false, error: '' } : previous)
         return data
       })
       .catch(error => {
         // Keep the last good cards, but say the refresh did not land.
-        setManualError(errorMessage(error, 'Refresh failed'))
+        setManual(previous => previous.key === contextKey
+          ? { key: contextKey, fetching: false, error: errorMessage(error, 'Refresh failed') }
+          : previous)
         return null
       })
-      .finally(() => setManualFetching(false))
   }
   let data = query.data
+  if (query.error) {
+    const base = data || { cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false }
+    data = { ...base, errors: [...(base.errors || []), errorMessage(query.error, 'Could not read live usage')] }
+  }
   if (manualError) {
     const base = data || { cards: [], errors: [], hadSession: false, haveAccountRpc: false }
     data = { ...base, errors: [...(base.errors || []), `Refresh failed: ${manualError}`] }
@@ -1259,12 +1282,18 @@ function PluginPageContent() {
   const nowMs = useValue($now)
   const clocks = useValue($clocks)
   const sessionId = useValue(host.state.focusedSessionId)
-  const owner = useValue(host.state.focusedSessionOwner)
-  const focusedProfile = useValue(host.state.focusedSessionProfile)
-  const activeConnectionId = useValue(host.state.connectionId)
-  const activeProfile = useValue(host.state.profile)
-  const connectionId = (owner && owner.connectionId) || activeConnectionId || ''
-  const profile = focusedProfile || activeProfile
+  const owner = useValue(host.state.focusedSessionOwner || $missingState)
+  const focusedProfile = useValue(host.state.focusedSessionProfile || $missingState)
+  const activeConnectionId = useValue(host.state.connectionId || $missingState)
+  const activeProfile = useValue(host.state.profile || $missingState)
+  const hasOwnerState = !!host.state.focusedSessionOwner
+  // A null owner means Desktop could not place the focused session. Do not
+  // combine its profile with another connection's account.
+  const unresolved = hasOwnerState
+    ? !owner || !owner.connectionId || !owner.profile
+    : focusedProfile && focusedProfile !== activeProfile
+  const connectionId = unresolved ? null : hasOwnerState ? owner.connectionId : activeConnectionId || ''
+  const profile = hasOwnerState ? owner && owner.profile : focusedProfile || activeProfile
   const live = useLiveCards(gateway, sessionId, connectionId, profile)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
