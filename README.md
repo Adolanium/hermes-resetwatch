@@ -123,9 +123,22 @@ Resetwatch uses the desktop plugin SDK and the standard Hermes gateway methods. 
 
 It runs on Windows, Mac, and Linux with stock Hermes Desktop. `probe.py` runs with the Hermes interpreter: `hermes-agent/.venv` under the Hermes home, or `$HERMES_PYTHON` on Nix and other packaged installs.
 
+Live cards follow the focused session's Desktop connection and profile. With no focused session, they use the active profile. Remote profile aliases use the backend profile name. The plugin can live in the base home or a profile home, and profiles can share the base home's Python install.
+
+When a profile is selected, its Hermes credentials and cache stay separate from other profiles. If the gateway is running under a different home, the probe reads API keys from the selected profile's `.env`. CLI and app logins such as Claude Code and Cursor are still shared when those apps use one login for the whole machine. Older Desktop versions without profile routing keep the normal gateway path; an unknown session owner shows an error instead of another account's cards.
+
 ## Contributing
 
 Contributions are welcome. Open an issue first for anything bigger than a small fix so we can agree on the shape before you spend time on it.
+
+Run the profile tests with Python and Node.js. No packages need to be installed:
+
+```sh
+python -m unittest test_profile_switch
+node --test test_profile_routing.cjs
+```
+
+The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing.
 
 ## License
 

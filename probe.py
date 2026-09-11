@@ -48,6 +48,7 @@ import io
 import json
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -86,6 +87,9 @@ _refresh_writes_lock = threading.Lock()
 # Vendors whose login file this run rewrote after a token refresh. Their
 # cards carry a note so a later CLI sign-out is not a mystery.
 _refreshed_vendors: set[str] = set()
+# Set only for --profile. Calls without it keep the existing lookup rules.
+_profile_home: Optional[Path] = None
+_profile_inherits_env = True
 
 
 def _note_vendor_refresh(vendor: str) -> None:
@@ -331,8 +335,14 @@ def _resetwatch_cache_dir() -> Path:
             missing.append(target)
     candidates.extend(existing)
     candidates.extend(missing)
-    candidates.append(Path.home() / ".hermes" / "cache" / "resetwatch")
-    candidates.append(Path(tempfile.gettempdir()) / "hermes-resetwatch-cache")
+    fallback = Path(tempfile.gettempdir()) / "hermes-resetwatch-cache"
+    if _profile_home is not None:
+        # An unwritable profile must not reuse the base account's cache.
+        scope = hashlib.sha256(str(_profile_home).encode("utf-8")).hexdigest()[:16]
+        fallback = fallback / scope
+    else:
+        candidates.append(Path.home() / ".hermes" / "cache" / "resetwatch")
+    candidates.append(fallback)
     seen: set[str] = set()
     for path in candidates:
         key = str(path)
@@ -344,7 +354,7 @@ def _resetwatch_cache_dir() -> Path:
             return path
         except Exception:
             continue
-    return Path(tempfile.gettempdir()) / "hermes-resetwatch-cache"
+    return fallback
 
 
 def _anthropic_cache_path() -> Path:
@@ -2557,6 +2567,8 @@ def _fetch_glm_zcode_account_usage() -> Optional[dict]:
 
 
 def _hermes_homes() -> list[Path]:
+    if _profile_home is not None:
+        return [_profile_home]
     roots: list[Path] = []
     override = (os.environ.get("HERMES_HOME") or "").strip()
     if override:
@@ -2617,7 +2629,8 @@ def _read_env_file_value(path: Path, name: str) -> Optional[str]:
 
 
 def _hermes_env_value(name: str) -> Optional[str]:
-    direct = (os.environ.get(name) or "").strip()
+    # A gateway serving a sibling profile still has its own API keys in env.
+    direct = (os.environ.get(name) or "").strip() if _profile_inherits_env else ""
     if direct:
         return direct
     for home in _hermes_homes():
@@ -3385,7 +3398,41 @@ def _fetch_commandcode_account_usage() -> Optional[dict]:
     return _commandcode_snapshot(account, credits, subscription, summary)
 
 
+@contextlib.contextmanager
+def _hermes_usage_env():
+    """Give upstream usage helpers the selected profile's keys and endpoints.
+
+    Keep their normal config and pool lookup, including older Hermes versions.
+    This runs before the CLI worker threads start.
+    """
+    if _profile_home is None or _profile_inherits_env:
+        yield
+        return
+    names = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "HERMES_API_KEY",
+             "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "HERMES_BASE_URL", "CUSTOM_BASE_URL")
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            value = _hermes_env_value(name)
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _collect_hermes() -> list[dict]:
+    with _hermes_usage_env():
+        return _collect_hermes_usage()
+
+
+def _collect_hermes_usage() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
     except Exception:
@@ -3558,7 +3605,39 @@ def _emit_json(payload: Any, stream) -> None:
     stream.flush()
 
 
+def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Path]:
+    """Resolve a profile beside this plugin install, including the base home."""
+    name = name.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+        raise ValueError("Invalid Hermes profile name")
+    start = (here or Path(__file__)).resolve()
+    for ancestor in start.parents:
+        if ancestor.name != "desktop-plugins":
+            continue
+        base = ancestor.parent
+        if base.parent.name == "profiles":
+            base = base.parent.parent
+        candidate = base if name == "default" else base / "profiles" / name
+        return candidate.resolve() if candidate.is_dir() else None
+    return None
+
+
 def _main_inner() -> int:
+    global _profile_home, _profile_inherits_env
+    if "--profile" in sys.argv:
+        index = sys.argv.index("--profile")
+        if index + 1 >= len(sys.argv):
+            raise ValueError("--profile requires a name")
+        target = _resolve_profile_home(sys.argv[index + 1].strip())
+        if target is None:
+            raise ValueError("Hermes profile not found beside this probe")
+        inherited = (os.environ.get("HERMES_HOME") or "").strip()
+        inherited_home = Path(inherited).expanduser() if inherited else next(
+            (home for home in _hermes_homes() if home.is_dir()), None
+        )
+        _profile_inherits_env = inherited_home is not None and inherited_home.resolve() == target
+        _profile_home = target
+        os.environ["HERMES_HOME"] = str(target)
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout
