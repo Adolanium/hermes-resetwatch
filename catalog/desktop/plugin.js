@@ -1,0 +1,1782 @@
+/**
+ * Resetwatch: remaining subscription quota and reset clocks for Hermes Desktop.
+ *
+ * One uncompiled plugin.js. A full page (sidebar + palette +
+ * keybind), not a HUD. Live rows come from gateway RPCs plus probe.py
+ * for CLI and app logins Hermes does not OAuth itself.
+ * Manual clocks cover plans with no public remaining-quota API.
+ *
+ * 1. Import the SDK as a namespace so missing named exports cannot crash load.
+ * 2. No hardcoded colours. No polling faster than 5 minutes.
+ * 3. No cookies, no scrape, no composer chip, no status bar, no right pane.
+ */
+
+import * as sdk from '@hermes/plugin-sdk'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { jsx, jsxs } from 'react/jsx-runtime'
+
+const PLUGIN_ID = 'resetwatch'
+const PLUGIN_NAME = 'Resetwatch'
+const ROUTE = '/resetwatch'
+const VERSION = '0.2.16'
+const POLL_MS = 5 * 60 * 1000
+// Manual Refresh floor. probe.py enforces the same 60s on --fresh, so a
+// click inside this window would only replay the cache anyway.
+const REFRESH_COOLDOWN_MS = 60 * 1000
+
+const host = sdk.host
+const {
+  useValue,
+  atom,
+  useQuery,
+  queryClient,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  PALETTE_AREA,
+  KEYBINDS_AREA,
+  Badge,
+  haptic
+} = sdk
+
+const text = {
+  primary: 'var(--ui-text-primary)',
+  secondary: 'var(--ui-text-secondary)',
+  tertiary: 'var(--ui-text-tertiary)',
+  quaternary: 'var(--ui-text-quaternary)',
+  red: 'var(--ui-red)',
+  yellow: 'var(--ui-yellow)',
+  green: 'var(--ui-green)',
+  accent: 'var(--ui-accent)'
+}
+
+const PRESETS = [
+  { id: 'cursor', name: 'Cursor', url: 'https://cursor.com/dashboard/spending' },
+  { id: 'claude', name: 'Claude', url: 'https://claude.ai/settings/usage' },
+  { id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com' },
+  { id: 'gemini', name: 'Gemini', url: 'https://gemini.google.com/app' },
+  { id: 'grok', name: 'Grok', url: 'https://grok.com' },
+  { id: 'perplexity', name: 'Perplexity', url: 'https://www.perplexity.ai' },
+  { id: 'custom', name: 'Custom', url: '' }
+]
+
+let storage = null
+let os = null
+
+const $clocks = atom([])
+const $now = atom(Date.now())
+const $missingState = atom(null)
+
+function stored(key, fallback) {
+  return storage ? storage.get(key, fallback) : fallback
+}
+
+function remember(key, value) {
+  if (storage) storage.set(key, value)
+}
+
+function loadClocks() {
+  const raw = stored('clocks', [])
+  const list = Array.isArray(raw) ? raw : []
+  $clocks.set(
+    list.filter(
+      clock =>
+        clock &&
+        typeof clock.id === 'string' &&
+        typeof clock.name === 'string' &&
+        clampPercent(clock.remaining) !== null
+    )
+  )
+}
+
+function saveClocks(next) {
+  $clocks.set(next)
+  remember('clocks', next)
+}
+
+function tap() {
+  if (typeof haptic === 'function') haptic('tap')
+}
+
+function clampPercent(value) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+function remainingFromUsed(used) {
+  const usedPct = clampPercent(used)
+  if (usedPct === null) return null
+  return Math.max(0, 100 - usedPct)
+}
+
+function toneForRemaining(remaining) {
+  if (remaining === null || remaining === undefined) return 'ok'
+  if (remaining <= 10) return 'bad'
+  if (remaining <= 30) return 'warn'
+  return 'ok'
+}
+
+function toneColor(tone) {
+  if (tone === 'bad') return text.red
+  if (tone === 'warn') return text.yellow
+  return text.secondary
+}
+
+function formatReset(resetAt, resetText, nowMs) {
+  if (resetText) return resetText
+  if (!resetAt) return ''
+  const date = new Date(resetAt)
+  if (Number.isNaN(date.getTime())) return String(resetAt)
+  const delta = date.getTime() - (nowMs || Date.now())
+  const local = date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  })
+  if (delta <= 0) return `Reset now · ${local}`
+  const minutes = Math.round(delta / 60000)
+  if (minutes < 1) return `Reset now · ${local}`
+  if (minutes < 60) return `Resets in ${minutes}m · ${local}`
+  const hours = Math.floor(minutes / 60)
+  const rem = minutes % 60
+  if (hours < 24) return `Resets in ${hours}h ${rem}m · ${local}`
+  const days = Math.floor(hours / 24)
+  return `Resets in ${days}d ${hours % 24}h · ${local}`
+}
+
+function toDatetimeLocal(iso) {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = n => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function fromDatetimeLocal(value) {
+  if (!value) return null
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+function isNousProvider(name) {
+  return /^nous\b/i.test(String(name || '').trim())
+}
+
+function providerKey(name) {
+  const key = String(name || '').trim().toLowerCase()
+  if (key === 'kimi-coding') return 'kimi'
+  if (key === 'xai-oauth' || key === 'xai') return 'grok'
+  if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'glm-coding' || key === 'zai-coding-plan') return 'glm'
+  if (key === 'deep-seek') return 'deepseek'
+  if (key === 'opencode_go' || key === 'opencode-go-sub' || key === 'go') return 'opencode-go'
+  if (key === 'ollama-cloud' || key === 'ollama_cloud') return 'ollama'
+  if (key === 'minimax-cn' || key === 'minimax_cn' || key === 'minimax-token-plan') return 'minimax'
+  if (key === 'novita-ai' || key === 'novitaai') return 'novita'
+  if (key === 'deep-infra') return 'deepinfra'
+  if (key === 'ai-gateway' || key === 'vercel' || key === 'vercel-ai-gateway') return 'ai-gateway'
+  return key
+}
+
+function isHttpUrl(url) {
+  return /^https?:\/\//i.test(String(url || '').trim())
+}
+
+function newClockId() {
+  return `clock:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+}
+
+function errorMessage(error, fallback) {
+  if (typeof error === 'string' && error && error !== '[object Object]') return error
+  if (error && typeof error.message === 'string' && error.message && error.message !== '[object Object]') {
+    return error.message
+  }
+  return fallback
+}
+
+const PROVIDER_LABELS = {
+  anthropic: 'Claude',
+  'openai-codex': 'Codex',
+  openrouter: 'OpenRouter',
+  cursor: 'Cursor',
+  kimi: 'Kimi',
+  'kimi-coding': 'Kimi',
+  grok: 'Grok',
+  'xai-oauth': 'Grok',
+  xai: 'Grok',
+  glm: 'GLM',
+  zai: 'GLM',
+  zcode: 'GLM',
+  zhipu: 'GLM',
+  'zai-coding-plan': 'GLM',
+  deepseek: 'DeepSeek',
+  'deep-seek': 'DeepSeek',
+  'opencode-go': 'OpenCode Go',
+  opencode_go: 'OpenCode Go',
+  go: 'OpenCode Go',
+  ollama: 'Ollama Cloud',
+  'ollama-cloud': 'Ollama Cloud',
+  ollama_cloud: 'Ollama Cloud',
+  minimax: 'MiniMax',
+  'minimax-cn': 'MiniMax',
+  novita: 'Novita',
+  'novita-ai': 'Novita',
+  deepinfra: 'DeepInfra',
+  'deep-infra': 'DeepInfra',
+  'ai-gateway': 'AI Gateway',
+  vercel: 'AI Gateway',
+  'vercel-ai-gateway': 'AI Gateway',
+  commandcode: 'Command Code',
+  nous: 'Nous'
+}
+
+function nousPortalTitle(planName) {
+  const plan = String(planName || '').trim()
+  if (!plan || /^nous(\s+portal)?$/i.test(plan)) return 'Nous Portal'
+  return `Nous Portal (${plan})`
+}
+
+function providerTitle(provider, plan) {
+  const key = String(provider || '').trim().toLowerCase()
+  const base = PROVIDER_LABELS[key] || provider || 'Account'
+  return plan ? `${base} (${plan})` : base
+}
+
+function parseUsageOutput(text) {
+  const groups = []
+  let current = null
+  let inLimits = false
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.replace(/\*\*/g, '').replace(/^📈\s*/, '').trim()
+    if (!line) continue
+    if (/^(account limits|nous credits)$/i.test(line)) {
+      inLimits = true
+      current = null
+      continue
+    }
+    if (/^(session (token )?usage|session info|rate limits)\b/i.test(line)) {
+      inLimits = false
+      current = null
+      continue
+    }
+    if (!inLimits && !/^provider:/i.test(line)) continue
+    const provider = line.match(/^Provider:\s+(.+)$/i)
+    if (provider) {
+      inLimits = true
+      current = { provider: provider[1].trim(), windows: [], details: [] }
+      groups.push(current)
+      continue
+    }
+    const windowMatch = line.match(
+      /^(.+?):\s+(\d+)% remaining \((\d+)% used\)(?:\s+[•·-]\s+(.+))?$/i
+    )
+    if (windowMatch) {
+      if (!current) {
+        current = { provider: 'Account', windows: [], details: [] }
+        groups.push(current)
+      }
+      const suffix = (windowMatch[4] || '').trim()
+      const resetText = /^resets\s+/i.test(suffix) ? suffix.replace(/^resets\s+/i, '') : ''
+      const detail = resetText ? '' : suffix
+      current.windows.push({
+        label: windowMatch[1].trim(),
+        remaining: Number(windowMatch[2]),
+        used: Number(windowMatch[3]),
+        resetText,
+        detail
+      })
+      continue
+    }
+    if (/^unavailable:/i.test(line)) continue
+    if (current) current.details.push(line)
+  }
+  return groups
+}
+
+function remainingFromBar(bar) {
+  if (!bar) return { remaining: null, used: null }
+  const used = clampPercent(bar.pct_used)
+  if (used !== null) return { remaining: remainingFromUsed(used), used }
+  if (typeof bar.fill_fraction === 'number' && Number.isFinite(bar.fill_fraction)) {
+    // Hermes fill_fraction is remaining (remaining_usd / total_usd), not consumed.
+    const remaining = clampPercent(bar.fill_fraction * 100)
+    return { remaining, used: remainingFromUsed(remaining) }
+  }
+  return { remaining: null, used: null }
+}
+
+function cardsFromUsageBars(bars) {
+  if (!bars || bars.available === false) return []
+  const cards = []
+  const planName = nousPortalTitle(bars.plan_name)
+  const pushBar = (bar, label, { showPercent = true } = {}) => {
+    if (!bar) return
+    const { remaining, used } = remainingFromBar(bar)
+    cards.push({
+      id: `nous:${label}`,
+      source: 'live',
+      provider: planName,
+      label,
+      remaining: showPercent ? remaining : null,
+      used: showPercent ? used : null,
+      resetAt: bars.renews_at || null,
+      resetText: bars.renews_display || '',
+      detail:
+        bar.remaining_display && bar.total_display
+          ? `${bar.remaining_display} of ${bar.total_display} left`
+          : bars.subscription_remaining_display || ''
+    })
+  }
+  pushBar(bars.plan_bar, 'Subscription')
+  if (bars.has_topup) pushBar(bars.topup_bar, 'Top-up credits', { showPercent: false })
+  return cards
+}
+
+function cardsFromUsageGroups(groups, skipNous) {
+  const cards = []
+  for (const group of groups || []) {
+    if (skipNous && isNousProvider(group.provider)) continue
+    const extra = (group.details || []).filter(line => !/^\(or run \/topup\)$/i.test(line))
+    const windows = group.windows || []
+    windows.forEach((window, index) => {
+      cards.push({
+        id: `usage:${group.provider}:${index}:${window.label}`,
+        source: 'live',
+        provider: group.provider,
+        label: window.label,
+        remaining: clampPercent(window.remaining),
+        used: clampPercent(window.used),
+        resetAt: null,
+        resetText: window.resetText || '',
+        detail: [window.detail, index === windows.length - 1 ? extra.join(' · ') : ''].filter(Boolean).join(' · ')
+      })
+    })
+    if (!windows.length && extra.length) {
+      cards.push({
+        id: `usage:${group.provider}:note`,
+        source: 'live',
+        provider: group.provider,
+        label: group.provider,
+        remaining: null,
+        used: null,
+        resetAt: null,
+        resetText: '',
+        detail: extra.join(' · ')
+      })
+    }
+  }
+  return cards
+}
+
+function maskEmailLabel(label) {
+  const text = String(label || '').trim()
+  const at = text.indexOf('@')
+  if (at <= 0 || at === text.length - 1 || text.includes(' ')) return text
+  return `${text.slice(0, Math.min(2, at))}**${text.slice(at)}`
+}
+
+function familyTitle(provider) {
+  const key = providerKey(provider)
+  if (key === 'anthropic' || key === 'claude') return 'Claude'
+  if (key === 'openai-codex') return 'Codex'
+  return PROVIDER_LABELS[key] || String(provider || 'Account')
+}
+
+function snapshotAccountLabel(snap) {
+  return maskEmailLabel(String(snap && snap.account_label ? snap.account_label : '').trim())
+}
+
+function snapshotAccountKey(snap) {
+  const key = String(snap && snap.account_key ? snap.account_key : '').trim()
+  if (key) return accountIdTag(key)
+  return accountIdTag(snapshotAccountLabel(snap))
+}
+
+function accountIdTag(label) {
+  return String(label || '').trim().replace(/:/g, '-')
+}
+
+function accountCardProvider(id) {
+  const text = String(id || '')
+  if (!text.startsWith('account:')) return ''
+  const rest = text.slice('account:'.length)
+  const colon = rest.indexOf(':')
+  const provider = colon === -1 ? rest : rest.slice(0, colon)
+  return providerKey(provider)
+}
+
+function cardsFromAccountSnapshots(snapshots) {
+  const cards = []
+  for (const snap of snapshots || []) {
+    const accountLabel = snapshotAccountLabel(snap)
+    const provider = providerTitle(snap.provider, snap.plan)
+    const group = accountLabel ? familyTitle(snap.provider) : provider
+    const accountTag = snapshotAccountKey(snap) ? `:${snapshotAccountKey(snap)}` : ''
+    const extra = (snap.details || []).join(' · ')
+    const windows = snap.windows || []
+    const failed = Boolean(snap.error)
+    if (failed) {
+      // probe.py found a login but the fetch failed. Show why instead of
+      // silently dropping the vendor from the page.
+      cards.push({
+        id: `account:${snap.provider}${accountTag}:error`,
+        source: 'live',
+        provider,
+        group,
+        account: accountLabel,
+        label: accountLabel || provider,
+        remaining: null,
+        used: null,
+        resetAt: null,
+        resetText: '',
+        detail: extra || `Could not fetch usage: ${String(snap.error)}`,
+        error: true
+      })
+      continue
+    }
+    windows.forEach((window, index) => {
+      cards.push({
+        id: `account:${snap.provider}${accountTag}:${index}:${window.label}`,
+        source: 'live',
+        provider,
+        group,
+        account: index === 0 ? accountLabel : '',
+        label: window.label,
+        remaining: clampPercent(window.remaining_percent) ?? remainingFromUsed(window.used_percent),
+        used: clampPercent(window.used_percent),
+        resetAt: window.reset_at || null,
+        resetText: '',
+        detail: [window.detail, index === windows.length - 1 ? extra : ''].filter(Boolean).join(' · ')
+      })
+    })
+    if (!windows.length && extra) {
+      cards.push({
+        id: `account:${snap.provider}${accountTag}:note`,
+        source: 'live',
+        provider,
+        group,
+        account: accountLabel,
+        label: accountLabel || provider,
+        remaining: null,
+        used: null,
+        resetAt: null,
+        resetText: '',
+        detail: extra
+      })
+    }
+  }
+  return cards
+}
+
+function readSessionId() {
+  const focused = host.state.focusedSessionId
+  const active = host.state.activeSessionId
+  return (focused && focused.get && focused.get()) || (active && active.get && active.get()) || ''
+}
+
+function hermesHomeFromConfig(payload) {
+  const sections = (payload && payload.sections) || []
+  for (const section of sections) {
+    for (const row of section.rows || []) {
+      if (row && row[0] === 'Config File' && row[1]) {
+        return String(row[1]).replace(/[\\/]+config\.ya?ml$/i, '')
+      }
+    }
+  }
+  return ''
+}
+
+function hermesHomeCandidates(fromConfig) {
+  const out = []
+  const push = value => {
+    const text = String(value || '').trim()
+    if (text && !out.includes(text)) out.push(text)
+    // Profiles share the base home's plugin install and Python runtime.
+    const base = text.replace(/[\\/]profiles[\\/][^\\/]+[\\/]*$/i, '')
+    if (base && base !== text && !out.includes(base)) out.push(base)
+  }
+  push(fromConfig)
+  try {
+    const env = typeof process !== 'undefined' && process.env ? process.env : null
+    if (env) {
+      push(env.HERMES_HOME)
+      if (env.LOCALAPPDATA) push(`${env.LOCALAPPDATA}\\hermes`)
+      const home = env.HOME || env.USERPROFILE
+      if (home) push(`${home}/.hermes`)
+    }
+  } catch (_) {}
+  return out
+}
+
+function quoteShell(path) {
+  // shell.exec takes a single command string (no argv). Quote for spaces.
+  return `"${String(path).replace(/"/g, '\\"')}"`
+}
+
+function probePythonCandidates(home) {
+  const root = String(home || '').replace(/[\\/]+$/, '')
+  const posix = [`${root}/hermes-agent/.venv/bin/python`, `${root}/hermes-agent/venv/bin/python`]
+  const win = [
+    `${root}/hermes-agent/.venv/Scripts/python.exe`,
+    `${root}/hermes-agent/venv/Scripts/python.exe`
+  ]
+  const isWin = /^[A-Za-z]:[\\/]/.test(root) || root.includes('\\')
+  const venv = isWin ? [...win, ...posix] : [...posix, ...win]
+  // Hermes' own interpreter when the install says where it is. Nix and other
+  // packaged installs keep no venv under the Hermes home; Hermes exports
+  // HERMES_PYTHON instead. The literal form is expanded by sh on POSIX.
+  // cmd does not expand $VAR, so skip it on Windows.
+  const runtime = []
+  try {
+    const env = typeof process !== 'undefined' && process.env ? process.env : null
+    if (env && env.HERMES_PYTHON) runtime.push(String(env.HERMES_PYTHON))
+  } catch (_) {}
+  if (!isWin) runtime.push('$HERMES_PYTHON')
+  // Bare interpreters last. On Mac and Windows these are usually a system
+  // Python without httpx, which would "succeed" with an import error card.
+  const generic = ['python3', 'python']
+  const out = []
+  for (const item of [...runtime, ...venv, ...generic]) {
+    if (item && !out.includes(item)) out.push(item)
+  }
+  return out
+}
+
+// Python itself reports a missing script this way. Anything else that
+// looks like "not found" means the interpreter path is wrong.
+function probeFailureKind(result) {
+  const err = result && result.stderr ? String(result.stderr) : ''
+  if (/can't open file|No such file or directory: '.*probe\.py'/i.test(err)) return 'no-probe'
+  if (
+    result &&
+    (result.code === 126 ||
+      result.code === 127 ||
+      result.code === 9009 ||
+      /is not recognized|not found|No such file or directory|cannot find the path|Permission denied/i.test(err))
+  ) {
+    return 'no-python'
+  }
+  return 'failed'
+}
+
+// probe.py always exits 0 with a JSON list. When the interpreter lacks httpx
+// that list is one note card saying so. Treat it as "wrong Python" and keep
+// looking rather than accepting it as the result.
+function probeMissingDeps(parsed) {
+  if (!Array.isArray(parsed) || parsed.length !== 1) return ''
+  const snap = parsed[0]
+  if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') return ''
+  const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
+  return note ? String(note) : ''
+}
+
+function pickProbeFailure(failures) {
+  const list = (failures || []).filter(item => item && item.message)
+  if (!list.length) return ''
+  // A real probe error (traceback, bad JSON) beats path guessing noise.
+  const real = [...list].reverse().find(item => item.kind === 'failed')
+  if (real) return real.message
+  const kinds = new Set(list.map(item => item.kind))
+  if (kinds.has('no-deps')) {
+    return 'Found a Python but not the Hermes one (no httpx). Looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON.'
+  }
+  if (kinds.has('no-probe') && !kinds.has('no-python')) {
+    return 'probe.py not found under desktop-plugins/resetwatch (copy both plugin files)'
+  }
+  if (kinds.has('no-python') && !kinds.has('no-probe')) {
+    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON)'
+  }
+  return list[list.length - 1].message
+}
+
+async function profileRequester(connectionId, profile) {
+  if (connectionId === null) throw new Error('Could not find the owner of the focused session')
+  const active = String(profile || '').trim()
+  if (!active || !connectionId || typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+    return { request: (method, params = {}) => host.request(method, params), profile: active }
+  }
+  const routes = await host.profileRoutes()
+  const sourceRoutes = routes.filter(item => item && item.connectionId === connectionId)
+  const route = sourceRoutes.find(item => item.profile === active) || sourceRoutes.find(item => item.targetProfile === active)
+  if (!route) throw new Error(`No Desktop route for ${active}`)
+  return {
+    request: (method, params = {}) => host.requestProfile(route, method, params),
+    profile: route.targetProfile || route.profile
+  }
+}
+
+async function probeStockAccountUsage(request, opts) {
+  try {
+    const shown = await request('config.show', {})
+    const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
+    if (!homes.length) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
+    const profileArg = String((opts && opts.profile) || '').trim()
+    if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
+      return { snapshots: null, error: 'Invalid Hermes profile name' }
+    }
+    const flags = [
+      profileArg ? `--profile ${quoteShell(profileArg)}` : '',
+      opts && opts.cliOnly ? '--cli-only' : '',
+      opts && opts.fresh ? '--fresh' : ''
+    ]
+      .filter(Boolean)
+      .map(flag => ` ${flag}`)
+      .join('')
+    const failures = []
+    // The plugin folder is "resetwatch" when installed by hand, but a plain
+    // clone of the repo lands as "hermes-resetwatch". Accept both.
+    const folders = ['resetwatch', 'hermes-resetwatch']
+    // Each attempt spawns a process, so prune as we learn: an interpreter
+    // that does not exist is skipped for every folder, and a folder Python
+    // could not open is skipped for every interpreter.
+    const deadPythons = new Set()
+    const deadProbes = new Set()
+    const pythons = [...new Set(homes.flatMap(probePythonCandidates).filter(item => item !== 'python3' && item !== 'python')),
+      'python3', 'python']
+    for (const home of homes) {
+      for (const python of pythons) {
+        if (deadPythons.has(python)) continue
+        for (const folder of folders) {
+          const probe = `${home}/desktop-plugins/${folder}/probe.py`
+          if (deadProbes.has(probe)) continue
+          try {
+            const result = await request('shell.exec', {
+              command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
+            })
+            if (!result || result.code) {
+              const err = result && result.stderr ? String(result.stderr).trim() : ''
+              const kind = probeFailureKind(result)
+              failures.push({
+                kind,
+                message: err || (result ? `probe exit ${result.code}` : 'probe returned nothing')
+              })
+              if (kind === 'no-python') {
+                deadPythons.add(python)
+                break
+              }
+              if (kind === 'no-probe') deadProbes.add(probe)
+              continue
+            }
+            const text = String(result.stdout || '').trim()
+            if (!text.startsWith('[')) {
+              failures.push({ kind: 'failed', message: 'probe returned non-JSON' })
+              continue
+            }
+            const parsed = JSON.parse(text)
+            const missingDeps = probeMissingDeps(parsed)
+            if (missingDeps) {
+              // Wrong interpreter for every home, not just this one.
+              failures.push({ kind: 'no-deps', message: missingDeps })
+              deadPythons.add(python)
+              break
+            }
+            if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
+            failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
+          } catch (error) {
+            failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
+          }
+        }
+      }
+    }
+    return {
+      snapshots: null,
+      error: pickProbeFailure(failures) || 'Could not run probe.py (no working Hermes Python)'
+    }
+  } catch (error) {
+    return { snapshots: null, error: errorMessage(error, 'Could not run probe.py') }
+  }
+}
+
+function go(route) {
+  if (typeof host.navigate === 'function') host.navigate(route)
+}
+
+async function fetchLiveCards(sessionId, opts, connectionId, profile) {
+  const cards = []
+  const errors = []
+  const sid = sessionId || readSessionId()
+  const fresh = !!(opts && opts.fresh)
+  let haveAccountRpc = false
+  const target = await profileRequester(connectionId, profile)
+  const request = target.request
+
+  const [barsResult, accountResult] = await Promise.allSettled([
+    request('usage.bars', {}),
+    request('account.usage', {})
+  ])
+
+  let barsError = ''
+  if (barsResult.status === 'fulfilled') {
+    cards.push(...cardsFromUsageBars(barsResult.value))
+  } else {
+    const error = barsResult.reason
+    barsError = error && error.message ? error.message : 'Could not read Nous usage'
+  }
+
+  if (!cards.length) {
+    try {
+      const sub = await request('subscription.state', {})
+      if (sub && sub.usage) cards.push(...cardsFromUsageBars(sub.usage))
+    } catch (error) {
+      errors.push(error && error.message ? error.message : 'Could not read subscription state')
+    }
+  }
+  // Only report the usage.bars failure if the fallback did not fill the Nous cards.
+  if (barsError && !cards.some(card => String(card.id).startsWith('nous:'))) {
+    errors.push(barsError)
+  }
+
+  const accountProviders = new Set()
+  if (accountResult.status === 'fulfilled') {
+    haveAccountRpc = true
+    const account = accountResult.value
+    const snaps = (account && account.snapshots) || []
+    for (const snap of snaps) {
+      if (snap && snap.provider) accountProviders.add(providerKey(snap.provider))
+    }
+    cards.push(...cardsFromAccountSnapshots(snaps))
+  } else {
+    const error = accountResult.reason
+    const message = error && error.message ? error.message : ''
+    if (!/unknown method|not found|-32601/i.test(message)) {
+      errors.push(message || 'Could not read signed-in account limits')
+    }
+  }
+
+  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile })
+  const probed = probeResult && probeResult.snapshots
+  if (probeResult && probeResult.error && !(probed && probed.length)) {
+    errors.push(probeResult.error)
+  }
+  let haveClaudeProbe = false
+  if (probed && probed.length) {
+    const labelledKeys = new Set(
+      probed
+        .filter(snap => snap && snap.provider && snapshotAccountLabel(snap))
+        .map(snap => providerKey(snap.provider))
+    )
+    if (labelledKeys.size) {
+      for (let index = cards.length - 1; index >= 0; index -= 1) {
+        const key = accountCardProvider(cards[index] && cards[index].id)
+        if (key && labelledKeys.has(key)) cards.splice(index, 1)
+      }
+    }
+    const extra = haveAccountRpc
+      ? probed.filter(snap => {
+          if (!snap || !snap.provider) return false
+          if (snapshotAccountLabel(snap)) return true
+          return !accountProviders.has(providerKey(snap.provider))
+        })
+      : probed
+    for (const snap of extra) {
+      const key = providerKey(snap && snap.provider)
+      if (key === 'anthropic' || key === 'claude') haveClaudeProbe = true
+    }
+    if (extra.length) cards.push(...cardsFromAccountSnapshots(extra))
+  }
+
+  // Claude often comes from Hermes /usage when the probe has Codex/etc. but
+  // no Anthropic row. Only skip that fallback once Claude is already present.
+  // Never surface a stale focused-session "session not found".
+  if (!haveAccountRpc && sid && !haveClaudeProbe) {
+    try {
+      const result = await request('slash.exec', { command: 'usage', session_id: sid })
+      const output = result && typeof result.output === 'string' ? result.output : ''
+      const skipNous = cards.some(card => String(card.id).startsWith('nous:'))
+      cards.push(...cardsFromUsageGroups(parseUsageOutput(output), skipNous))
+    } catch (error) {
+      const message = error && error.message ? error.message : ''
+      if (!/session not found/i.test(message)) {
+        errors.push(message || 'Could not run /usage')
+      }
+    }
+  }
+
+  const seen = new Set()
+  const unique = []
+  for (const card of cards) {
+    if (seen.has(card.id)) continue
+    seen.add(card.id)
+    unique.push(card)
+  }
+  return { cards: unique, errors, hadSession: Boolean(sid), haveAccountRpc }
+}
+
+function SmallButton({ onClick, children, active, title, disabled }) {
+  return jsx('button', {
+    type: 'button',
+    title,
+    disabled: !!disabled,
+    onClick,
+    style: {
+      fontSize: '0.6875rem',
+      padding: '2px 8px',
+      border: `1px solid ${active ? 'var(--ui-accent)' : 'var(--ui-stroke-secondary)'}`,
+      borderRadius: 4,
+      color: active ? text.primary : text.secondary,
+      background: active ? 'var(--ui-control-active-background)' : 'transparent',
+      opacity: disabled ? 0.5 : 1,
+      cursor: disabled ? 'default' : 'pointer'
+    },
+    children
+  })
+}
+
+function Field({ label, children }) {
+  return jsxs('label', {
+    style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, flex: 1 },
+    children: [
+      jsx('span', { style: { fontSize: '0.6875rem', color: text.tertiary }, children: label }),
+      children
+    ]
+  })
+}
+
+function NativeInput({ value, onChange, type, placeholder, style }) {
+  return jsx('input', {
+    type: type || 'text',
+    value: value || '',
+    placeholder,
+    onChange: event => onChange(event.target.value),
+    style: {
+      height: 28,
+      padding: '0 8px',
+      borderRadius: 6,
+      border: '1px solid var(--ui-stroke-secondary)',
+      background: 'transparent',
+      color: text.primary,
+      fontSize: '0.8125rem',
+      outline: 'none',
+      ...style
+    }
+  })
+}
+
+function UsageBar({ remaining }) {
+  const used = remaining === null || remaining === undefined ? 0 : Math.max(0, 100 - remaining)
+  const tone = toneForRemaining(remaining)
+  const fill = tone === 'bad' ? text.red : tone === 'warn' ? text.yellow : 'var(--ui-text-primary)'
+  return jsx('div', {
+    style: {
+      width: 92,
+      height: 6,
+      borderRadius: 99,
+      background: 'var(--ui-stroke-secondary)',
+      overflow: 'hidden',
+      flexShrink: 0
+    },
+    children: jsx('div', {
+      style: {
+        width: `${used}%`,
+        height: '100%',
+        borderRadius: 99,
+        background: fill
+      }
+    })
+  })
+}
+
+function displayDetail(card) {
+  const detail = String((card && card.detail) || '').trim()
+  if (!detail) return ''
+  // Bar + "% left" already show the same unitless fraction.
+  if (card.remaining !== null && card.remaining !== undefined) {
+    if (/^[\d,]+\s+of\s+[\d,]+\s+left$/i.test(detail)) return ''
+  }
+  return detail
+}
+
+function renderDetailText(detail) {
+  const value = String(detail || '')
+  const marker = 'Peak pricing now'
+  const index = value.indexOf(marker)
+  if (index < 0) return value
+  return jsxs(Fragment, {
+    children: [
+      value.slice(0, index),
+      jsx('span', { style: { fontWeight: 700 }, children: marker }),
+      value.slice(index + marker.length)
+    ]
+  })
+}
+
+function LimitCard({ card, nowMs, actions }) {
+  const remaining = card.remaining
+  const tone = toneForRemaining(remaining)
+  const reset = formatReset(card.resetAt, card.resetText, nowMs)
+  const leftLabel = remaining === null || remaining === undefined ? '—' : `${remaining}% left`
+  const detail = displayDetail(card)
+  return jsxs('div', {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 16,
+      padding: '12px 14px',
+      borderRadius: 10,
+      border: '1px solid var(--ui-stroke-secondary)',
+      background: 'var(--ui-bg-secondary, transparent)'
+    },
+    children: [
+      jsxs('div', {
+        style: { flex: 1, minWidth: 0 },
+        children: [
+          jsx('div', {
+            style: { fontSize: '0.875rem', fontWeight: 600, color: text.primary },
+            children: card.label
+          }),
+          card.account
+            ? jsx('div', {
+                style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
+                children: card.account
+              })
+            : null,
+          reset
+            ? jsx('div', {
+                style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
+                children: reset.startsWith('Resets') || reset.startsWith('Reset') ? reset : `Resets ${reset}`
+              })
+            : null,
+          detail
+            ? jsx('div', {
+                style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
+                children: renderDetailText(detail)
+              })
+            : null
+        ]
+      }),
+      card.error
+        ? jsx('div', {
+            title: detail,
+            style: { fontSize: '0.75rem', color: text.quaternary, flexShrink: 0 },
+            children: 'unavailable'
+          })
+        : remaining === null || remaining === undefined
+          ? null
+          : jsxs('div', {
+              style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 },
+              children: [
+                jsx(UsageBar, { remaining }),
+                jsx('div', {
+                  style: { fontSize: '0.8125rem', color: toneColor(tone), minWidth: 64, textAlign: 'right' },
+                  children: leftLabel
+                })
+              ]
+            }),
+      actions || null
+    ]
+  })
+}
+
+function useSectionOpen(key) {
+  const [open, setOpen] = useState(() => {
+    const saved = stored(`sectionOpen:${key}`, null)
+    return saved === null || saved === undefined ? true : !!saved
+  })
+  return [
+    open,
+    () => {
+      const next = !open
+      setOpen(next)
+      remember(`sectionOpen:${key}`, next)
+    }
+  ]
+}
+
+function SectionHeader({ title, open, onToggle, extra }) {
+  return jsxs('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 8 },
+    children: [
+      jsxs('button', {
+        type: 'button',
+        onClick: () => {
+          tap()
+          onToggle()
+        },
+        'aria-expanded': open,
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          flex: 1,
+          minWidth: 0,
+          padding: 0,
+          border: 'none',
+          background: 'transparent',
+          color: text.primary,
+          cursor: 'pointer',
+          textAlign: 'left'
+        },
+        children: [
+          jsx('span', {
+            style: { fontSize: '0.7rem', color: text.tertiary, width: 10 },
+            children: open ? '▾' : '▸'
+          }),
+          jsx('h2', {
+            style: { fontSize: '0.75rem', fontWeight: 600, color: text.primary, margin: 0 },
+            children: title
+          })
+        ]
+      }),
+      extra || null
+    ]
+  })
+}
+
+function ProviderBlock({ title, cards, nowMs, empty, actionsFor }) {
+  const [open, toggle] = useSectionOpen(`provider:${title}`)
+  return jsxs('section', {
+    style: { display: 'flex', flexDirection: 'column', gap: 8 },
+    children: [
+      jsx(SectionHeader, { title, open, onToggle: toggle }),
+      !open
+        ? null
+        : !cards.length
+          ? jsx('div', { style: { fontSize: '0.8125rem', color: text.tertiary }, children: empty })
+          : cards.map(card =>
+              jsx(
+                LimitCard,
+                { card, nowMs, actions: actionsFor ? actionsFor(card) : null },
+                card.id
+              )
+            )
+    ]
+  })
+}
+
+function ClockForm({ onSave, onCancel }) {
+  const [presetId, setPresetId] = useState('gemini')
+  const preset = PRESETS.find(item => item.id === presetId) || PRESETS[0]
+  const [name, setName] = useState(preset.name)
+  const [left, setLeft] = useState('70')
+  const [resetLocal, setResetLocal] = useState('')
+  const [url, setUrl] = useState(preset.url)
+
+  useEffect(() => {
+    const next = PRESETS.find(item => item.id === presetId) || PRESETS[0]
+    if (presetId !== 'custom') {
+      setName(next.name)
+      setUrl(next.url)
+    }
+  }, [presetId])
+
+  const remaining = clampPercent(left)
+  const canSave = Boolean(name.trim()) && remaining !== null
+
+  return jsxs('div', {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 10,
+      padding: 12,
+      borderRadius: 10,
+      border: '1px solid var(--ui-stroke-secondary)'
+    },
+    children: [
+      jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 }, children: [
+        PRESETS.map(item =>
+          jsx(
+            SmallButton,
+            {
+              active: presetId === item.id,
+              onClick: () => {
+                tap()
+                setPresetId(item.id)
+              },
+              children: item.name
+            },
+            item.id
+          )
+        )
+      ] }),
+      jsxs('div', { style: { display: 'grid', gridTemplateColumns: '1fr 90px 1fr', gap: 8 }, children: [
+        jsx(Field, { label: 'Name', children: jsx(NativeInput, { value: name, onChange: setName, placeholder: 'Plan name' }) }),
+        jsx(Field, {
+          label: '% left',
+          children: jsx(NativeInput, { value: left, onChange: setLeft, type: 'number', placeholder: '70' })
+        }),
+        jsx(Field, {
+          label: 'Resets',
+          children: jsx(NativeInput, { value: resetLocal, onChange: setResetLocal, type: 'datetime-local' })
+        })
+      ] }),
+      jsx(Field, {
+        label: 'Dashboard URL (optional)',
+        children: jsx(NativeInput, { value: url, onChange: setUrl, placeholder: 'https://' })
+      }),
+      jsxs('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' }, children: [
+        jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
+        jsx(SmallButton, {
+          active: true,
+          disabled: !canSave,
+          onClick: () => {
+            if (!canSave) return
+            tap()
+            onSave({
+              id: newClockId(),
+              name: name.trim(),
+              remaining,
+              resetAt: fromDatetimeLocal(resetLocal),
+              url: url.trim()
+            })
+          },
+          children: 'Add clock'
+        })
+      ] })
+    ]
+  })
+}
+
+function EditClock({ clock, onSave, onCancel }) {
+  const [name, setName] = useState(clock.name)
+  const [left, setLeft] = useState(String(clock.remaining))
+  const [resetLocal, setResetLocal] = useState(toDatetimeLocal(clock.resetAt))
+  const [url, setUrl] = useState(clock.url || '')
+  const remaining = clampPercent(left)
+  const canSave = Boolean(name.trim()) && remaining !== null
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 220 },
+    children: [
+      jsx(NativeInput, { value: name, onChange: setName }),
+      jsxs('div', { style: { display: 'flex', gap: 8 }, children: [
+        jsx(NativeInput, { value: left, onChange: setLeft, type: 'number', style: { width: 72 } }),
+        jsx(NativeInput, { value: resetLocal, onChange: setResetLocal, type: 'datetime-local' })
+      ] }),
+      jsx(NativeInput, { value: url, onChange: setUrl, placeholder: 'https://' }),
+      jsxs('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' }, children: [
+        jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
+        jsx(SmallButton, {
+          active: true,
+          disabled: !canSave,
+          onClick: () => {
+            if (!canSave) return
+            onSave({ ...clock, name: name.trim(), remaining, resetAt: fromDatetimeLocal(resetLocal), url: url.trim() })
+          },
+          children: 'Save'
+        })
+      ] })
+    ]
+  })
+}
+
+function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
+  const sid = sessionId || ''
+  const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
+  const [isFetching, setFetching] = useState(false)
+  const genRef = useRef(0)
+  const inFlight = useRef(false)
+
+  const load = (opts) => {
+    if (gateway !== 'open' || inFlight.current) return
+    inFlight.current = true
+    const gen = ++genRef.current
+    setFetching(true)
+    fetchLiveCards(sid, opts, connectionId, profile)
+      .then(next => {
+        if (gen !== genRef.current) return
+        setData(next)
+      })
+      .catch(error => {
+        if (gen !== genRef.current) return
+        setData({
+          cards: [],
+          errors: [errorMessage(error, 'Could not read live usage')],
+          hadSession: Boolean(sid),
+          haveAccountRpc: false
+        })
+      })
+      .finally(() => {
+        if (gen !== genRef.current) return
+        inFlight.current = false
+        setFetching(false)
+      })
+  }
+
+  useEffect(() => {
+    setData({ cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false })
+    load()
+    const id = setInterval(() => load(), POLL_MS)
+    return () => {
+      genRef.current += 1
+      // A fetch from the old session may still be running. Its result is
+      // discarded above, so it must not block the first load of the new one.
+      inFlight.current = false
+      clearInterval(id)
+    }
+  }, [gateway, sid, connectionId, profile])
+
+  return { data, isFetching, refetch: () => load({ fresh: true }) }
+}
+
+function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
+  const sid = sessionId || ''
+  const key = [PLUGIN_ID, 'live', connectionId, profile || '', sid]
+  const contextKey = JSON.stringify(key)
+  const [manual, setManual] = useState({ key: '', fetching: false, error: '' })
+  const manualFetching = manual.key === contextKey && manual.fetching
+  const manualError = manual.key === contextKey ? manual.error : ''
+  const query = useQuery({
+    queryKey: key,
+    queryFn: () => fetchLiveCards(sid, {}, connectionId, profile),
+    enabled: gateway === 'open',
+    refetchInterval: POLL_MS,
+    retry: false
+  })
+  const refetch = () => {
+    if (!queryClient || typeof queryClient.fetchQuery !== 'function') {
+      return query.refetch && query.refetch()
+    }
+    setManual({ key: contextKey, fetching: true, error: '' })
+    return queryClient
+      .fetchQuery({
+        queryKey: [...key, 'fresh'],
+        queryFn: () => fetchLiveCards(sid, { fresh: true }, connectionId, profile),
+        staleTime: 0,
+        retry: false
+      })
+      .then(data => {
+        queryClient.setQueryData(key, data)
+        setManual(previous => previous.key === contextKey ? { key: contextKey, fetching: false, error: '' } : previous)
+        return data
+      })
+      .catch(error => {
+        // Keep the last good cards, but say the refresh did not land.
+        setManual(previous => previous.key === contextKey
+          ? { key: contextKey, fetching: false, error: errorMessage(error, 'Refresh failed') }
+          : previous)
+        return null
+      })
+  }
+  let data = query.data
+  if (query.error) {
+    const base = data || { cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false }
+    data = { ...base, errors: [...(base.errors || []), errorMessage(query.error, 'Could not read live usage')] }
+  }
+  if (manualError) {
+    const base = data || { cards: [], errors: [], hadSession: false, haveAccountRpc: false }
+    data = { ...base, errors: [...(base.errors || []), `Refresh failed: ${manualError}`] }
+  }
+  return { data, isFetching: !!(query.isFetching || manualFetching), refetch }
+}
+
+const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled
+
+function groupLiveCards(cards) {
+  const groups = []
+  const index = new Map()
+  for (const card of cards || []) {
+    const key = card.group || card.provider || 'Account'
+    if (!index.has(key)) {
+      const group = { title: key, cards: [] }
+      index.set(key, group)
+      groups.push(group)
+    }
+    index.get(key).cards.push(card)
+  }
+  return groups
+}
+
+function PluginPageContent() {
+  const gateway = useValue(host.state.gateway)
+  const nowMs = useValue($now)
+  const clocks = useValue($clocks)
+  const sessionId = useValue(host.state.focusedSessionId)
+  const owner = useValue(host.state.focusedSessionOwner || $missingState)
+  const focusedProfile = useValue(host.state.focusedSessionProfile || $missingState)
+  const activeConnectionId = useValue(host.state.connectionId || $missingState)
+  const activeProfile = useValue(host.state.profile || $missingState)
+  const hasOwnerState = !!host.state.focusedSessionOwner
+  // A null owner means Desktop could not place the focused session. Do not
+  // combine its profile with another connection's account.
+  const unresolved = hasOwnerState
+    ? !owner || !owner.connectionId || !owner.profile
+    : focusedProfile && focusedProfile !== activeProfile
+  const connectionId = unresolved ? null : hasOwnerState ? owner.connectionId : activeConnectionId || ''
+  const profile = hasOwnerState ? owner && owner.profile : focusedProfile || activeProfile
+  const live = useLiveCards(gateway, sessionId, connectionId, profile)
+  const [adding, setAdding] = useState(false)
+  const [editingId, setEditingId] = useState(null)
+  const [liveOpen, toggleLive] = useSectionOpen('live')
+  const [manualOpen, toggleManual] = useSectionOpen('manual')
+  const [cooldownUntil, setCooldownUntil] = useState(0)
+  const [cooldownTick, setCooldownTick] = useState(0)
+  const coolingDown = cooldownUntil > Date.now()
+  const payload = live.data || { cards: [], errors: [], hadSession: false }
+  const groups = useMemo(
+    () => groupLiveCards(payload.cards).filter(group => group.cards.length),
+    [payload.cards]
+  )
+
+  useEffect(() => {
+    $now.set(Date.now())
+    const id = setInterval(() => $now.set(Date.now()), 30000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Re-enable the Refresh button exactly when the cooldown ends.
+  useEffect(() => {
+    const wait = cooldownUntil - Date.now()
+    if (wait <= 0) return undefined
+    const id = setTimeout(() => setCooldownTick(tick => tick + 1), wait + 50)
+    return () => clearTimeout(id)
+  }, [cooldownUntil, cooldownTick])
+
+  const openExternal = url => {
+    if (!isHttpUrl(url)) return
+    tap()
+    if (os && typeof os.openExternal === 'function') os.openExternal(url)
+  }
+
+  const clockCards = clocks.map(clock => ({
+    id: clock.id,
+    source: 'manual',
+    provider: clock.name,
+    label: clock.name,
+    remaining: clock.remaining,
+    used: remainingFromUsed(clock.remaining),
+    resetAt: clock.resetAt,
+    resetText: '',
+    detail: clock.url ? clock.url.replace(/^https?:\/\//, '') : 'Typed by you. Update when the vendor page changes.',
+    url: clock.url
+  }))
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 10,
+          padding: '10px 16px 6px',
+          borderBottom: '1px solid var(--ui-stroke-secondary)'
+        },
+        children: [
+          jsx('h1', { style: { fontSize: '1rem', fontWeight: 600, color: text.primary, margin: 0 }, children: PLUGIN_NAME }),
+          jsx('span', {
+            style: { color: text.tertiary, fontSize: '0.75rem' },
+            children: 'How much is left, and when it comes back'
+          }),
+          Badge ? jsx(Badge, { variant: 'muted', children: VERSION }) : null,
+          jsxs('div', {
+            style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' },
+            children: [
+              jsx('span', {
+                style: { fontSize: '0.6875rem', color: text.tertiary },
+                children: `gateway ${gateway || 'idle'}`
+              }),
+              jsx(SmallButton, {
+                disabled: !!live.isFetching || coolingDown,
+                title: coolingDown ? 'Wait a minute between refreshes' : 'Skip the cache and ask every vendor again',
+                onClick: () => {
+                  if (live.isFetching || coolingDown) return
+                  tap()
+                  setCooldownUntil(Date.now() + REFRESH_COOLDOWN_MS)
+                  if (live.refetch) live.refetch()
+                  else if (queryClient) queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'live'] })
+                },
+                children: live.isFetching ? 'Refreshing…' : 'Refresh'
+              })
+            ]
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: {
+          flex: 1,
+          minHeight: 0,
+          overflowY: 'auto',
+          padding: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 22
+        },
+        children: [
+          jsx('p', {
+            style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
+            children:
+              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. Click a section name to fold it up.'
+          }),
+          jsxs('section', {
+            style: { display: 'flex', flexDirection: 'column', gap: 12 },
+            children: [
+              jsx(SectionHeader, {
+                title: 'Automatic',
+                open: liveOpen,
+                onToggle: toggleLive
+              }),
+              !liveOpen
+                ? null
+                : jsxs('div', {
+                    style: { display: 'flex', flexDirection: 'column', gap: 16, paddingLeft: 16 },
+                    children: [
+                      groups.length
+                        ? jsx('div', {
+                            style: {
+                              display: 'grid',
+                              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
+                              gap: 22,
+                              alignItems: 'start'
+                            },
+                            children: groups.map(group =>
+                              jsx(ProviderBlock, { title: group.title, cards: group.cards, nowMs }, group.title)
+                            )
+                          })
+                        : jsx('div', {
+                            style: { fontSize: '0.8125rem', color: text.tertiary },
+                            children:
+                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, Command Code, OpenRouter, or Nous, then refresh.'
+                          }),
+                      payload.errors && payload.errors.length
+                        ? jsx('div', {
+                            style: { fontSize: '0.75rem', color: text.tertiary },
+                            children: payload.errors.join(' · ')
+                          })
+                        : null
+                    ]
+                  })
+            ]
+          }),
+          jsxs('section', {
+            style: { display: 'flex', flexDirection: 'column', gap: 8 },
+            children: [
+              jsx(SectionHeader, {
+                title: 'Manual clocks',
+                open: manualOpen,
+                onToggle: toggleManual,
+                extra: jsx(SmallButton, {
+                  active: adding,
+                  onClick: () => {
+                    tap()
+                    if (!manualOpen) toggleManual()
+                    setAdding(open => !open)
+                  },
+                  children: adding ? 'Close' : 'Add clock'
+                })
+              }),
+              !manualOpen || !adding
+                ? null
+                : jsx(ClockForm, {
+                    onSave: clock => {
+                      saveClocks([...clocks, clock])
+                      setAdding(false)
+                    },
+                    onCancel: () => setAdding(false)
+                  }),
+              !manualOpen
+                ? null
+                : clockCards.map(card => {
+                    const clock = clocks.find(item => item.id === card.id)
+                    return editingId === card.id && clock
+                      ? jsx(
+                          EditClock,
+                          {
+                            clock,
+                            onSave: next => {
+                              saveClocks(clocks.map(item => (item.id === next.id ? next : item)))
+                              setEditingId(null)
+                            },
+                            onCancel: () => setEditingId(null)
+                          },
+                          card.id
+                        )
+                      : jsx(
+                          LimitCard,
+                          {
+                            card,
+                            nowMs,
+                            actions: jsxs('div', {
+                              style: { display: 'flex', gap: 6 },
+                              children: [
+                                isHttpUrl(card.url)
+                                  ? jsx(SmallButton, {
+                                      onClick: () => openExternal(card.url),
+                                      children: 'Open'
+                                    })
+                                  : null,
+                                jsx(SmallButton, {
+                                  onClick: () => {
+                                    tap()
+                                    setEditingId(card.id)
+                                  },
+                                  children: 'Edit'
+                                }),
+                                jsx(SmallButton, {
+                                  onClick: () => {
+                                    tap()
+                                    saveClocks(clocks.filter(item => item.id !== card.id))
+                                  },
+                                  children: 'Remove'
+                                })
+                              ]
+                            })
+                          },
+                          card.id
+                        )
+                  })
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
+
+
+// BEGIN SIGNED DESKTOP UPDATER
+// Kept inline: Desktop loads this file directly, without sibling module imports.
+function createDesktopUpdater(config) {
+  const model = sdk.atom({ busy: false, open: false, message: '', error: '', offer: null, backup: null });
+  const lock = Symbol.for(config.repo + '.desktop-update');
+  const limit = 500000;
+  let storage = null, alive = false;
+  const patch = value => { if (alive) model.set({ ...model.get(), ...value }); };
+  const keyFor = dir => 'signed-updater:backup:' + dir;
+  const bytes = text => new TextEncoder().encode(text);
+  const decode = value => {
+    if (typeof value !== 'string' || value.length > 16000) throw Error('Invalid signed release.');
+    return Uint8Array.from(atob(value), c => c.charCodeAt(0));
+  };
+  async function hash(text) {
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes(text))), b => b.toString(16).padStart(2, '0')).join('');
+  }
+  function parts(version) {
+    if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) throw Error('Invalid release version.');
+    const result = version.split('.').map(Number);
+    if (!result.every(Number.isSafeInteger)) throw Error('Invalid release version.');
+    return result;
+  }
+  function newer(a, b) {
+    const x = parts(a), y = parts(b);
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+    return false;
+  }
+  const declaredVersion = text => text.match(/const VERSION\s*=\s*["']([0-9]+\.[0-9]+\.[0-9]+)["']/)?.[1];
+  const declaredId = text => text.match(/const PLUGIN_ID\s*=\s*["']([^"']+)["']/)?.[1];
+  async function verify(release) {
+    if (release.draft || release.prerelease) throw Error('Only stable releases can be installed.');
+    const block = String(release.body || '').match(/```hermes-desktop-update\s*\n([\s\S]*?)\n```/);
+    if (!block) throw Error('This release has no signed update. Nothing was installed.');
+    const envelope = JSON.parse(block[1]), payload = decode(envelope.payload);
+    const key = await crypto.subtle.importKey('spki', decode(config.key), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    if (!await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, decode(envelope.signature), payload)) throw Error('The release signature is invalid. Nothing was installed.');
+    const info = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(payload));
+    parts(info.version);
+    if (info.schema !== 2 || info.plugin !== config.id || info.repo !== config.repo || release.tag_name !== 'v' + info.version ||
+        !/^[a-f0-9]{40}$/.test(info.commit) || !Array.isArray(info.files) || info.files.length !== config.files.length)
+      throw Error('The signed release does not match this plugin.');
+    for (const name of config.files) {
+      const rows = info.files.filter(file => file.name === name);
+      if (rows.length !== 1 || !/^[a-f0-9]{64}$/.test(rows[0].sha256) || !Number.isInteger(rows[0].bytes) || rows[0].bytes < 1 || rows[0].bytes > limit)
+        throw Error('The signed release file list is invalid.');
+    }
+    return info;
+  }
+  async function download(url, max = limit) {
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(url, { signal: controller.signal, credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store', redirect: 'error' });
+      if (!response.ok) {
+        const error = Error(response.status === 403 || response.status === 429 ? 'GitHub is limiting update checks. Try again later.' : `GitHub download failed (${response.status}). Try again later.`);
+        error.status = response.status; throw error;
+      }
+      if (!response.body || Number(response.headers.get('content-length')) > max) throw Error('The download is empty or too large.');
+      const reader = response.body.getReader(), chunks = [];
+      let size = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > max) { await reader.cancel(); throw Error('The download is too large.'); }
+        chunks.push(value);
+      }
+      const data = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
+    } catch (error) {
+      if (error.name === 'AbortError') throw Error('The update check timed out. Try again.');
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
+  function desktop() {
+    const bridge = globalThis.window?.hermesDesktop;
+    if (!bridge?.desktopPluginsRoot || !bridge?.readFileText || !bridge?.writeTextFile || !bridge?.renamePath)
+      throw Error('Updating requires Hermes Desktop with local plugin file support.');
+    return bridge;
+  }
+  async function read(bridge, file) {
+    const result = await bridge.readFileText(file);
+    if (result.truncated || typeof result.text !== 'string' || bytes(result.text).length > limit) throw Error('Could not read the complete file: ' + file);
+    return result.text;
+  }
+  async function location(bridge) {
+    const root = await bridge.desktopPluginsRoot();
+    if (typeof root !== 'string' || !root.trim()) throw Error('The local Desktop plugin folder is unavailable.');
+    const matches = [];
+    for (const folder of config.folders) {
+      const dir = root.replace(/[\\/]+$/, '') + '/' + folder;
+      let source;
+      try { source = await read(bridge, dir + '/plugin.js'); } catch { continue; }
+      if (declaredId(source) === config.id) matches.push(dir);
+    }
+    if (matches.length !== 1) throw Error(matches.length ? 'Multiple copies of this plugin are installed. Keep one copy and reload Desktop.' : 'Could not locate this plugin. Install it in desktop-plugins/' + config.folders[0] + ' and reload Desktop.');
+    return matches[0];
+  }
+  async function snapshot(bridge, dir) {
+    const texts = {}, hashes = {};
+    for (const name of config.files) { texts[name] = await read(bridge, dir + '/' + name); hashes[name] = await hash(texts[name]); }
+    return { texts, hashes };
+  }
+  const sameHashes = (a, b) => config.files.every(name => a[name] === b[name]);
+  function validBackup(record) {
+    return record?.plugin === config.id && Array.isArray(record.files) && record.files.length === config.files.length && config.files.every(name => {
+      const rows = record.files.filter(file => file.name === name);
+      return rows.length === 1 && /^update-[a-f0-9-]{36}-backup-[a-z.]+$/.test(rows[0].backup) && rows[0].backup.endsWith('-backup-' + name) && /^[a-f0-9]{64}$/.test(rows[0].sha256);
+    });
+  }
+  // Electron-local only. Stage every file; replace plugin.js last so helpers are ready at reload.
+  async function replace(bridge, dir, before, next, store) {
+    const token = crypto.randomUUID(), staged = {}, moved = [];
+    const order = [...config.files.filter(name => name !== 'plugin.js'), 'plugin.js'];
+    const backup = { plugin: config.id, version: declaredVersion(before.texts['plugin.js']) || null,
+      files: order.map(name => ({ name, backup: 'update-' + token + '-backup-' + name, sha256: before.hashes[name] })) };
+    for (const name of order) {
+      staged[name] = 'update-' + token + '-staged-' + name;
+      await bridge.writeTextFile(dir + '/' + staged[name], next[name]);
+      if (await read(bridge, dir + '/' + staged[name]) !== next[name]) throw Error('The staged files did not verify. Nothing was replaced.');
+    }
+    if (!alive || await location(bridge) !== dir || !sameHashes((await snapshot(bridge, dir)).hashes, before.hashes))
+      throw Error('The Desktop profile or plugin files changed. Check again before installing.');
+    const previous = await store.get(keyFor(dir), null);
+    try {
+      await store.set(keyFor(dir), backup);
+      for (const file of backup.files) {
+        await bridge.renamePath(dir + '/' + file.name, file.backup);
+        const step = { ...file, installed: false }; moved.push(step);
+        await bridge.renamePath(dir + '/' + staged[file.name], file.name);
+        step.installed = true;
+      }
+    } catch (error) {
+      let failed = false;
+      for (const file of moved.reverse()) {
+        try {
+          if (file.installed) await bridge.renamePath(dir + '/' + file.name, staged[file.name]);
+          await bridge.renamePath(dir + '/' + file.backup, file.name);
+        } catch { failed = true; }
+      }
+      if (failed) throw Error(`Replacement failed. Close Desktop and restore the update-${token}-backup-* files in ${dir} to their original names.`);
+      await store.set(keyFor(dir), previous);
+      throw Error('Replacement failed. The original files were restored. ' + error.message);
+    }
+    return backup;
+  }
+  function cancel() { if (!model.get().busy) patch({ offer: null, error: '', message: '' }); }
+  async function run() {
+    patch({ open: true, busy: false, offer: null, error: '', message: "This package uses Hermes updates. Run hermes plugins update hermes-resetwatch, then rescan Desktop plugins." });
+  }
+  function register(ctx) {
+    storage = ctx.storage; alive = true;
+    ctx.onDispose?.(() => { alive = false; storage = null; });
+    (async () => {
+      try { const dir = await location(desktop()); const backup = await storage?.get(keyFor(dir), null); patch({ backup: validBackup(backup) ? backup : null }); }
+      catch { /* Other plugin features remain available on older Desktop versions. */ }
+    })();
+  }
+  function Panel() {
+    const s = sdk.useValue(model);
+    const button = (label, onClick, primary = false) => jsx('button', {
+      type: 'button', disabled: s.busy, onClick,
+      style: { padding: '6px 10px', minHeight: 32, borderRadius: 6, border: '1px solid var(--ui-stroke-secondary)',
+        background: primary ? 'var(--ui-bg-secondary)' : 'transparent', color: 'var(--ui-text-primary)', cursor: s.busy ? 'wait' : 'pointer', font: 'inherit', opacity: s.busy ? 0.6 : 1 }, children: label
+    });
+    return jsxs('section', {
+      'aria-label': config.name + ' updates',
+      style: { flexShrink: 0, padding: '8px 16px', borderTop: '1px solid var(--ui-stroke-secondary)', color: 'var(--ui-text-secondary)', fontSize: 12 },
+      children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }, children: [
+          jsx('span', { style: { marginRight: 'auto' }, children: `${config.name} v${config.version}` }),
+          button(s.busy ? 'Please wait…' : 'Check for updates', () => run()),
+          s.backup && !s.offer && button('Restore previous version', () => run('restore'))
+        ] }),
+        (s.message || s.error) && jsx('p', { role: s.error ? 'alert' : 'status',
+          style: { margin: '8px 0', overflowWrap: 'anywhere', color: s.error ? 'var(--ui-red)' : 'inherit' }, children: s.error || s.message }),
+        s.offer && jsxs('div', { role: 'group', 'aria-label': s.offer.kind === 'restore' ? 'Confirm restore' : 'Confirm update',
+          style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }, children: [
+            button(s.offer.kind === 'restore' ? 'Restore now' : 'Update now', () => run(s.offer.kind === 'restore' ? 'restore-confirm' : 'install'), true),
+            button(s.offer.kind === 'restore' ? 'Cancel' : 'Later', cancel)
+          ] })
+      ]
+    });
+  }
+  return { register, Panel, run, cancel, model, verify, newer, replace, snapshot, location, validBackup };
+}
+// END SIGNED DESKTOP UPDATER
+
+const UPDATE_KEY = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdDcg2pf4qQg4y89ZLfoIhfJqyKP+bJMA0Q0YVDK0VAbAgyVi5CaodDuUgibOqTx1zQg9xrXdzYbCvpgMjIFBCw==";
+const desktopUpdater = createDesktopUpdater({
+  id: PLUGIN_ID, name: "Resetwatch", version: VERSION, key: UPDATE_KEY,
+  repo: "Adolanium/hermes-resetwatch", folders: ["hermes-resetwatch","resetwatch"], files: ["plugin.js","probe.py"]
+});
+function Page() {
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsx('div', { style: { flex: 1, minHeight: 0, overflow: 'hidden' }, children: jsx(PluginPageContent, {}) }),
+      jsx(desktopUpdater.Panel, {})
+    ]
+  });
+}
+
+export default {
+  id: PLUGIN_ID,
+  name: PLUGIN_NAME,
+  description: 'Remaining quota and reset clocks for the plans you already pay for.',
+  defaultEnabled: true,
+  register(ctx) {
+    desktopUpdater.register(ctx);
+    const onDispose = typeof ctx.onDispose === 'function' ? fn => ctx.onDispose(fn) : () => {}
+    storage = ctx.storage || null
+    os = ctx.os || null
+    loadClocks()
+
+    const contributions = [
+      { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(Page, {}) },
+      {
+        id: 'nav',
+        area: SIDEBAR_NAV_AREA,
+        order: 62,
+        data: { path: ROUTE, label: PLUGIN_NAME, codicon: 'watch' }
+      },
+      {
+        id: 'open',
+        area: PALETTE_AREA,
+        data: {
+          id: 'resetwatch.open',
+          label: 'Resetwatch: Open',
+          keywords: ['usage', 'quota', 'reset', 'limits', 'subscription'],
+          run: () => go(ROUTE)
+        }
+      }
+    ]
+    if (KEYBINDS_AREA) {
+      contributions.push({
+        id: 'open-key',
+        area: KEYBINDS_AREA,
+        data: {
+          id: 'resetwatch.open',
+          label: 'Open Resetwatch',
+          category: PLUGIN_NAME,
+          defaults: ['mod+alt+r'],
+          run: () => go(ROUTE)
+        }
+      })
+    }
+    ctx.registerMany(contributions)
+    onDispose(() => {
+      storage = null
+      os = null
+    })
+  }
+}

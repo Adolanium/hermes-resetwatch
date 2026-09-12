@@ -1,0 +1,9 @@
+{
+  "name": "hermes-resetwatch",
+  "version": "0.2.16.post1",
+  "description": "Track subscription quotas and reset times in Hermes Desktop.",
+  "updater": "shared",
+  "companions": [
+    "probe.py"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "hermes-resetwatch",
+  "version": "0.2.16.post1",
+  "description": "Track subscription quotas and reset times in Hermes Desktop.",
+  "author": "Adolanium",
+  "manifest_version": 1,
+  "kind": "standalone",
+  "provides_tools": [],
+  "provides_hooks": [],
+  "provides_middleware": [],
+  "requires_env": []
+}
