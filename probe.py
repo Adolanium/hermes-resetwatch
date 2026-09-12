@@ -137,7 +137,8 @@ CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_TOKEN_SKEW_SECONDS = 120
 
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
-# Official DeepSeek peak windows (UTC). Off-peak is half price.
+# Official DeepSeek peak windows, Monday-Friday UTC. Off-peak is half price.
+# https://api-docs.deepseek.com/quick_start/pricing/
 DEEPSEEK_PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
 
 OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
@@ -2680,13 +2681,13 @@ def _deepseek_peak_status(now: Optional[datetime] = None) -> tuple[bool, str]:
     minute_of_day = stamp.hour * 60 + stamp.minute
     peak = False
     for start_hour, end_hour in DEEPSEEK_PEAK_WINDOWS_UTC:
-        if start_hour * 60 <= minute_of_day < end_hour * 60:
+        if stamp.weekday() < 5 and start_hour * 60 <= minute_of_day < end_hour * 60:
             peak = True
             break
     local = stamp.astimezone()
     local_clock = _clock_label(local)
     utc_clock = stamp.strftime("%H:%M")
-    windows = "01:00-04:00 and 06:00-10:00 UTC"
+    windows = "Mon-Fri 01:00-04:00 and 06:00-10:00 UTC"
     if peak:
         return True, f"Peak pricing now · {local_clock} local · {utc_clock} UTC · {windows}"
     return False, f"Off-peak now · {local_clock} local · {utc_clock} UTC · peak is {windows}"

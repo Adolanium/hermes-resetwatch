@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.16</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.17</sub>
 
   <br /><br />
 
@@ -61,7 +61,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Kimi:** Kimi Code CLI, or `KIMI_CODING_API_KEY` / `KIMI_API_KEY` in Hermes env (Coding Plan)
 - **Grok:** Grok CLI
 - **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
-- **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak)
+- **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
 - **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
 - **MiniMax:** `MINIMAX_API_KEY` (or `MINIMAX_CN_API_KEY`) in Hermes env (Token Plan 5h / weekly)
@@ -251,4 +251,4 @@ continue to use the existing root files.
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.16-1` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.17-1` and are not marked as the latest standalone release.

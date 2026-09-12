@@ -13,3 +13,5 @@ jobs:
       - run: python scripts/build_catalog.py --check
       - run: python -m py_compile catalog/__init__.py
       - run: node --check catalog/desktop/plugin.js
+      - run: python -m unittest test_deepseek_pricing.py test_profile_switch.py
+      - run: node --test test_profile_routing.cjs
