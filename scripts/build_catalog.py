@@ -6,6 +6,8 @@ Hermes updates so their Desktop copy cannot bypass a reviewed commit pin.
 import argparse
 import json
 from pathlib import Path
+from catalog_policy import strip_updater
+from catalog_probe import readonly_probe
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -13,26 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def build(check=False):
     config = json.loads((ROOT / "catalog-package.json").read_text())
     name = config["name"]
-    message = f"This package uses Hermes updates. Run hermes plugins update {name}, then rescan Desktop plugins."
-    source = (ROOT / "plugin.js").read_text(encoding="utf-8")
-    mode = config["updater"]
-    if mode == "shared":
-        start = "  async function run(action = 'check') {"
-        end = "  function register(ctx) {"
-        replacement = "  async function run() {\n    patch({ open: true, busy: false, offer: null, error: '', message: " + json.dumps(message) + " });\n  }\n"
-    elif mode == "ssh":
-        start = 'async function runUpdate(action = "check") {'
-        end = 'const ROUTE = "/ssh-connections";'
-        replacement = "async function runUpdate() {\n  updatePatch({ busy: false, available: null, restoreAvailable: null, error: '', message: " + json.dumps(message) + " });\n}\n"
-    elif mode != "none":
-        raise ValueError("Unknown updater mode: " + mode)
-    if mode != "none":
-        if source.count(start) != 1 or source.count(end) != 1:
-            raise ValueError("Updater structure changed; review catalog update handling before releasing")
-        first, last = source.index(start), source.index(end)
-        if last <= first:
-            raise ValueError("Unexpected updater function order")
-        source = source[:first] + replacement + source[last:]
+    source = strip_updater((ROOT / "plugin.js").read_text(encoding="utf-8"), config["updater"])
 
     manifest = {
         "name": name, "version": config["version"],
@@ -48,7 +31,7 @@ def build(check=False):
         "catalog/desktop/plugin.js": source,
     }
     for companion in config["companions"]:
-        outputs["catalog/desktop/" + companion] = (ROOT / companion).read_text(encoding="utf-8")
+        outputs["catalog/desktop/" + companion] = readonly_probe((ROOT / companion).read_text(encoding="utf-8"))
     stale = []
     for name, content in outputs.items():
         target = ROOT / name

@@ -1,41 +1,12 @@
-"""Stock Hermes usage probe for Resetwatch.
+"""Read-only catalog usage probe for Resetwatch.
 
-Prints JSON snapshots for Claude, Codex, and OpenRouter using fetchers
-the gateway already ships. If Hermes OAuth is missing, Claude Code and
-Codex CLI logins fill those same cards. Cursor, Kimi, Grok, and GLM
-(ZCode) come from those logins. When CLI login is missing, Kimi Coding
-(KIMI_CODING_API_KEY / KIMI_API_KEY) and GLM (ZAI_API_KEY / GLM_API_KEY)
-fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
-(OPENCODE_GO_API_KEY), Ollama Cloud (OLLAMA_API_KEY), MiniMax
-(MINIMAX_API_KEY), Novita (NOVITA_API_KEY), DeepInfra
-(DEEPINFRA_API_KEY), and Vercel AI Gateway (AI_GATEWAY_API_KEY) always
-use Hermes env. Command Code uses COMMANDCODE_API_KEY from Hermes env,
-or the `cmd` CLI login in ~/.commandcode/auth.json.
+Reads existing CLI and Hermes access tokens and calls vendor usage APIs. Never
+exchanges refresh tokens or writes login files. Expired Kimi/Grok credentials
+produce an error asking the user to sign in with the vendor CLI. Cursor CLI
+commands and Hermes OAuth resolvers are not invoked. Result/rate-limit caches
+under $HERMES_HOME/cache/resetwatch may be written. No tokens on stdout.
 
-Read-only for Claude and Codex credentials: the probe never exchanges
-those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
-and Claude pool cards come from reading $HERMES_HOME/auth.json. Kimi and Grok may
-refresh on 401 and write back only that vendor's file. Before writing,
-the probe re-reads the file and merges token fields into that fresh
-record so concurrent CLI edits to other keys are not reverted. That is
-file-level protection only; it cannot make a shared refresh-token
-exchange protocol-safe if the CLI refreshes in the same window. If the
-vendor rotates refresh tokens, whichever side refreshes second can be
-signed out. When this probe did refresh, that vendor's card says so. It
-may also write a small cache under $HERMES_HOME/cache/resetwatch,
-including a 5-minute probe result cache so vendor APIs are not hit more
-often than that (--fresh drops that to a 60-second floor). Incomplete
-timed-out runs are not cached. Vendor fetchers run in parallel with a
-hard time budget. No tokens on stdout.
-
-A vendor with a login on this machine whose fetch fails (HTTP error,
-timeout, changed payload) produces an error snapshot with no windows and
-an "error" field, so the page can show why the card is empty. A vendor
-with no login stays silent.
-
-Vendor usage rows call undocumented private APIs with the same client
-identity those CLIs use (Claude Code, Codex, Grok CLI). Those rows are
-best-effort and can break when a vendor changes its API.
+Private vendor APIs are best-effort and may change without notice.
 """
 
 from __future__ import annotations
@@ -53,7 +24,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
@@ -78,54 +48,14 @@ CURSOR_CLI_TIMEOUT = 8
 ANTHROPIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS = 15 * 60
 MINIMAX_HTTP_TIMEOUT = 5.0
-# Credential write grace: wait briefly before os._exit so a finishing
-# Kimi/Grok refresh can land on disk.
-CREDENTIAL_WRITE_GRACE_SECONDS = 5.0
 
-_refresh_writes = 0
-_refresh_writes_lock = threading.Lock()
-# Vendors whose login file this run rewrote after a token refresh. Their
-# cards carry a note so a later CLI sign-out is not a mystery.
-_refreshed_vendors: set[str] = set()
 # Set only for --profile. Calls without it keep the existing lookup rules.
 _profile_home: Optional[Path] = None
 _profile_inherits_env = True
 
 
-def _note_vendor_refresh(vendor: str) -> None:
-    with _refresh_writes_lock:
-        _refreshed_vendors.add(vendor)
-
-
-def _vendor_refresh_note(vendor: str, cli_name: str) -> Optional[str]:
-    with _refresh_writes_lock:
-        if vendor not in _refreshed_vendors:
-            return None
-    return f"Resetwatch refreshed this login token. If {cli_name} asks you to sign in again, that is why."
-
-
-def _begin_secret_write() -> None:
-    global _refresh_writes
-    with _refresh_writes_lock:
-        _refresh_writes += 1
-
-
-def _end_secret_write() -> None:
-    global _refresh_writes
-    with _refresh_writes_lock:
-        _refresh_writes = max(0, _refresh_writes - 1)
-
-
-def _wait_for_credential_writes(timeout: float = CREDENTIAL_WRITE_GRACE_SECONDS) -> None:
-    deadline = time.monotonic() + float(timeout)
-    while time.monotonic() < deadline:
-        with _refresh_writes_lock:
-            if _refresh_writes <= 0:
-                return
-        time.sleep(0.05)
-
-
-HERMES_PROVIDERS = ("openai-codex", "openrouter")
+# Codex is read directly below; the Hermes resolver can refresh OAuth.
+HERMES_PROVIDERS = ("openrouter",)
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
 # honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
@@ -168,14 +98,10 @@ GLM_PEAK_END_HOUR = 18
 
 CURSOR_PERIOD_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 
-KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-KIMI_CODE_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_CODE_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
-GROK_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
-GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 
 def _utc_now() -> datetime:
@@ -407,33 +333,6 @@ def _write_cache_json(path: Path, payload: Any) -> None:
         return
 
 
-def _write_secret_json(path: Path, payload: dict) -> None:
-    """Atomic write for Kimi/Grok credential files only. Never Claude/Codex."""
-    _begin_secret_write()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        # Create the temp file owner-only from the start so the token is
-        # never briefly world-readable. Mode is ignored on Windows.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, indent=2))
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    finally:
-        _end_secret_write()
-
-
 def _probe_result_cache_path(*, cli_only: bool) -> Path:
     name = "probe_snapshots.cli.json" if cli_only else "probe_snapshots.full.json"
     return _resetwatch_cache_dir() / name
@@ -541,14 +440,7 @@ def _store_anthropic_snapshot(snap: dict) -> None:
 
 
 def _hermes_anthropic_oauth_token() -> Optional[str]:
-    try:
-        from agent.anthropic_credentials import resolve_anthropic_token
-
-        token = (resolve_anthropic_token() or "").strip()
-        if token and _is_claude_oauth_token(token):
-            return token
-    except Exception:
-        pass
+    """Read the saved token; Hermes token resolvers may refresh it."""
     for home in _hermes_homes():
         path = home / ".anthropic_oauth.json"
         payload = _read_json_file(path)
@@ -691,66 +583,9 @@ def _version_key(name: str) -> tuple:
     return tuple(parts)
 
 
-def _cursor_agent_executable() -> Optional[str]:
-    override = (os.environ.get("CURSOR_AGENT") or os.environ.get("CURSOR_USAGE_AGENT") or "").strip()
-    if override:
-        path = Path(override).expanduser()
-        return str(path) if path.is_file() else override
-    candidates: list[Path] = []
-    if _is_windows():
-        local_app = os.environ.get("LOCALAPPDATA") or ""
-        if local_app:
-            root = Path(local_app) / "cursor-agent"
-            candidates.extend(root / name for name in ("agent.cmd", "cursor-agent.cmd", "agent.exe"))
-    if _is_macos():
-        home = _user_home()
-        candidates.append(home / ".local" / "bin" / "cursor-agent")
-        versions = home / ".local" / "share" / "cursor-agent" / "versions"
-        if versions.is_dir():
-            version_bins = sorted(
-                (item / "cursor-agent" for item in versions.iterdir() if item.is_dir()),
-                key=lambda item: _version_key(item.parent.name),
-                reverse=True,
-            )
-            candidates.extend(version_bins)
-        candidates.extend(
-            (
-                Path("/opt/homebrew/bin/cursor-agent"),
-                Path("/usr/local/bin/cursor-agent"),
-            )
-        )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    try:
-        import shutil
-
-        # Never fall back to a bare `agent` on PATH: that name collides with other CLIs.
-        return shutil.which("cursor-agent")
-    except Exception:
-        return None
-
-
 def _cursor_cli_json(args: list[str]) -> Optional[dict]:
-    exe = _cursor_agent_executable()
-    if not exe:
-        return None
-    try:
-        result = subprocess.run(
-            [exe, *args],
-            capture_output=True,
-            text=True,
-            timeout=CURSOR_CLI_TIMEOUT,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except Exception:
-        return None
-    try:
-        payload = json.loads(result.stdout or "")
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+    """Do not launch a CLI that may refresh its login as a side effect."""
+    return None
 
 
 def _cursor_plan_cache_path() -> Path:
@@ -962,55 +797,8 @@ def _kimi_code_read_credentials(path: Path) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def _kimi_code_refresh_tokens(creds: dict) -> Optional[dict]:
-    refresh = creds.get("refresh_token")
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-    import httpx
-
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        response = client.post(
-            KIMI_CODE_OAUTH_TOKEN_URL,
-            data={
-                "client_id": KIMI_CODE_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh.strip(),
-            },
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-        )
-        if response.status_code >= 400:
-            return None
-        body = response.json() or {}
-    if not isinstance(body, dict):
-        return None
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    updated = dict(creds)
-    updated["access_token"] = access.strip()
-    new_refresh = body.get("refresh_token")
-    if isinstance(new_refresh, str) and new_refresh.strip():
-        updated["refresh_token"] = new_refresh.strip()
-    expires_in = _to_int(body.get("expires_in")) or 900
-    updated["expires_in"] = expires_in
-    updated["expires_at"] = int(_utc_now().timestamp()) + expires_in
-    token_type = body.get("token_type")
-    if isinstance(token_type, str) and token_type.strip():
-        updated["token_type"] = token_type.strip()
-    scope = body.get("scope")
-    if isinstance(scope, str) and scope.strip():
-        updated["scope"] = scope.strip()
-    return updated
-
-
-def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bool = False) -> Optional[str]:
-    """Return a Kimi access token. Refresh+write only when allow_refresh.
-
-    Re-reads the credential file before write and merges token fields into
-    that fresh record so concurrent CLI edits to other keys are kept. This
-    is file-level protection only, not a protocol-safe lock against a
-    simultaneous CLI refresh. Never touches Claude/Codex files.
-    """
+def _kimi_code_access_token(*, previous: Optional[str] = None) -> Optional[str]:
+    """Read an existing access token without exchanging or saving credentials."""
     path = _kimi_code_credentials_path()
     if not path:
         return None
@@ -1021,34 +809,7 @@ def _kimi_code_access_token(*, previous: Optional[str] = None, allow_refresh: bo
     token = token.strip() if isinstance(token, str) and token.strip() else None
     if token and (not previous or token != previous.strip()):
         return token
-    if not allow_refresh:
-        return None
-    refreshed = _kimi_code_refresh_tokens(creds)
-    if not refreshed:
-        return None
-    # TOCTOU: CLI may have refreshed while we were on the wire.
-    current = _kimi_code_read_credentials(path)
-    if not isinstance(current, dict):
-        # Do not clobber a file we could not read. Use the refreshed token
-        # for this run only and leave disk alone.
-        access = refreshed.get("access_token")
-        return access.strip() if isinstance(access, str) and access.strip() else None
-    current_token = None
-    raw = current.get("access_token")
-    current_token = raw.strip() if isinstance(raw, str) and raw.strip() else None
-    if previous and current_token and current_token != previous.strip():
-        return current_token
-    merged = dict(current)
-    for key in ("access_token", "refresh_token", "expires_in", "expires_at", "token_type", "scope"):
-        if key in refreshed:
-            merged[key] = refreshed[key]
-    try:
-        _write_secret_json(path, merged)
-        _note_vendor_refresh("kimi")
-    except (OSError, TypeError, ValueError):
-        pass
-    access = merged.get("access_token")
-    return access.strip() if isinstance(access, str) and access.strip() else None
+    return None
 
 
 def infer_kimi_plan_name(payload: Optional[dict] = None) -> Optional[str]:
@@ -1170,19 +931,12 @@ def _fetch_kimi_cli_usage() -> Optional[dict]:
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
         if response.status_code == 401:
-            token = _kimi_code_access_token(previous=token, allow_refresh=True)
-            if not token:
-                return None
-            headers["Authorization"] = f"Bearer {token}"
-            response = client.get(KIMI_CODE_USAGE_URL, headers=headers)
+            raise RuntimeError("Kimi login expired. Sign in with the Kimi CLI, then refresh usage. Catalog installs never refresh login tokens.")
         response.raise_for_status()
         payload = response.json() or {}
     if not isinstance(payload, dict):
         return None
     snap = _kimi_snapshot_from_payload(payload)
-    note = _vendor_refresh_note("kimi", "the Kimi CLI")
-    if snap and note:
-        snap["details"] = [*snap.get("details", []), note]
     return snap
 
 
@@ -1285,55 +1039,8 @@ def _grok_read_auth() -> Optional[tuple[Path, str, dict, dict]]:
     return path, chosen_key, payload, chosen
 
 
-def _grok_refresh_entry(entry: dict) -> Optional[dict]:
-    refresh = entry.get("refresh_token")
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-    import httpx
-
-    client_id = str(entry.get("oidc_client_id") or GROK_OAUTH_CLIENT_ID).strip() or GROK_OAUTH_CLIENT_ID
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        response = client.post(
-            GROK_OAUTH_TOKEN_URL,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            data={
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": refresh.strip(),
-            },
-        )
-        if response.status_code >= 400:
-            return None
-        body = response.json() or {}
-    if not isinstance(body, dict):
-        return None
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    updated = dict(entry)
-    updated["key"] = access.strip()
-    new_refresh = body.get("refresh_token")
-    if isinstance(new_refresh, str) and new_refresh.strip():
-        updated["refresh_token"] = new_refresh.strip()
-    expires_in = _to_int(body.get("expires_in")) or 21600
-    updated["expires_at"] = (
-        datetime.fromtimestamp(_utc_now().timestamp() + expires_in, tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    return updated
-
-
-def _grok_access_context(
-    *, previous: Optional[str] = None, allow_refresh: bool = False
-) -> Optional[tuple[str, str]]:
-    """Return Grok access token + user id. Refresh+write only when allow_refresh.
-
-    Re-reads auth.json before write and merges token fields into that fresh
-    entry so concurrent Grok CLI changes to other keys are not reverted.
-    This is file-level protection only, not a protocol-safe lock against a
-    simultaneous CLI refresh. Never touches Claude/Codex files.
-    """
+def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """Read an existing access token without exchanging or saving credentials."""
     loaded = _grok_read_auth()
     if not loaded:
         return None
@@ -1347,39 +1054,6 @@ def _grok_access_context(
         if user_id:
             return token, user_id
         return None
-    if not allow_refresh:
-        return None
-    refreshed = _grok_refresh_entry(entry)
-    if not refreshed:
-        return None
-    # TOCTOU: re-read full map; abort write if this entry's token changed.
-    reloaded = _grok_read_auth()
-    if not reloaded:
-        return None
-    path2, map_key2, payload2, entry2 = reloaded
-    if path2 != path or map_key2 != map_key:
-        return None
-    disk_token = entry2.get("key") or entry2.get("access_token")
-    disk_token = disk_token.strip() if isinstance(disk_token, str) and disk_token.strip() else None
-    disk_user = str(entry2.get("user_id") or entry2.get("principal_id") or user_id or "").strip()
-    if previous and disk_token and disk_token != previous.strip():
-        if disk_user:
-            return disk_token, disk_user
-        return None
-    merged = dict(entry2)
-    for key in ("key", "refresh_token", "expires_at"):
-        if key in refreshed:
-            merged[key] = refreshed[key]
-    merged_user = str(merged.get("user_id") or merged.get("principal_id") or disk_user or "").strip()
-    payload2[map_key2] = merged
-    try:
-        _write_secret_json(path2, payload2)
-        _note_vendor_refresh("grok")
-    except OSError:
-        pass
-    access = merged.get("key")
-    if isinstance(access, str) and access.strip() and merged_user:
-        return access.strip(), merged_user
     return None
 
 
@@ -1442,12 +1116,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(billing_url, headers=headers)
         if response.status_code == 401:
-            context = _grok_access_context(previous=token, allow_refresh=True)
-            if not context:
-                return None
-            token, user_id = context
-            headers = _grok_proxy_headers(token, user_id)
-            response = client.get(billing_url, headers=headers)
+            raise RuntimeError("Grok login expired. Sign in with the Grok CLI, then refresh usage. Catalog installs never refresh login tokens.")
         response.raise_for_status()
         payload = response.json() or {}
         settings: dict = {}
@@ -1516,8 +1185,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         plan = plan.strip() or None
     else:
         plan = None
-    note = _vendor_refresh_note("grok", "the Grok CLI")
-    return _snapshot("grok", plan, windows, [note] if note else None)
+    return _snapshot("grok", plan, windows)
 
 
 def _claude_home() -> Path:
@@ -3648,7 +3316,6 @@ def _main_inner() -> int:
     cached = _read_probe_result_cache(cli_only=cli_only, max_age=max_age)
     if cached is not None:
         _emit_json(cached, real_stdout)
-        _wait_for_credential_writes()
         # Non-daemon pool threads must not keep this process alive.
         os._exit(0)
     snapshots: list[dict] = []
@@ -3666,7 +3333,6 @@ def _main_inner() -> int:
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
     _emit_json(snapshots, real_stdout)
-    _wait_for_credential_writes()
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)
 

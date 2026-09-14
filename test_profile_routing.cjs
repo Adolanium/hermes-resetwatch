@@ -4,7 +4,7 @@ const path = require('node:path')
 const vm = require('node:vm')
 const { test } = require('node:test')
 
-const source = fs.readFileSync(path.join(__dirname, 'plugin.js'), 'utf8')
+const source = fs.readFileSync(path.join(__dirname, process.env.HERMES_TEST_CATALOG ? 'catalog/desktop/plugin.js' : 'plugin.js'), 'utf8')
   .replace(/^import .*$/gm, '')
   .replace('export default {', 'const plugin = {')
 

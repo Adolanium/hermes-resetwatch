@@ -158,7 +158,7 @@ MIT
 > Resetwatch is an independent community plugin. It is not affiliated with, endorsed by, sponsored by, or officially associated with [Nous Research](https://github.com/NousResearch) or the [Hermes Agent project](https://github.com/NousResearch/hermes-agent). Hermes, Hermes Agent, and Nous Research are names and marks belonging to their respective owners.
 
 
-## Signed updates and recovery
+## Standalone Desktop signed updates and recovery
 
 At the bottom of Resetwatch, choose **Check for updates**. The plugin checks [its own GitHub releases](https://github.com/Adolanium/hermes-resetwatch/releases) and asks before installing. **Update now** downloads the offered version; **Later** leaves the installation unchanged. Checking alone downloads only release metadata.
 
@@ -244,11 +244,12 @@ and move its folder out of the Desktop plugin directory; Hermes intentionally
 does not overwrite manual installations. Keep plugin settings when migrating.
 
 After catalog admission, use `hermes plugins update hermes-resetwatch` and rescan
-Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
-actions cannot replace its files from GitHub releases. Standalone signed updates
+Desktop plugins to adopt a reviewed update. The packaged copy has no in-app update or restore controls. Its release downloader, signature verifier, backup/restore updater, and code-replacement helpers are removed at build time. Standalone signed updates
 continue to use the existing root files.
 
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.17-1` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.17-2` and are not marked as the latest standalone release.
+
+The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort.
