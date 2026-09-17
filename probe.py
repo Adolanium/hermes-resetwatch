@@ -2652,7 +2652,8 @@ def _deepseek_money(value: Any) -> Optional[float]:
         return float(value)
     if isinstance(value, str) and value.strip():
         try:
-            return float(value.strip().replace(",", ""))
+            parsed = float(value.strip().replace(",", ""))
+            return parsed if math.isfinite(parsed) else None
         except ValueError:
             return None
     return None
@@ -2713,7 +2714,7 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
     infos = payload.get("balance_infos")
     if not isinstance(infos, list) or not infos:
         return None
-    chosen = None
+    balances = []
     for item in infos:
         if not isinstance(item, dict):
             continue
@@ -2721,29 +2722,29 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
         if total is None:
             continue
         currency = str(item.get("currency") or "USD").strip().upper() or "USD"
-        if chosen is None or currency == "USD":
-            chosen = (currency, total, item)
-            if currency == "USD":
-                break
-    if not chosen:
+        balances.append((currency, total, item))
+    if not balances:
         return None
-    currency, total, item = chosen
-    granted = _deepseek_money(item.get("granted_balance"))
-    topped = _deepseek_money(item.get("topped_up_balance"))
-    money = _deepseek_money_text(total, currency)
-    detail_parts = [f"{money} left"]
-    if topped is not None and topped > 0:
-        detail_parts.append(f"{_deepseek_money_text(topped, currency)} topped up")
-    if granted is not None and granted > 0:
-        detail_parts.append(f"{_deepseek_money_text(granted, currency)} granted")
+    # Keep currencies separate. Empty placeholder rows must not hide funds,
+    # and amounts in different currencies cannot be ranked or added together.
+    visible = [balance for balance in balances if balance[1] != 0]
+    if not visible:
+        visible = [next((balance for balance in balances if balance[0] == "USD"), balances[0])]
     available = payload.get("is_available")
-    if available is False:
-        detail_parts.append("balance too low for new calls")
-    peak, peak_text = _deepseek_peak_status()
-    windows = [
-        _win("Balance", None, None, " · ".join(detail_parts)),
-        _win("Pricing", None, None, peak_text),
-    ]
+    windows = []
+    for currency, total, item in sorted(visible, key=lambda balance: balance[0]):
+        granted = _deepseek_money(item.get("granted_balance"))
+        topped = _deepseek_money(item.get("topped_up_balance"))
+        detail_parts = [f"{_deepseek_money_text(total, currency)} left"]
+        if topped is not None and topped > 0:
+            detail_parts.append(f"{_deepseek_money_text(topped, currency)} topped up")
+        if granted is not None and granted > 0:
+            detail_parts.append(f"{_deepseek_money_text(granted, currency)} granted")
+        if available is False:
+            detail_parts.append("balance too low for new calls")
+        windows.append(_win(f"Balance ({currency})", None, None, " · ".join(detail_parts)))
+    _, peak_text = _deepseek_peak_status()
+    windows.append(_win("Pricing", None, None, peak_text))
     return _snapshot("deepseek", None, windows)
 
 
