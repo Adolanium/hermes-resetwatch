@@ -498,15 +498,8 @@ function hermesHomeCandidates(fromConfig) {
     if (base && base !== text && !out.includes(base)) out.push(base)
   }
   push(fromConfig)
-  try {
-    const env = typeof process !== 'undefined' && process.env ? process.env : null
-    if (env) {
-      push(env.HERMES_HOME)
-      if (env.LOCALAPPDATA) push(`${env.LOCALAPPDATA}\\hermes`)
-      const home = env.HOME || env.USERPROFILE
-      if (home) push(`${home}/.hermes`)
-    }
-  } catch (_) {}
+  // config.show belongs to the selected gateway. Renderer environment paths
+  // can belong to another machine and must not become backend candidates.
   return out
 }
 
@@ -526,14 +519,8 @@ function probePythonCandidates(home) {
   const venv = isWin ? [...win, ...posix] : [...posix, ...win]
   // Hermes' own interpreter when the install says where it is. Nix and other
   // packaged installs keep no venv under the Hermes home; Hermes exports
-  // HERMES_PYTHON instead. The literal form is expanded by sh on POSIX.
-  // cmd does not expand $VAR, so skip it on Windows.
-  const runtime = []
-  try {
-    const env = typeof process !== 'undefined' && process.env ? process.env : null
-    if (env && env.HERMES_PYTHON) runtime.push(String(env.HERMES_PYTHON))
-  } catch (_) {}
-  if (!isWin) runtime.push('$HERMES_PYTHON')
+  // HERMES_PYTHON instead. Expand it on the backend using its shell syntax.
+  const runtime = [isWin ? '%HERMES_PYTHON%' : '$HERMES_PYTHON']
   // Bare interpreters last. On Mac and Windows these are usually a system
   // Python without httpx, which would "succeed" with an import error card.
   const generic = ['python3', 'python']
@@ -562,14 +549,16 @@ function probeFailureKind(result) {
 }
 
 // probe.py always exits 0 with a JSON list. When the interpreter lacks httpx
-// that list is one note card saying so. Treat it as "wrong Python" and keep
+// that list includes a note card saying so. Treat it as "wrong Python" and keep
 // looking rather than accepting it as the result.
 function probeMissingDeps(parsed) {
-  if (!Array.isArray(parsed) || parsed.length !== 1) return ''
-  const snap = parsed[0]
-  if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') return ''
-  const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
-  return note ? String(note) : ''
+  if (!Array.isArray(parsed)) return ''
+  for (const snap of parsed) {
+    if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') continue
+    const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
+    if (note) return String(note)
+  }
+  return ''
 }
 
 function pickProbeFailure(failures) {
@@ -580,13 +569,13 @@ function pickProbeFailure(failures) {
   if (real) return real.message
   const kinds = new Set(list.map(item => item.kind))
   if (kinds.has('no-deps')) {
-    return 'Found a Python but not the Hermes one (no httpx). Looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON.'
+    return 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.'
   }
   if (kinds.has('no-probe') && !kinds.has('no-python')) {
     return 'probe.py not found in the standalone or combined-package installation on this Gateway'
   }
   if (kinds.has('no-python') && !kinds.has('no-probe')) {
-    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON)'
+    return 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)'
   }
   return list[list.length - 1].message
 }
@@ -617,6 +606,7 @@ async function probeStockAccountUsage(request, opts) {
       return { snapshots: null, error: 'Invalid Hermes profile name' }
     }
     const flags = [
+      '--gateway-runtime',
       profileArg ? `--profile ${quoteShell(profileArg)}` : '',
       opts && opts.cliOnly ? '--cli-only' : '',
       opts && opts.fresh ? '--fresh' : ''

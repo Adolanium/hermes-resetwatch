@@ -12,7 +12,7 @@ function atom(value) {
   return { get: () => value, set: next => { value = next }, listen: () => () => {} }
 }
 
-function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker' } = {}) {
+function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker', shellExec } = {}) {
   const calls = []
   const queries = []
   const cacheWrites = []
@@ -26,6 +26,7 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
   async function reply(method, params) {
     if (method === 'config.show') return { sections: [{ rows: [['Config File', `${configHome}/config.yaml`]] }] }
     if (method === 'shell.exec') {
+      if (shellExec) return shellExec(params.command)
       if (python && !params.command.startsWith(`"${python}" `)) return { code: 127, stderr: 'interpreter not found' }
       if (!params.command.includes(`"${probeHome}/${probeLayout}"`)) {
         return { code: 2, stderr: "can't open file 'probe.py'" }
@@ -93,12 +94,68 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
   return { context, host, sdk, calls, queries, cacheWrites, queryResult, renderHook, renderPolled }
 }
 
+test('remote UI discovers a custom gateway venv with bare system Python and a stale dependency cache', { skip: process.platform !== 'linux' }, async () => {
+  const { spawnSync } = require('node:child_process')
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'resetwatch-runtime-'))
+  const run = (exe, args, options = {}) => {
+    const result = spawnSync(exe, args, { encoding: 'utf8', timeout: 30000, ...options })
+    assert.equal(result.status, 0, result.stderr || String(result.error))
+    return result.stdout.trim()
+  }
+  try {
+    const systemPython = run('python3', ['-c', 'import sys; print(sys.executable)'])
+    const venv = path.join(root, 'system install', 'venv')
+    run(systemPython, ['-m', 'venv', '--without-pip', venv])
+    const runtime = path.join(venv, 'bin', 'python3')
+    const site = run(runtime, ['-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'])
+    // A dependency fixture: no vendor network or real account credentials.
+    fs.writeFileSync(path.join(site, 'httpx.py'), 'import os, sys\nfrom pathlib import Path\nPath(os.environ["RESETWATCH_TEST_RUNTIME_LOG"]).write_text(sys.executable)\n')
+    const bin = path.join(root, 'bin')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'python3'), `#!/bin/sh\nexec '${systemPython.replace(/'/g, "'\\''")}' -S "$@"\n`, { mode: 0o755 })
+    const home = path.join(root, 'home')
+    const profileHome = path.join(home, 'profiles', 'worker')
+    fs.mkdirSync(profileHome, { recursive: true })
+    const installed = path.join(home, 'plugins', 'hermes-resetwatch', 'desktop', 'probe.py')
+    fs.mkdirSync(path.dirname(installed), { recursive: true })
+    fs.copyFileSync(path.join(__dirname, process.env.HERMES_TEST_CATALOG ? 'catalog/desktop/probe.py' : 'probe.py'), installed)
+    const cache = path.join(profileHome, 'cache', 'resetwatch')
+    fs.mkdirSync(cache, { recursive: true })
+    const poison = JSON.stringify({ fetched_at: Date.now() / 1000, snapshots: [{ provider: 'resetwatch', details: ['probe cannot import httpx: missing'] }] })
+    for (const mode of ['cli', 'full']) fs.writeFileSync(path.join(cache, `probe_snapshots.${mode}.json`), poison)
+    const log = path.join(root, 'runtime.txt')
+    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, RESETWATCH_TEST_RUNTIME_LOG: log }
+    assert.notEqual(spawnSync(path.join(bin, 'python3'), ['-c', 'import httpx'], { env }).status, 0)
+    const gateway = path.join(root, 'gateway.py')
+    fs.writeFileSync(gateway, 'import json, subprocess, sys\nr = subprocess.run(sys.argv[1], shell=True, capture_output=True, text=True, timeout=20)\nprint(json.dumps(dict(code=r.returncode, stdout=r.stdout, stderr=r.stderr)))\n')
+    const route = { connectionId: 'remote', profile: 'desktop-alias', targetProfile: 'worker', mode: 'remote' }
+    const app = load({ route, connectionId: 'remote', profile: 'desktop-alias', configHome: profileHome,
+      shellExec: command => JSON.parse(run(runtime, [gateway, command], { env, cwd: root })) })
+    app.context.page()
+    const data = await app.queries[0].queryFn()
+    assert.equal(data.errors.length, 0, JSON.stringify(data.errors))
+    assert.equal(fs.readFileSync(log, 'utf8'), runtime)
+    assert.ok(app.calls.every(call => call.route === route))
+    assert.ok(app.calls.filter(call => call.method === 'shell.exec').every(call => call.params.command.includes('--profile "worker"')))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('older SDK state can render and use the normal request method', async () => {
   const app = load({ legacy: true })
   app.context.page()
   await app.queries[0].queryFn()
   assert.ok(app.calls.some(call => call.method === 'usage.bars'))
   assert.ok(app.calls.every(call => !call.route))
+})
+
+test('remote discovery does not borrow Desktop environment paths', async () => {
+  const app = load({ shellExec: () => ({ code: 127, stderr: 'not found' }) })
+  app.context.process = { env: { HERMES_HOME: '/desktop/home', HERMES_PYTHON: '/desktop/python', HOME: '/desktop' } }
+  await app.context.probeStockAccountUsage(app.host.request, { profile: 'default' })
+  assert.ok(app.calls.some(call => call.method === 'shell.exec'))
+  assert.ok(app.calls.every(call => !call.params.command?.includes('/desktop/')))
 })
 
 test('a remote alias sends every request to the route and the backend name to the probe', async () => {

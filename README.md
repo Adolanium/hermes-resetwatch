@@ -121,7 +121,9 @@ It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplet
 
 Resetwatch uses the desktop plugin SDK and the standard Hermes gateway methods. It is one uncompiled `plugin.js` plus `probe.py`. No package manager.
 
-It runs on Windows, Mac, and Linux with stock Hermes Desktop. `probe.py` runs with the Hermes interpreter: `hermes-agent/.venv` under the Hermes home, or `$HERMES_PYTHON` on Nix and other packaged installs.
+It runs on Windows, Mac, and Linux with stock Hermes Desktop. Interpreter discovery runs on the selected gateway. The probe checks that backend's `HERMES_PYTHON` and `VIRTUAL_ENV`; on Linux it can also discover the running gateway's Python through its process ancestors, including system-wide and custom venv installs outside the Hermes home. It keeps the venv path instead of resolving its Python symlink to the system binary. Home-relative and PATH interpreters remain fallbacks when runtime discovery is unavailable. Desktop-local environment paths are not used for remote discovery.
+
+Missing-`httpx` failures are never cached. Old cached dependency failures are ignored automatically, including when using Refresh, so switching to a working interpreter does not require deleting cache files. Update both `plugin.js` and `probe.py` on the appropriate Desktop and gateway installations to use runtime discovery.
 
 Live cards follow the focused session's Desktop connection and profile. With no focused session, they use the active profile. Remote profile aliases use the backend profile name. The plugin can live in the base home or a profile home, and profiles can share the base home's Python install.
 
@@ -134,11 +136,11 @@ Contributions are welcome. Open an issue first for anything bigger than a small 
 Run the profile tests with Python and Node.js. No packages need to be installed:
 
 ```sh
-python -m unittest test_profile_switch
+python -m unittest test_profile_switch test_probe_runtime
 node --test test_profile_routing.cjs
 ```
 
-The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing.
+The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.
 
 ## License
 

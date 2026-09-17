@@ -439,6 +439,14 @@ def _probe_result_cache_path(*, cli_only: bool) -> Path:
     return _resetwatch_cache_dir() / name
 
 
+def _has_dependency_error(snapshots: list) -> bool:
+    return any(
+        isinstance(snap, dict) and snap.get("provider") == "resetwatch"
+        and any("cannot import httpx" in str(detail) for detail in (snap.get("details") or []))
+        for snap in snapshots
+    )
+
+
 def _read_probe_result_cache(*, cli_only: bool, max_age: float = PROBE_MIN_INTERVAL_SECONDS) -> Optional[list]:
     payload = _read_json_file(_probe_result_cache_path(cli_only=cli_only))
     if not isinstance(payload, dict):
@@ -447,6 +455,10 @@ def _read_probe_result_cache(*, cli_only: bool, max_age: float = PROBE_MIN_INTER
     snapshots = payload.get("snapshots")
     if not isinstance(fetched_at, (int, float)) or not isinstance(snapshots, list):
         return None
+    # Older probes cached this interpreter failure. It says nothing about
+    # the interpreter running now, even inside the --fresh rate-limit floor.
+    if _has_dependency_error(snapshots):
+        return None
     age = datetime.now(timezone.utc).timestamp() - float(fetched_at)
     if age < 0 or age > float(max_age):
         return None
@@ -454,6 +466,8 @@ def _read_probe_result_cache(*, cli_only: bool, max_age: float = PROBE_MIN_INTER
 
 
 def _store_probe_result_cache(snapshots: list, *, cli_only: bool) -> None:
+    if _has_dependency_error(snapshots):
+        return
     _write_cache_json(
         _probe_result_cache_path(cli_only=cli_only),
         {
@@ -3467,7 +3481,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
     try:
         import httpx  # noqa: F401
     except Exception as exc:
-        return [_snapshot("resetwatch", None, [], [f"probe cannot import httpx: {exc}"])], True
+        return [_snapshot("resetwatch", None, [], [f"probe cannot import httpx: {exc}"])], False
 
     pool_accounts = _codex_pool_accounts()
     cli_token = ""
@@ -3626,8 +3640,76 @@ def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Pa
     return candidate.resolve() if candidate.is_dir() else None
 
 
+def _gateway_python_candidates(proc_root: Path = Path("/proc")) -> list[str]:
+    """Discover on this backend, without resolving venv interpreter symlinks.
+
+    On Linux shell.exec is a child of the Python gateway. Walk only our own
+    ancestors, reading argv[0] (never returning or logging command arguments).
+    /proc/<pid>/exe would lose the venv by resolving to the system binary.
+    Other platforms and restricted proc mounts retain the environment and
+    Desktop's existing home/PATH fallbacks.
+    """
+    candidates: list[str] = []
+    explicit = os.environ.get("HERMES_PYTHON", "").strip()
+    if explicit and Path(explicit).is_absolute():
+        candidates.append(explicit)
+    venv = os.environ.get("VIRTUAL_ENV", "").strip()
+    if venv and Path(venv).is_absolute():
+        candidates.append(str(Path(venv) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")))
+    pid = os.getppid()
+    seen: set[int] = set()
+    for _ in range(12):
+        if pid <= 0 or pid in seen:
+            break
+        seen.add(pid)
+        folder = proc_root / str(pid)
+        try:
+            with (folder / "cmdline").open("rb") as stream:
+                executable = os.fsdecode(stream.read(4096).split(b"\0", 1)[0])
+            if executable.startswith("/") and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable.rsplit("/", 1)[-1]):
+                candidates.append(executable)
+            parent = re.search(r"^PPid:\s*(\d+)", (folder / "status").read_text(), re.MULTILINE)
+            if parent is None:
+                break
+            pid = int(parent.group(1))
+        except (OSError, ValueError):
+            break
+    return list(dict.fromkeys(candidates))
+
+
+def _use_gateway_python() -> None:
+    """Bootstrap with stdlib Python, then replace it with a capable runtime.
+
+    The caller consumes --gateway-runtime before re-exec, bounding this to
+    one handoff. All remaining probe flags and the backend environment survive.
+    """
+    deadline = time.monotonic() + 5
+    for executable in _gateway_python_candidates():
+        if os.path.normcase(executable) == os.path.normcase(sys.executable):
+            try:
+                import httpx  # noqa: F401
+                return
+            except Exception:
+                continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            checked = subprocess.run(
+                [executable, "-c", "import httpx"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=min(3, remaining),
+            )
+            if checked.returncode == 0:
+                os.execv(executable, [executable, str(Path(__file__).absolute()), *sys.argv[1:]])
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
 def _main_inner() -> int:
     global _profile_home, _profile_inherits_env
+    if "--gateway-runtime" in sys.argv:
+        sys.argv.remove("--gateway-runtime")
+        _use_gateway_python()
     if "--profile" in sys.argv:
         index = sys.argv.index("--profile")
         if index + 1 >= len(sys.argv):
