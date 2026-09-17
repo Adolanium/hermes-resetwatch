@@ -12,7 +12,7 @@ function atom(value) {
   return { get: () => value, set: next => { value = next }, listen: () => () => {} }
 }
 
-function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', python, configHome = '/srv/hermes/profiles/backend-worker' } = {}) {
+function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker' } = {}) {
   const calls = []
   const queries = []
   const cacheWrites = []
@@ -27,7 +27,7 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
     if (method === 'config.show') return { sections: [{ rows: [['Config File', `${configHome}/config.yaml`]] }] }
     if (method === 'shell.exec') {
       if (python && !params.command.startsWith(`"${python}" `)) return { code: 127, stderr: 'interpreter not found' }
-      if (!params.command.includes(`"${probeHome}/desktop-plugins/resetwatch/probe.py"`)) {
+      if (!params.command.includes(`"${probeHome}/${probeLayout}"`)) {
         return { code: 2, stderr: "can't open file 'probe.py'" }
       }
       return { code: 0, stdout: '[]' }
@@ -121,6 +121,28 @@ test('a profile gateway can find the probe installed in the base home', async ()
   const data = await app.queries[0].queryFn()
   assert.ok(!data.errors.some(error => /probe.py not found/.test(error)))
   assert.ok(app.calls.some(call => call.params.command?.includes('"/srv/hermes/desktop-plugins/resetwatch/probe.py"')))
+})
+
+test('combined packages are discovered on the selected gateway and profile', async () => {
+  for (const base of ['/srv/custom home', 'C:\\Users\\Test User\\hermes']) {
+    for (const profile of ['default', 'backend-worker']) {
+      for (const localInstall of [false, true]) {
+        for (const folder of ['resetwatch', 'hermes-resetwatch']) {
+          const home = localInstall ? `${base}/profiles/backend-worker` : base
+          const probeLayout = `plugins/${folder}/desktop/probe.py`
+          const route = { connectionId: 'remote', profile: 'desktop-alias', targetProfile: profile, mode: 'remote' }
+          const app = load({ connectionId: 'remote', profile: 'desktop-alias', route,
+            configHome: `${base}/profiles/backend-worker`, probeHome: home, probeLayout })
+          app.context.page()
+          const data = await app.queries[0].queryFn()
+          assert.equal(data.errors.length, 0)
+          const commands = app.calls.filter(call => call.method === 'shell.exec')
+          assert.ok(commands.some(call => call.params.command.includes(`"${home}/${probeLayout}"`)))
+          assert.ok(commands.every(call => call.route === route && call.params.command.includes(`--profile "${profile}"`)))
+        }
+      }
+    }
+  }
 })
 
 test('unknown focused ownership does not query the active account', async () => {

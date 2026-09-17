@@ -3280,15 +3280,17 @@ def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Pa
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
         raise ValueError("Invalid Hermes profile name")
     start = (here or Path(__file__)).resolve()
-    for ancestor in start.parents:
-        if ancestor.name != "desktop-plugins":
-            continue
-        base = ancestor.parent
-        if base.parent.name == "profiles":
-            base = base.parent.parent
-        candidate = base if name == "default" else base / "profiles" / name
-        return candidate.resolve() if candidate.is_dir() else None
-    return None
+    directory = start.parent
+    if directory.parent.name == "desktop-plugins":
+        base = directory.parent.parent
+    elif directory.name == "desktop" and directory.parent.parent.name == "plugins":
+        base = directory.parent.parent.parent
+    else:
+        return None
+    if base.parent.name == "profiles":
+        base = base.parent.parent
+    candidate = base if name == "default" else base / "profiles" / name
+    return candidate.resolve() if candidate.is_dir() else None
 
 
 def _main_inner() -> int:
