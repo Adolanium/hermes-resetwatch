@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.17</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.18</sub>
 
   <br /><br />
 
@@ -61,7 +61,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Kimi:** Kimi Code CLI, or `KIMI_CODING_API_KEY` / `KIMI_API_KEY` in Hermes env (Coding Plan)
 - **Grok:** Grok CLI
 - **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
-- **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
+- **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Funded USD and CNY balances appear separately with their own top-up and granted amounts. An empty USD row does not hide CNY funds; currencies are never added or compared by amount. Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
 - **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
 - **MiniMax:** `MINIMAX_API_KEY` (or `MINIMAX_CN_API_KEY`) in Hermes env (Token Plan 5h / weekly)
@@ -225,9 +225,10 @@ console.log(output);
 
 The `catalog/` directory packages this Desktop plugin for the Hermes plugin catalog,
 using the [combined package layout](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks).
-Catalog admission is pending. The repository does not imply approval or endorsement.
+The catalog uses reviewed commit pins. A new repository release becomes available
+through catalog updates after its pin update is accepted upstream.
 
-To install the package directly before catalog admission:
+To install the package directly from the repository:
 
 ```sh
 hermes plugins install Adolanium/hermes-resetwatch/catalog
@@ -243,13 +244,13 @@ installation per Desktop plugin. Before switching from a manual install, back up
 and move its folder out of the Desktop plugin directory; Hermes intentionally
 does not overwrite manual installations. Keep plugin settings when migrating.
 
-After catalog admission, use `hermes plugins update hermes-resetwatch` and rescan
+For catalog installations, use `hermes plugins update hermes-resetwatch` and rescan
 Desktop plugins to adopt a reviewed update. The packaged copy has no in-app update or restore controls. Its release downloader, signature verifier, backup/restore updater, and code-replacement helpers are removed at build time. Standalone signed updates
 continue to use the existing root files.
 
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.17-2` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.18` and are not marked as the latest standalone release.
 
 The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort.
