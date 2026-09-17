@@ -583,7 +583,7 @@ function pickProbeFailure(failures) {
     return 'Found a Python but not the Hermes one (no httpx). Looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON.'
   }
   if (kinds.has('no-probe') && !kinds.has('no-python')) {
-    return 'probe.py not found under desktop-plugins/resetwatch (copy both plugin files)'
+    return 'probe.py not found in the standalone or combined-package installation on this Gateway'
   }
   if (kinds.has('no-python') && !kinds.has('no-probe')) {
     return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON)'
@@ -628,6 +628,10 @@ async function probeStockAccountUsage(request, opts) {
     // The plugin folder is "resetwatch" when installed by hand, but a plain
     // clone of the repo lands as "hermes-resetwatch". Accept both.
     const folders = ['resetwatch', 'hermes-resetwatch']
+    const probePaths = folders.flatMap(folder => [
+      `desktop-plugins/${folder}/probe.py`,
+      `plugins/${folder}/desktop/probe.py`
+    ])
     // Each attempt spawns a process, so prune as we learn: an interpreter
     // that does not exist is skipped for every folder, and a folder Python
     // could not open is skipped for every interpreter.
@@ -638,8 +642,8 @@ async function probeStockAccountUsage(request, opts) {
     for (const home of homes) {
       for (const python of pythons) {
         if (deadPythons.has(python)) continue
-        for (const folder of folders) {
-          const probe = `${home}/desktop-plugins/${folder}/probe.py`
+        for (const relativePath of probePaths) {
+          const probe = `${home}/${relativePath}`
           if (deadProbes.has(probe)) continue
           try {
             const result = await request('shell.exec', {
