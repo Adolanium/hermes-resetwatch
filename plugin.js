@@ -65,6 +65,7 @@ let os = null
 const $clocks = atom([])
 const $now = atom(Date.now())
 const $missingState = atom(null)
+const $providerPreferences = atom({ disabled: [], order: [] })
 
 function stored(key, fallback) {
   return storage ? storage.get(key, fallback) : fallback
@@ -167,6 +168,9 @@ function isNousProvider(name) {
 
 function providerKey(name) {
   const key = String(name || '').trim().toLowerCase()
+  if (key === 'claude') return 'anthropic'
+  if (key === 'codex') return 'openai-codex'
+  if (isNousProvider(key)) return 'nous'
   if (key === 'kimi-coding') return 'kimi'
   if (key === 'xai-oauth' || key === 'xai') return 'grok'
   if (key === 'zai' || key === 'zcode' || key === 'zhipu' || key === 'glm-coding' || key === 'zai-coding-plan') return 'glm'
@@ -230,6 +234,68 @@ const PROVIDER_LABELS = {
   'vercel-ai-gateway': 'AI Gateway',
   commandcode: 'Command Code',
   nous: 'Nous'
+}
+
+const LIVE_PROVIDERS = [
+  'nous', 'anthropic', 'openai-codex', 'openrouter', 'cursor', 'kimi', 'grok',
+  'glm', 'deepseek', 'opencode-go', 'ollama', 'minimax', 'novita', 'deepinfra',
+  'ai-gateway', 'commandcode'
+]
+
+function normalizeProviderPreferences(raw) {
+  const valid = values => [...new Set((Array.isArray(values) ? values : [])
+    .map(providerKey).filter(key => LIVE_PROVIDERS.includes(key)))]
+  return { disabled: valid(raw && raw.disabled).sort(), order: valid(raw && raw.order) }
+}
+
+function saveProviderPreferences(next) {
+  const value = normalizeProviderPreferences(next)
+  remember('providers', value)
+  $providerPreferences.set(value)
+}
+
+function cardProvider(card) {
+  if (String(card.id).startsWith('nous:')) return 'nous'
+  return accountCardProvider(card.id) || providerKey(card.provider)
+}
+
+function arrangeProviderCards(cards, preferences) {
+  const { disabled, order } = normalizeProviderPreferences(preferences)
+  const rank = key => { const index = order.indexOf(key); return index < 0 ? order.length : index }
+  return (cards || []).filter(card => !disabled.includes(cardProvider(card)))
+    .sort((a, b) => rank(cardProvider(a)) - rank(cardProvider(b)))
+}
+
+function ProviderControls({ preferences }) {
+  const order = [...preferences.order, ...LIVE_PROVIDERS.filter(key => !preferences.order.includes(key))]
+  const move = (index, delta) => {
+    if (index + delta < 0 || index + delta >= order.length) return
+    const next = [...order]
+    const moved = next.splice(index, 1)[0]
+    next.splice(index + delta, 0, moved)
+    saveProviderPreferences({ ...preferences, order: next })
+  }
+  return jsxs('details', {
+    children: [
+      jsx('summary', { style: { cursor: 'pointer', color: text.secondary }, children: 'Providers and order' }),
+      jsx('p', { style: { color: text.tertiary, fontSize: '0.75rem' },
+        children: 'Choose which providers to fetch and show. Move providers to set their card order. Saved for this Desktop installation across profiles. An in-progress refresh may finish.' }),
+      ...order.map((key, index) => jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 8, maxWidth: 400, padding: '4px 0' },
+        children: [
+          jsxs('label', { style: { flex: 1, display: 'flex', gap: 8 }, children: [
+            jsx('input', { type: 'checkbox', checked: !preferences.disabled.includes(key),
+              onChange: event => saveProviderPreferences({ ...preferences,
+                disabled: event.target.checked ? preferences.disabled.filter(item => item !== key) : [...preferences.disabled, key] }) }),
+            PROVIDER_LABELS[key]
+          ] }),
+          jsx(SmallButton, { disabled: index === 0, title: `Move ${PROVIDER_LABELS[key]} up`, onClick: () => move(index, -1), children: '↑' }),
+          jsx(SmallButton, { disabled: index === order.length - 1, title: `Move ${PROVIDER_LABELS[key]} down`, onClick: () => move(index, 1), children: '↓' })
+        ]
+      }, key)),
+      jsx(SmallButton, { onClick: () => saveProviderPreferences({}), children: 'Reset providers' })
+    ]
+  })
 }
 
 function nousPortalTitle(planName) {
@@ -498,15 +564,8 @@ function hermesHomeCandidates(fromConfig) {
     if (base && base !== text && !out.includes(base)) out.push(base)
   }
   push(fromConfig)
-  try {
-    const env = typeof process !== 'undefined' && process.env ? process.env : null
-    if (env) {
-      push(env.HERMES_HOME)
-      if (env.LOCALAPPDATA) push(`${env.LOCALAPPDATA}\\hermes`)
-      const home = env.HOME || env.USERPROFILE
-      if (home) push(`${home}/.hermes`)
-    }
-  } catch (_) {}
+  // config.show belongs to the selected gateway. Renderer environment paths
+  // can belong to another machine and must not become backend candidates.
   return out
 }
 
@@ -526,14 +585,8 @@ function probePythonCandidates(home) {
   const venv = isWin ? [...win, ...posix] : [...posix, ...win]
   // Hermes' own interpreter when the install says where it is. Nix and other
   // packaged installs keep no venv under the Hermes home; Hermes exports
-  // HERMES_PYTHON instead. The literal form is expanded by sh on POSIX.
-  // cmd does not expand $VAR, so skip it on Windows.
-  const runtime = []
-  try {
-    const env = typeof process !== 'undefined' && process.env ? process.env : null
-    if (env && env.HERMES_PYTHON) runtime.push(String(env.HERMES_PYTHON))
-  } catch (_) {}
-  if (!isWin) runtime.push('$HERMES_PYTHON')
+  // HERMES_PYTHON instead. Expand it on the backend using its shell syntax.
+  const runtime = [isWin ? '%HERMES_PYTHON%' : '$HERMES_PYTHON']
   // Bare interpreters last. On Mac and Windows these are usually a system
   // Python without httpx, which would "succeed" with an import error card.
   const generic = ['python3', 'python']
@@ -562,14 +615,16 @@ function probeFailureKind(result) {
 }
 
 // probe.py always exits 0 with a JSON list. When the interpreter lacks httpx
-// that list is one note card saying so. Treat it as "wrong Python" and keep
+// that list includes a note card saying so. Treat it as "wrong Python" and keep
 // looking rather than accepting it as the result.
 function probeMissingDeps(parsed) {
-  if (!Array.isArray(parsed) || parsed.length !== 1) return ''
-  const snap = parsed[0]
-  if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') return ''
-  const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
-  return note ? String(note) : ''
+  if (!Array.isArray(parsed)) return ''
+  for (const snap of parsed) {
+    if (!snap || String(snap.provider || '').toLowerCase() !== 'resetwatch') continue
+    const note = (snap.details || []).find(line => /cannot import httpx/i.test(String(line)))
+    if (note) return String(note)
+  }
+  return ''
 }
 
 function pickProbeFailure(failures) {
@@ -580,13 +635,13 @@ function pickProbeFailure(failures) {
   if (real) return real.message
   const kinds = new Set(list.map(item => item.kind))
   if (kinds.has('no-deps')) {
-    return 'Found a Python but not the Hermes one (no httpx). Looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON.'
+    return 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.'
   }
   if (kinds.has('no-probe') && !kinds.has('no-python')) {
     return 'probe.py not found in the standalone or combined-package installation on this Gateway'
   }
   if (kinds.has('no-python') && !kinds.has('no-probe')) {
-    return 'No working Hermes Python found (looked for hermes-agent/.venv under the Hermes home and $HERMES_PYTHON)'
+    return 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)'
   }
   return list[list.length - 1].message
 }
@@ -616,7 +671,10 @@ async function probeStockAccountUsage(request, opts) {
     if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
       return { snapshots: null, error: 'Invalid Hermes profile name' }
     }
+    const disabled = normalizeProviderPreferences({ disabled: opts && opts.disabled }).disabled
     const flags = [
+      '--gateway-runtime',
+      disabled.length ? `--disabled-providers=${disabled.join(',')}` : '',
       profileArg ? `--profile ${quoteShell(profileArg)}` : '',
       opts && opts.cliOnly ? '--cli-only' : '',
       opts && opts.fresh ? '--fresh' : ''
@@ -702,13 +760,19 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   const errors = []
   const sid = sessionId || readSessionId()
   const fresh = !!(opts && opts.fresh)
+  const disabled = normalizeProviderPreferences({ disabled: opts && opts.disabled }).disabled
+  const selective = disabled.length > 0
+  const nousEnabled = !disabled.includes('nous')
+  if (disabled.length === LIVE_PROVIDERS.length) {
+    return { cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false }
+  }
   let haveAccountRpc = false
   const target = await profileRequester(connectionId, profile)
   const request = target.request
 
   const [barsResult, accountResult] = await Promise.allSettled([
-    request('usage.bars', {}),
-    request('account.usage', {})
+    nousEnabled ? request('usage.bars', {}) : Promise.resolve(null),
+    selective ? Promise.resolve(null) : request('account.usage', {})
   ])
 
   let barsError = ''
@@ -719,7 +783,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     barsError = error && error.message ? error.message : 'Could not read Nous usage'
   }
 
-  if (!cards.length) {
+  if (nousEnabled && !cards.length) {
     try {
       const sub = await request('subscription.state', {})
       if (sub && sub.usage) cards.push(...cardsFromUsageBars(sub.usage))
@@ -733,7 +797,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   }
 
   const accountProviders = new Set()
-  if (accountResult.status === 'fulfilled') {
+  if (!selective && accountResult.status === 'fulfilled') {
     haveAccountRpc = true
     const account = accountResult.value
     const snaps = (account && account.snapshots) || []
@@ -741,7 +805,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
       if (snap && snap.provider) accountProviders.add(providerKey(snap.provider))
     }
     cards.push(...cardsFromAccountSnapshots(snaps))
-  } else {
+  } else if (!selective) {
     const error = accountResult.reason
     const message = error && error.message ? error.message : ''
     if (!/unknown method|not found|-32601/i.test(message)) {
@@ -749,7 +813,9 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
   }
 
-  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile })
+  const probeResult = disabled.filter(key => key !== 'nous').length === LIVE_PROVIDERS.length - 1
+    ? { snapshots: [], error: null }
+    : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -784,7 +850,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   // Claude often comes from Hermes /usage when the probe has Codex/etc. but
   // no Anthropic row. Only skip that fallback once Claude is already present.
   // Never surface a stale focused-session "session not found".
-  if (!haveAccountRpc && sid && !haveClaudeProbe) {
+  if (!selective && !haveAccountRpc && sid && !haveClaudeProbe) {
     try {
       const result = await request('slash.exec', { command: 'usage', session_id: sid })
       const output = result && typeof result.output === 'string' ? result.output : ''
@@ -805,7 +871,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     seen.add(card.id)
     unique.push(card)
   }
-  return { cards: unique, errors, hadSession: Boolean(sid), haveAccountRpc }
+  return { cards: arrangeProviderCards(unique, { disabled }), errors, hadSession: Boolean(sid), haveAccountRpc }
 }
 
 function SmallButton({ onClick, children, active, title, disabled }) {
@@ -1164,8 +1230,9 @@ function EditClock({ clock, onSave, onCancel }) {
   })
 }
 
-function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
+function useLiveCardsPolled(gateway, sessionId, connectionId, profile, disabled = []) {
   const sid = sessionId || ''
+  const selection = disabled.join(',')
   const [data, setData] = useState({ cards: [], errors: [], hadSession: false, haveAccountRpc: false })
   const [isFetching, setFetching] = useState(false)
   const genRef = useRef(0)
@@ -1176,7 +1243,7 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
     inFlight.current = true
     const gen = ++genRef.current
     setFetching(true)
-    fetchLiveCards(sid, opts, connectionId, profile)
+    fetchLiveCards(sid, { ...opts, disabled }, connectionId, profile)
       .then(next => {
         if (gen !== genRef.current) return
         setData(next)
@@ -1208,21 +1275,22 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile) {
       inFlight.current = false
       clearInterval(id)
     }
-  }, [gateway, sid, connectionId, profile])
+  }, [gateway, sid, connectionId, profile, selection])
 
   return { data, isFetching, refetch: () => load({ fresh: true }) }
 }
 
-function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
+function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled = []) {
   const sid = sessionId || ''
   const key = [PLUGIN_ID, 'live', connectionId, profile || '', sid]
+  if (disabled.length) key.push(disabled.join(','))
   const contextKey = JSON.stringify(key)
   const [manual, setManual] = useState({ key: '', fetching: false, error: '' })
   const manualFetching = manual.key === contextKey && manual.fetching
   const manualError = manual.key === contextKey ? manual.error : ''
   const query = useQuery({
     queryKey: key,
-    queryFn: () => fetchLiveCards(sid, {}, connectionId, profile),
+    queryFn: () => fetchLiveCards(sid, { disabled }, connectionId, profile),
     enabled: gateway === 'open',
     refetchInterval: POLL_MS,
     retry: false
@@ -1235,7 +1303,7 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile) {
     return queryClient
       .fetchQuery({
         queryKey: [...key, 'fresh'],
-        queryFn: () => fetchLiveCards(sid, { fresh: true }, connectionId, profile),
+        queryFn: () => fetchLiveCards(sid, { fresh: true, disabled }, connectionId, profile),
         staleTime: 0,
         retry: false
       })
@@ -1298,7 +1366,8 @@ function PluginPageContent() {
     : focusedProfile && focusedProfile !== activeProfile
   const connectionId = unresolved ? null : hasOwnerState ? owner.connectionId : activeConnectionId || ''
   const profile = hasOwnerState ? owner && owner.profile : focusedProfile || activeProfile
-  const live = useLiveCards(gateway, sessionId, connectionId, profile)
+  const preferences = useValue($providerPreferences)
+  const live = useLiveCards(gateway, sessionId, connectionId, profile, preferences.disabled)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [liveOpen, toggleLive] = useSectionOpen('live')
@@ -1308,8 +1377,8 @@ function PluginPageContent() {
   const coolingDown = cooldownUntil > Date.now()
   const payload = live.data || { cards: [], errors: [], hadSession: false }
   const groups = useMemo(
-    () => groupLiveCards(payload.cards).filter(group => group.cards.length),
-    [payload.cards]
+    () => groupLiveCards(arrangeProviderCards(payload.cards, preferences)).filter(group => group.cards.length),
+    [payload.cards, preferences]
   )
 
   useEffect(() => {
@@ -1402,6 +1471,7 @@ function PluginPageContent() {
             children:
               'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. Click a section name to fold it up.'
           }),
+          jsx(ProviderControls, { preferences }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
             children: [
@@ -1429,8 +1499,9 @@ function PluginPageContent() {
                           })
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
-                            children:
-                              'No remaining-quota windows yet. Sign into Claude, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, Command Code, OpenRouter, or Nous, then refresh.'
+                            children: preferences.disabled.length === LIVE_PROVIDERS.length
+                              ? 'All providers are off. Enable a provider in Providers and order to see live usage.'
+                              : 'No remaining-quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {
@@ -1798,6 +1869,7 @@ export default {
     storage = ctx.storage || null
     os = ctx.os || null
     loadClocks()
+    $providerPreferences.set(normalizeProviderPreferences(stored('providers', {})))
 
     const contributions = [
       { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(Page, {}) },

@@ -12,7 +12,7 @@ function atom(value) {
   return { get: () => value, set: next => { value = next }, listen: () => () => {} }
 }
 
-function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker' } = {}) {
+function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker', shellExec } = {}) {
   const calls = []
   const queries = []
   const cacheWrites = []
@@ -26,6 +26,7 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
   async function reply(method, params) {
     if (method === 'config.show') return { sections: [{ rows: [['Config File', `${configHome}/config.yaml`]] }] }
     if (method === 'shell.exec') {
+      if (shellExec) return shellExec(params.command)
       if (python && !params.command.startsWith(`"${python}" `)) return { code: 127, stderr: 'interpreter not found' }
       if (!params.command.includes(`"${probeHome}/${probeLayout}"`)) {
         return { code: 2, stderr: "can't open file 'probe.py'" }
@@ -90,8 +91,122 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
     while (pendingEffects.length) pendingEffects.shift()()
     return result
   }
-  return { context, host, sdk, calls, queries, cacheWrites, queryResult, renderHook, renderPolled }
+  const renderPage = () => { cursor = 0; return context.page() }
+  return { context, host, sdk, calls, queries, cacheWrites, queryResult, renderHook, renderPolled, renderPage }
 }
+
+test('provider controls persist toggles and order, filter cached cards, and route filtered fetches', async () => {
+  const app = load()
+  const saved = new Map()
+  app.context.storageFixture = { get: (key, fallback) => saved.get(key) ?? fallback, set: (key, value) => saved.set(key, value) }
+  vm.runInContext('storage = storageFixture', app.context)
+  const controls = () => vm.runInContext('ProviderControls({ preferences: $providerPreferences.get() })', app.context)
+  const row = (tree, key) => tree.props.children.find(child => child?.props?.children?.[0]?.props?.children?.[1] === key)
+  const cursorRow = row(controls(), 'Cursor')
+  cursorRow.props.children[0].props.children[0].props.onChange({ target: { checked: false } })
+  assert.deepEqual(Array.from(saved.get('providers').disabled), ['cursor'])
+  const reordered = row(controls(), 'Cursor')
+  reordered.props.children[1].props.onClick()
+  assert.ok(saved.get('providers').order.indexOf('cursor') < saved.get('providers').order.indexOf('openrouter'))
+  vm.runInContext('$providerPreferences.set(normalizeProviderPreferences(stored("providers", {})))', app.context)
+  app.renderPage()
+  await app.queries[0].queryFn()
+  assert.ok(app.calls.some(call => call.params.command?.includes('--disabled-providers=cursor')))
+  assert.ok(!app.calls.some(call => ['account.usage', 'slash.exec'].includes(call.method)))
+  const arranged = vm.runInContext(`arrangeProviderCards([
+    {id:'account:cursor:0', provider:'Cursor Pro'},
+    {id:'account:openai-codex:a:0', provider:'Codex Plus'},
+    {id:'account:anthropic:b:0', provider:'Claude Max'},
+    {id:'account:anthropic:c:0', provider:'Claude Max'}
+  ], {disabled:['cursor'], order:['anthropic','openai-codex']})`, app.context)
+  assert.deepEqual(Array.from(arranged, card => card.id), ['account:anthropic:b:0', 'account:anthropic:c:0', 'account:openai-codex:a:0'])
+})
+
+test('all providers disabled performs no gateway requests; Nous-only does not launch the probe', async () => {
+  const app = load()
+  vm.runInContext('saveProviderPreferences({ disabled: LIVE_PROVIDERS })', app.context)
+  app.renderPage()
+  const empty = await app.queries.at(-1).queryFn()
+  assert.equal(empty.cards.length, 0)
+  assert.equal(app.calls.length, 0)
+  vm.runInContext('saveProviderPreferences({ disabled: LIVE_PROVIDERS.filter(key => key !== "nous") })', app.context)
+  app.renderPage()
+  await app.queries.at(-1).queryFn()
+  assert.deepEqual(app.calls.map(call => call.method), ['usage.bars', 'subscription.state'])
+})
+
+test('disabling Nous skips its RPCs and refresh keeps the provider selection', async () => {
+  const app = load()
+  const hook = app.renderHook('open', 'session', 'local', 'default', ['nous'])
+  await hook.refetch()
+  assert.ok(!app.calls.some(call => ['usage.bars', 'subscription.state', 'account.usage', 'slash.exec'].includes(call.method)))
+  assert.ok(app.calls.filter(call => call.method === 'shell.exec').every(call => call.params.command.includes('--disabled-providers=nous') && call.params.command.includes('--fresh')))
+})
+
+test('provider query keys change only with the selection, not display order', () => {
+  const app = load()
+  app.renderPage()
+  const original = JSON.stringify(app.queries.at(-1).queryKey)
+  vm.runInContext('saveProviderPreferences({ order: ["cursor"] })', app.context)
+  app.renderPage()
+  assert.equal(JSON.stringify(app.queries.at(-1).queryKey), original)
+  vm.runInContext('saveProviderPreferences({ disabled: ["cursor"] })', app.context)
+  app.renderPage()
+  assert.notEqual(JSON.stringify(app.queries.at(-1).queryKey), original)
+})
+
+test('remote UI discovers a custom gateway venv with bare system Python and a stale dependency cache', { skip: process.platform !== 'linux' }, async () => {
+  const { spawnSync } = require('node:child_process')
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'resetwatch-runtime-'))
+  const run = (exe, args, options = {}) => {
+    const result = spawnSync(exe, args, { encoding: 'utf8', timeout: 30000, ...options })
+    assert.equal(result.status, 0, result.stderr || String(result.error))
+    return result.stdout.trim()
+  }
+  try {
+    const systemPython = run('python3', ['-c', 'import sys; print(sys.executable)'])
+    const venv = path.join(root, 'system install', 'venv')
+    run(systemPython, ['-m', 'venv', '--without-pip', venv])
+    const runtime = path.join(venv, 'bin', 'python3')
+    const site = run(runtime, ['-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'])
+    // A dependency fixture: no vendor network or real account credentials.
+    fs.writeFileSync(path.join(site, 'httpx.py'), 'import os, sys\nfrom pathlib import Path\nPath(os.environ["RESETWATCH_TEST_RUNTIME_LOG"]).write_text(sys.executable)\n')
+    const bin = path.join(root, 'bin')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'python3'), `#!/bin/sh\nexec '${systemPython.replace(/'/g, "'\\''")}' -S "$@"\n`, { mode: 0o755 })
+    const home = path.join(root, 'home')
+    const profileHome = path.join(home, 'profiles', 'worker')
+    fs.mkdirSync(profileHome, { recursive: true })
+    const installed = path.join(home, 'plugins', 'hermes-resetwatch', 'desktop', 'probe.py')
+    fs.mkdirSync(path.dirname(installed), { recursive: true })
+    fs.copyFileSync(path.join(__dirname, process.env.HERMES_TEST_CATALOG ? 'catalog/desktop/probe.py' : 'probe.py'), installed)
+    const cache = path.join(profileHome, 'cache', 'resetwatch')
+    fs.mkdirSync(cache, { recursive: true })
+    const poison = JSON.stringify({ fetched_at: Date.now() / 1000, snapshots: [{ provider: 'resetwatch', details: ['probe cannot import httpx: missing'] }] })
+    for (const mode of ['cli', 'full']) fs.writeFileSync(path.join(cache, `probe_snapshots.${mode}.json`), poison)
+    const log = path.join(root, 'runtime.txt')
+    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, RESETWATCH_TEST_RUNTIME_LOG: log }
+    assert.notEqual(spawnSync(path.join(bin, 'python3'), ['-c', 'import httpx'], { env }).status, 0)
+    const gateway = path.join(root, 'gateway.py')
+    fs.writeFileSync(gateway, 'import json, subprocess, sys\nr = subprocess.run(sys.argv[1], shell=True, capture_output=True, text=True, timeout=20)\nprint(json.dumps(dict(code=r.returncode, stdout=r.stdout, stderr=r.stderr)))\n')
+    const route = { connectionId: 'remote', profile: 'desktop-alias', targetProfile: 'worker', mode: 'remote' }
+    const app = load({ route, connectionId: 'remote', profile: 'desktop-alias', configHome: profileHome,
+      shellExec: command => JSON.parse(run(runtime, [gateway, command], { env, cwd: root })) })
+    app.context.page()
+    const data = await app.queries[0].queryFn()
+    assert.equal(data.errors.length, 0, JSON.stringify(data.errors))
+    assert.equal(fs.readFileSync(log, 'utf8'), runtime)
+    assert.ok(app.calls.every(call => call.route === route))
+    assert.ok(app.calls.filter(call => call.method === 'shell.exec').every(call => call.params.command.includes('--profile "worker"')))
+    vm.runInContext('saveProviderPreferences({ disabled: ["cursor"] })', app.context)
+    app.renderPage()
+    const filtered = await app.queries.at(-1).queryFn()
+    assert.equal(filtered.errors.length, 0, JSON.stringify(filtered.errors))
+    assert.ok(app.calls.some(call => call.params.command?.includes('--disabled-providers=cursor')))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('older SDK state can render and use the normal request method', async () => {
   const app = load({ legacy: true })
@@ -99,6 +214,14 @@ test('older SDK state can render and use the normal request method', async () =>
   await app.queries[0].queryFn()
   assert.ok(app.calls.some(call => call.method === 'usage.bars'))
   assert.ok(app.calls.every(call => !call.route))
+})
+
+test('remote discovery does not borrow Desktop environment paths', async () => {
+  const app = load({ shellExec: () => ({ code: 127, stderr: 'not found' }) })
+  app.context.process = { env: { HERMES_HOME: '/desktop/home', HERMES_PYTHON: '/desktop/python', HOME: '/desktop' } }
+  await app.context.probeStockAccountUsage(app.host.request, { profile: 'default' })
+  assert.ok(app.calls.some(call => call.method === 'shell.exec'))
+  assert.ok(app.calls.every(call => !call.params.command?.includes('/desktop/')))
 })
 
 test('a remote alias sends every request to the route and the backend name to the probe', async () => {
