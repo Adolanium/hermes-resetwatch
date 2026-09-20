@@ -66,6 +66,7 @@ const $clocks = atom([])
 const $now = atom(Date.now())
 const $missingState = atom(null)
 const $providerPreferences = atom({ disabled: [], order: [] })
+const $displayMode = atom('remaining')
 
 function stored(key, fallback) {
   return storage ? storage.get(key, fallback) : fallback
@@ -109,6 +110,22 @@ function remainingFromUsed(used) {
   const usedPct = clampPercent(used)
   if (usedPct === null) return null
   return Math.max(0, 100 - usedPct)
+}
+
+function normalizeDisplayMode(value) {
+  return value === 'used' ? 'used' : 'remaining'
+}
+
+function saveDisplayMode(value) {
+  const mode = normalizeDisplayMode(value)
+  $displayMode.set(mode)
+  remember('display_mode', mode)
+}
+
+function quotaPercent(card, mode) {
+  return normalizeDisplayMode(mode) === 'used'
+    ? clampPercent(card.used) ?? remainingFromUsed(card.remaining)
+    : clampPercent(card.remaining) ?? remainingFromUsed(card.used)
 }
 
 function toneForRemaining(remaining) {
@@ -924,11 +941,15 @@ function NativeInput({ value, onChange, type, placeholder, style }) {
   })
 }
 
-function UsageBar({ remaining }) {
-  const used = remaining === null || remaining === undefined ? 0 : Math.max(0, 100 - remaining)
+function UsageBar({ remaining, percent, label }) {
   const tone = toneForRemaining(remaining)
   const fill = tone === 'bad' ? text.red : tone === 'warn' ? text.yellow : 'var(--ui-text-primary)'
   return jsx('div', {
+    role: 'meter',
+    'aria-label': label,
+    'aria-valuemin': 0,
+    'aria-valuemax': 100,
+    'aria-valuenow': percent,
     style: {
       width: 92,
       height: 6,
@@ -939,7 +960,7 @@ function UsageBar({ remaining }) {
     },
     children: jsx('div', {
       style: {
-        width: `${used}%`,
+        width: `${percent}%`,
         height: '100%',
         borderRadius: 99,
         background: fill
@@ -951,7 +972,7 @@ function UsageBar({ remaining }) {
 function displayDetail(card) {
   const detail = String((card && card.detail) || '').trim()
   if (!detail) return ''
-  // Bar + "% left" already show the same unitless fraction.
+  // The meter and percentage already show the same unitless fraction.
   if (card.remaining !== null && card.remaining !== undefined) {
     if (/^[\d,]+\s+of\s+[\d,]+\s+left$/i.test(detail)) return ''
   }
@@ -973,10 +994,12 @@ function renderDetailText(detail) {
 }
 
 function LimitCard({ card, nowMs, actions }) {
-  const remaining = card.remaining
+  const displayMode = useValue($displayMode)
+  const remaining = quotaPercent(card, 'remaining')
+  const percent = quotaPercent(card, displayMode)
   const tone = toneForRemaining(remaining)
   const reset = formatReset(card.resetAt, card.resetText, nowMs)
-  const leftLabel = remaining === null || remaining === undefined ? '—' : `${remaining}% left`
+  const percentLabel = `${percent}% ${displayMode === 'used' ? 'used' : 'left'}`
   const detail = displayDetail(card)
   return jsxs('div', {
     style: {
@@ -1022,15 +1045,15 @@ function LimitCard({ card, nowMs, actions }) {
             style: { fontSize: '0.75rem', color: text.quaternary, flexShrink: 0 },
             children: 'unavailable'
           })
-        : remaining === null || remaining === undefined
+        : percent === null
           ? null
           : jsxs('div', {
               style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 },
               children: [
-                jsx(UsageBar, { remaining }),
+                jsx(UsageBar, { remaining, percent, label: `${card.label}: ${percentLabel}` }),
                 jsx('div', {
                   style: { fontSize: '0.8125rem', color: toneColor(tone), minWidth: 64, textAlign: 'right' },
-                  children: leftLabel
+                  children: percentLabel
                 })
               ]
             }),
@@ -1367,6 +1390,7 @@ function PluginPageContent() {
   const connectionId = unresolved ? null : hasOwnerState ? owner.connectionId : activeConnectionId || ''
   const profile = hasOwnerState ? owner && owner.profile : focusedProfile || activeProfile
   const preferences = useValue($providerPreferences)
+  const displayMode = useValue($displayMode)
   const live = useLiveCards(gateway, sessionId, connectionId, profile, preferences.disabled)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
@@ -1429,12 +1453,31 @@ function PluginPageContent() {
           jsx('h1', { style: { fontSize: '1rem', fontWeight: 600, color: text.primary, margin: 0 }, children: PLUGIN_NAME }),
           jsx('span', {
             style: { color: text.tertiary, fontSize: '0.75rem' },
-            children: 'How much is left, and when it comes back'
+            children: displayMode === 'used'
+              ? 'How much is used, and when it resets'
+              : 'How much is left, and when it comes back'
           }),
           Badge ? jsx(Badge, { variant: 'muted', children: VERSION }) : null,
           jsxs('div', {
             style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' },
             children: [
+              jsxs('select', {
+                'aria-label': 'Quota display mode',
+                value: displayMode,
+                onChange: event => saveDisplayMode(event.target.value),
+                style: {
+                  fontSize: '0.75rem',
+                  color: text.primary,
+                  background: 'var(--ui-bg-primary)',
+                  border: '1px solid var(--ui-stroke-secondary)',
+                  borderRadius: 4,
+                  padding: '2px 6px'
+                },
+                children: [
+                  jsx('option', { value: 'remaining', children: 'Remaining %' }),
+                  jsx('option', { value: 'used', children: 'Used %' })
+                ]
+              }),
               jsx('span', {
                 style: { fontSize: '0.6875rem', color: text.tertiary },
                 children: `gateway ${gateway || 'idle'}`
@@ -1501,7 +1544,7 @@ function PluginPageContent() {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children: preferences.disabled.length === LIVE_PROVIDERS.length
                               ? 'All providers are off. Enable a provider in Providers and order to see live usage.'
-                              : 'No remaining-quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
+                              : 'No quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {
@@ -1870,6 +1913,7 @@ export default {
     os = ctx.os || null
     loadClocks()
     $providerPreferences.set(normalizeProviderPreferences(stored('providers', {})))
+    $displayMode.set(normalizeDisplayMode(stored('display_mode', 'remaining')))
 
     const contributions = [
       { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(Page, {}) },
