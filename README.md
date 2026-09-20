@@ -49,6 +49,8 @@ It does not scrape vendor websites. Live rows come from Hermes OAuth plus the sa
 
 Open **Providers and order** to turn individual providers off or move them up and down. Disabled providers are hidden and skipped by future fetches; an already-running refresh may finish. The controls also list providers with no current login, so you can enable them later. **Reset providers** restores all providers and the original order. Manual clocks are unaffected.
 
+Choose **Remaining %** (the default) or **Used %** in the page header. Resetwatch remembers your choice and applies it to live quota rows and manual clocks; each meter fills to match its displayed percentage. Warning colors still indicate low remaining quota in either mode. Manual clock forms continue to accept the percentage remaining, and credit balances keep their original units.
+
 These preferences are saved in this Desktop installation and apply across its connections and profiles. Changing order does not fetch again. Changing the enabled providers starts a query for that selection; cached results from a different selection are not reused. While any provider is disabled, Resetwatch uses individual probe fetchers instead of the gateway's broad `account.usage` and `/usage` calls, which cannot guarantee skipping a provider. Gateway-only providers outside the probe's supported list are unavailable in this mode. Nous still uses its own usage RPCs when enabled.
 
 Update both Desktop `plugin.js` and the selected gateway's `probe.py` to use provider filtering. For direct probe calls, pass `--disabled-providers=cursor,kimi` (comma-separated provider IDs).

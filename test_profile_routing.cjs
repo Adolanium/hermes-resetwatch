@@ -95,6 +95,80 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
   return { context, host, sdk, calls, queries, cacheWrites, queryResult, renderHook, renderPolled, renderPage }
 }
 
+test('quota mode persists through registration and updates the header without fetching', () => {
+  const saved = new Map()
+  const register = app => {
+    app.context.ctx = {
+      storage: { get: (key, fallback) => saved.get(key) ?? fallback, set: (key, value) => saved.set(key, value) },
+      registerMany: () => {}, onDispose: () => {}
+    }
+    vm.runInContext('plugin.register(ctx)', app.context)
+  }
+  const findSelector = tree => {
+    if (!tree || typeof tree !== 'object') return null
+    if (tree.props?.['aria-label'] === 'Quota display mode') return tree
+    for (const child of [tree.props?.children].flat(Infinity)) {
+      const match = findSelector(child)
+      if (match) return match
+    }
+    return null
+  }
+  const app = load()
+  register(app)
+  const selector = findSelector(app.renderPage())
+  assert.equal(selector.props.value, 'remaining')
+  selector.props.onChange({ target: { value: 'used' } })
+  assert.equal(saved.get('display_mode'), 'used')
+  assert.equal(findSelector(app.renderPage()).props.value, 'used')
+  assert.equal(app.calls.length, 0, 'display mode must not issue gateway requests')
+  const reloaded = load()
+  register(reloaded)
+  assert.equal(findSelector(reloaded.renderPage()).props.value, 'used')
+  saved.set('display_mode', 'invalid')
+  register(reloaded)
+  assert.equal(findSelector(reloaded.renderPage()).props.value, 'remaining')
+})
+
+test('live and manual quota labels and meters agree in both modes without changing warning meaning', () => {
+  const app = load()
+  for (const source of ['account', 'manual']) {
+    for (const remaining of [0, 5, 30, 72, 100]) {
+      for (const mode of ['remaining', 'used']) {
+        app.context.fixture = { source, label: 'Weekly', remaining }
+        app.context.mode = mode
+        const row = vm.runInContext('saveDisplayMode(mode); LimitCard({card: fixture, nowMs: 0})', app.context)
+        const [bar, label] = row.props.children[1].props.children
+        const percent = mode === 'used' ? 100 - remaining : remaining
+        assert.equal(label.props.children, `${percent}% ${mode === 'used' ? 'used' : 'left'}`)
+        const meter = bar.type(bar.props)
+        assert.equal(meter.props.children.props.style.width, `${percent}%`)
+        assert.equal(meter.props['aria-valuenow'], percent)
+        assert.equal(meter.props['aria-label'], `Weekly: ${label.props.children}`)
+        assert.equal(meter.props.children.props.style.background,
+          remaining <= 10 ? 'var(--ui-red)' : remaining <= 30 ? 'var(--ui-yellow)' : 'var(--ui-text-primary)')
+        assert.equal(app.context.fixture.remaining, remaining, 'display does not mutate manual clock data')
+      }
+    }
+  }
+})
+
+test('used-only data can display either mode; unknown balances and errors never acquire a fake percentage', () => {
+  const app = load()
+  for (const mode of ['remaining', 'used']) {
+    app.context.mode = mode
+    const row = vm.runInContext(`saveDisplayMode(mode); LimitCard({card: {label:'Weekly', used:28}, nowMs:0})`, app.context)
+    assert.equal(row.props.children[1].props.children[1].props.children, mode === 'used' ? '28% used' : '72% left')
+    for (const value of [null, undefined, '', NaN]) {
+      app.context.fixture = { label: 'Credits', remaining: value, used: value, detail: '$12.00 left' }
+      const balance = vm.runInContext('LimitCard({card:fixture, nowMs:0})', app.context)
+      assert.equal(balance.props.children[1], null)
+      assert.equal(balance.props.children[0].props.children[3].props.children, '$12.00 left')
+    }
+    const failed = vm.runInContext(`LimitCard({card:{label:'Weekly', remaining:72, error:true}, nowMs:0})`, app.context)
+    assert.equal(failed.props.children[1].props.children, 'unavailable')
+  }
+})
+
 test('provider controls persist toggles and order, filter cached cards, and route filtered fetches', async () => {
   const app = load()
   const saved = new Map()
