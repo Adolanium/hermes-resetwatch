@@ -2325,11 +2325,100 @@ def _hermes_env_value(name: str) -> Optional[str]:
     direct = (os.environ.get(name) or "").strip() if _profile_inherits_env else ""
     if direct:
         return direct
+    value = _secret_source_env_value(name)
+    if value:
+        return value
     for home in _hermes_homes():
         value = _read_env_file_value(home / ".env", name)
         if value:
             return value
-    return None
+    return _container_env_file_value(name)
+
+
+def _secret_source_env_value(name: str) -> Optional[str]:
+    """Read a matching Vaultwarden snapshot without invoking a secret source.
+
+    Cache keys are backend-specific. Do not scan arbitrary *_cache.json files
+    or guess precedence when several sources are enabled. Vaultwarden's key
+    binds the snapshot to its session, item, and login-field mappings.
+    Its TTL is a refetch interval, not a credential expiry: the gateway also
+    retains its startup values past that interval. Never refresh/write here.
+    """
+    home = next((home for home in _hermes_homes() if home.is_dir()), None)
+    if home is None:
+        return None
+    try:
+        text = (home / "config.yaml").read_text(encoding="utf-8-sig")
+        try:
+            config = json.loads(text)
+        except ValueError:
+            try:
+                import yaml
+            except ImportError:
+                return None  # The gateway runtime supplies PyYAML.
+            try:
+                config = yaml.safe_load(text)
+            except yaml.YAMLError:
+                return None
+        payload = json.loads((home / "cache/vaultwarden_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    sources = config.get("secrets") if isinstance(config, dict) else None
+    if not isinstance(sources, dict) or not isinstance(payload, dict):
+        return None
+    enabled = [key for key, cfg in sources.items() if isinstance(cfg, dict) and cfg.get("enabled")]
+    if enabled != ["vaultwarden"]:
+        return None
+    cfg = sources["vaultwarden"]
+    try:
+        ttl = float(cfg.get("cache_ttl_seconds", 300))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(ttl) or ttl <= 0:
+        return None
+    existing = _read_env_file_value(home / ".env", name)
+    preserve = sources.get("preserve_existing")
+    if existing and (not cfg.get("override_existing", False) or
+                     (isinstance(preserve, list) and name in preserve)):
+        return None
+    session_name = str(cfg.get("session_env") or "BW_SESSION")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", session_name):
+        return None
+    session = (os.environ.get(session_name) or "").strip() if _profile_inherits_env else ""
+    session = session or _read_env_file_value(home / ".env", session_name) or _container_env_file_value(session_name)
+    item = str(cfg.get("item_name") or "").strip()
+    if not session or not item or name == session_name:
+        return None
+    bindings = []
+    for field in ("username_env", "password_env", "notes_env"):
+        binding = str(cfg.get(field) or "").strip()
+        bindings.append(binding if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", binding) else "")
+    fingerprint = hashlib.sha256(session.encode("utf-8")).hexdigest()[:16]
+    expected = "|".join(("vw", fingerprint, item, *bindings))
+    fetched = payload.get("fetched_at")
+    if (payload.get("key") != expected or isinstance(fetched, bool) or
+            not isinstance(fetched, (int, float)) or
+            not 0 < fetched <= time.time()):
+        return None
+    secrets = payload.get("secrets")
+    value = secrets.get(name) if isinstance(secrets, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+# The official Hermes Docker image keeps container env vars as bare files
+# under this directory (s6-overlay).
+_S6_ENV_DIR = Path("/run/s6/container_environment")
+
+
+def _container_env_file_value(name: str) -> Optional[str]:
+    # Container startup values belong to the inherited gateway profile only.
+    if not _profile_inherits_env or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    try:
+        value = (_S6_ENV_DIR / name).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
 
 
 def _deepseek_api_key() -> Optional[str]:
@@ -3098,11 +3187,10 @@ def _hermes_usage_env():
     Keep their normal config and pool lookup, including older Hermes versions.
     This runs before the CLI worker threads start.
     """
-    if _profile_home is None or _profile_inherits_env:
-        yield
-        return
     names = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "HERMES_API_KEY",
              "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "HERMES_BASE_URL", "CUSTOM_BASE_URL")
+    # Resolve missing credentials for scrubbed shell children too, preserving
+    # the distinction between an absent variable and an existing blank value.
     previous = {name: os.environ.get(name) for name in names}
     try:
         for name in names:
