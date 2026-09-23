@@ -14,9 +14,9 @@ jobs:
       - run: python -m unittest test_catalog_policy.py
       - run: python -m py_compile catalog/__init__.py
       - run: node --check catalog/desktop/plugin.js
+      - run: python -m pip install httpx==0.28.1 PyYAML==6.0.3
       - run: python -m unittest test_deepseek_pricing.py test_profile_switch.py test_probe_install.py test_probe_runtime.py test_provider_controls.py test_probe_env_fallback.py
       - run: node --test test_profile_routing.cjs
-      - run: python -m pip install httpx==0.28.1
       - run: python -m unittest test_catalog_readonly.py test_deepseek_balance.py
       - run: node --test test_profile_routing.cjs
         env:

@@ -235,6 +235,29 @@ console.log(output);
 
 ## Catalog package
 
+### Credentials in scrubbed shell environments
+
+When Hermes removes provider keys from shell children, Resetwatch can read the
+selected profile's Vaultwarden cache without running `bw` or changing credentials.
+This fallback requires `secrets.vaultwarden.enabled`, a positive cache TTL, and a
+cache key matching the configured vault item, login-field mappings, and current
+session token. The session token must be available in that profile's environment
+or `.env`, or in Docker's container environment when probing the gateway's own
+profile. YAML configuration uses PyYAML from the gateway runtime.
+
+Existing process values win. Cached values can override `.env` values only when
+`override_existing` allows it and `preserve_existing` does not protect the name.
+The snapshot remains usable past the cache's refetch interval, as the gateway
+also retains startup credentials. Resetwatch does not refresh it. Restart Hermes
+after rotating vault credentials. Missing or mismatched caches, disabled caching,
+and multiple enabled secret sources do not use this fallback. Other secret-source
+cache formats are not supported.
+
+Docker's `/run/s6/container_environment` files provide a final fallback for the
+gateway's own profile. They never supply credentials to a sibling profile.
+
+### Installation
+
 The `catalog/` directory packages this Desktop plugin for the Hermes plugin catalog,
 using the [combined package layout](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks).
 The catalog uses reviewed commit pins. A new repository release becomes available
