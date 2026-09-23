@@ -2661,7 +2661,52 @@ def _hermes_env_value(name: str) -> Optional[str]:
         value = _read_env_file_value(home / ".env", name)
         if value:
             return value
+    value = _secret_source_env_value(name)
+    if value:
+        return value
+    return _container_env_file_value(name)
+
+
+def _secret_source_env_value(name: str) -> Optional[str]:
+    """Read a value a secret-source plugin fetched (read-only).
+
+    Plugins such as vaultwarden persist fetched values through the shared
+    agent.secret_sources DiskCache substrate at
+    ``<hermes_home>/cache/<backend>_cache.json`` as
+    ``{"key", "secrets", "fetched_at"}``. Shell children can run with
+    provider credentials scrubbed, so this cache keeps usage lookups
+    working when .env no longer holds the keys.
+    """
+    for home in _hermes_homes():
+        try:
+            candidates = sorted((home / "cache").glob("*_cache.json"))
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            secrets = payload.get("secrets") if isinstance(payload, dict) else None
+            if not isinstance(secrets, dict):
+                continue
+            value = secrets.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
+
+
+# The official Hermes Docker image keeps container env vars as bare files
+# under this directory (s6-overlay).
+_S6_ENV_DIR = Path("/run/s6/container_environment")
+
+
+def _container_env_file_value(name: str) -> Optional[str]:
+    try:
+        value = (_S6_ENV_DIR / name).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
 
 
 def _deepseek_api_key() -> Optional[str]:
@@ -3430,11 +3475,27 @@ def _hermes_usage_env():
     Keep their normal config and pool lookup, including older Hermes versions.
     This runs before the CLI worker threads start.
     """
-    if _profile_home is None or _profile_inherits_env:
-        yield
-        return
     names = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "HERMES_API_KEY",
              "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "HERMES_BASE_URL", "CUSTOM_BASE_URL")
+    if _profile_home is None or _profile_inherits_env:
+        # Shell children can run with provider credentials scrubbed (the
+        # Desktop shell.exec sandbox strips them). Fill in whatever the
+        # environment is missing from resolved secret sources so upstream
+        # usage helpers still find the keys, then restore the environment.
+        filled: list[str] = []
+        try:
+            for name in names:
+                if (os.environ.get(name) or "").strip():
+                    continue
+                value = _hermes_env_value(name)
+                if value:
+                    os.environ[name] = value
+                    filled.append(name)
+            yield
+        finally:
+            for name in filled:
+                os.environ.pop(name, None)
+        return
     previous = {name: os.environ.get(name) for name in names}
     try:
         for name in names:
