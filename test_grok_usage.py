@@ -1,4 +1,4 @@
-"""Grok billing responses must preserve signed-in accounts without meters."""
+"""Grok billing responses must keep signed-in accounts visible with the right usage."""
 import importlib.util
 import unittest
 from pathlib import Path
@@ -29,6 +29,20 @@ UNIFIED_BILLING = {"config": {
     "billingPeriodStart": "2026-09-23T14:17:12.715439+00:00",
     "billingPeriodEnd": RESET,
 }}
+UNIFIED_BILLING_USED = {"config": {
+    **UNIFIED_BILLING["config"],
+    "creditUsagePercent": 9.0,
+    "productUsage": [{"product": "GrokBuild", "usagePercent": 9.0}],
+}}
+ZERO_USAGE = "No usage recorded yet this period"
+
+
+def row(label, used, reset=RESET, detail=None):
+    return {
+        "label": label, "used_percent": used,
+        "remaining_percent": None if used is None else 100.0 - used,
+        "reset_at": reset, "detail": detail,
+    }
 
 
 class GrokUsageTests(unittest.TestCase):
@@ -44,31 +58,43 @@ class GrokUsageTests(unittest.TestCase):
              patch.object(module, "_grok_access_context", return_value=context):
             return module._fetch_grok_account_usage()
 
-    def test_unified_billing_retains_plan_period_and_unknown_usage(self):
+    def test_unified_billing_without_usage_reads_as_zero(self):
         for module in (probe, catalog_probe):
             with self.subTest(module=module.__name__):
                 self.assertEqual(
                     self.fetch(module, UNIFIED_BILLING, {"subscription_tier_display": " SuperGrok "}),
-                    {"provider": "grok", "plan": "SuperGrok", "details": [], "windows": [{
-                        "label": "Weekly", "used_percent": None, "remaining_percent": None,
-                        "reset_at": RESET, "detail": "No metered limits on this plan",
-                    }]},
+                    {"provider": "grok", "plan": "SuperGrok", "details": [],
+                     "windows": [row("Weekly", 0.0, detail=ZERO_USAGE)]},
                 )
 
-    def test_recognized_unmetered_responses(self):
+    def test_unified_billing_reports_recorded_usage(self):
+        for module in (probe, catalog_probe):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(self.fetch(module, UNIFIED_BILLING_USED)["windows"],
+                                 [row("Weekly", 9.0), row("Build", 9.0)])
+
+    def test_period_without_usage_reads_as_zero_beside_other_rows(self):
         cases = [
-            ({"subscriptionTier": "SuperGrok"}, "SuperGrok", "Weekly", None),
-            ({"config": {"currentPeriod": {"type": "MONTHLY", "end": RESET}}}, None, "Monthly", RESET),
-            ({"config": {"billingPeriodEnd": RESET, "monthlyLimit": {"val": 0}, "used": {"val": 0}}}, None, "Weekly", RESET),
+            ({"currentPeriod": {"type": "MONTHLY", "end": RESET}}, [row("Monthly", 0.0, detail=ZERO_USAGE)]),
+            ({**UNIFIED_BILLING["config"], "prepaidBalance": {"val": 2500}},
+             [row("Weekly", 0.0, detail=ZERO_USAGE), row("Prepaid", None, None, "$25.00 left")]),
         ]
         for module in (probe, catalog_probe):
-            for payload, plan, label, reset in cases:
+            for config, windows in cases:
+                with self.subTest(module=module.__name__, config=config):
+                    self.assertEqual(self.fetch(module, {"config": config})["windows"], windows)
+
+    def test_responses_without_period_have_no_meter(self):
+        cases = [
+            ({"subscriptionTier": "SuperGrok"}, "SuperGrok", None),
+            ({"config": {"billingPeriodEnd": RESET, "monthlyLimit": {"val": 0}, "used": {"val": 0}}}, None, RESET),
+        ]
+        for module in (probe, catalog_probe):
+            for payload, plan, reset in cases:
                 with self.subTest(module=module.__name__, payload=payload):
                     self.assertEqual(self.fetch(module, payload), {
-                        "provider": "grok", "plan": plan, "details": [], "windows": [{
-                            "label": label, "used_percent": None, "remaining_percent": None,
-                            "reset_at": reset, "detail": "No metered limits on this plan",
-                        }],
+                        "provider": "grok", "plan": plan, "details": [],
+                        "windows": [row("Weekly", None, reset, "No metered limits on this plan")],
                     })
 
     def test_legacy_meter_and_prepaid_remain_unchanged(self):
