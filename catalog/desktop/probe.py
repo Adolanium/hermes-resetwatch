@@ -1201,13 +1201,17 @@ def _fetch_grok_account_usage() -> Optional[dict]:
                 f"${demand_used / 100:.2f} of ${demand_cap / 100:.2f} used",
             )
         )
-    if not windows:
-        return None
     plan = settings.get("subscription_tier_display") or payload.get("subscriptionTier")
     if isinstance(plan, str):
         plan = plan.strip() or None
     else:
         plan = None
+    if not windows:
+        if not (plan or reset_at):
+            return None
+        windows.append(
+            _win(_grok_period_label(period), None, reset_at, "No metered limits on this plan")
+        )
     return _snapshot("grok", plan, windows)
 
 
