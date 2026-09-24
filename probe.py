@@ -1489,20 +1489,24 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else None
     reset_at = _parse_dt((period or {}).get("end") or config.get("billingPeriodEnd"))
     used_pct = config.get("creditUsagePercent")
+    limit = _grok_cent(config.get("monthlyLimit"))
+    used = _grok_cent(config.get("used"))
     if isinstance(used_pct, (int, float)) and math.isfinite(used_pct):
         windows.append(_win(_grok_period_label(period), max(0.0, min(100.0, float(used_pct))), reset_at))
-    else:
-        limit = _grok_cent(config.get("monthlyLimit"))
-        used = _grok_cent(config.get("used"))
-        if limit is not None and limit > 0 and used is not None:
-            windows.append(
-                _win(
-                    _grok_period_label(period),
-                    max(0.0, min(100.0, used / float(limit) * 100.0)),
-                    reset_at,
-                    f"${used / 100:.2f} of ${limit / 100:.2f} used",
-                )
+    elif limit is not None and limit > 0 and used is not None:
+        windows.append(
+            _win(
+                _grok_period_label(period),
+                max(0.0, min(100.0, used / float(limit) * 100.0)),
+                reset_at,
+                f"${used / 100:.2f} of ${limit / 100:.2f} used",
             )
+        )
+    elif period is not None:
+        # Grok leaves out creditUsagePercent until the period records usage.
+        windows.append(
+            _win(_grok_period_label(period), 0.0, reset_at, "No usage recorded yet this period")
+        )
     products = config.get("productUsage")
     if isinstance(products, list):
         for item in products:
