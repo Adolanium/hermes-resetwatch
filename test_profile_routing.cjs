@@ -31,7 +31,7 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
       if (!params.command.includes(`"${probeHome}/${probeLayout}"`)) {
         return { code: 2, stderr: "can't open file 'probe.py'" }
       }
-      return { code: 0, stdout: '[]' }
+      return { code: 0, stdout: JSON.stringify({ snapshot_token: 'a'.repeat(32), snapshots: [] }) }
     }
     if (method === 'account.usage') throw new Error('unknown method')
     return {}

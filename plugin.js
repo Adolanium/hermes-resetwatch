@@ -683,18 +683,24 @@ async function profileRequester(connectionId, profile) {
 // invocation requests at most eight snapshots and probe.py also caps bytes.
 const PROBE_SLICE = 8
 
-async function probeNextSlice(request, python, probe, flags, offset) {
+function pinnedPage(text, expectedToken) {
+  const parsed = JSON.parse(text)
+  const token = parsed && parsed.snapshot_token
+  if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
+    throw new Error('probe returned invalid snapshot pin')
+  }
+  return parsed
+}
+
+async function probeNextSlice(request, python, probe, flags, token, offset) {
   const result = await request('shell.exec', {
-    command: `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --slice=${offset}:${PROBE_SLICE}`
+    command: `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --snapshot-token=${token} --slice=${offset}:${PROBE_SLICE}`
   })
   if (!result || result.code) {
     throw new Error((result && String(result.stderr || '').trim()) || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
   }
   const text = String(result.stdout || '').trim()
-  if (!text.startsWith('[')) throw new Error('probe returned non-JSON')
-  const parsed = JSON.parse(text)
-  if (!Array.isArray(parsed)) throw new Error('probe JSON was not a list')
-  return parsed
+  return pinnedPage(text, token).snapshots
 }
 
 async function probeStockAccountUsage(request, opts) {
@@ -740,7 +746,7 @@ async function probeStockAccountUsage(request, opts) {
           if (deadProbes.has(probe)) continue
           try {
             const result = await request('shell.exec', {
-              command: `${quoteShell(python)} ${quoteShell(probe)}${flags} --slice=0:${PROBE_SLICE}`
+              command: `${quoteShell(python)} ${quoteShell(probe)}${flags} --pin-snapshot --slice=0:${PROBE_SLICE}`
             })
             if (!result || result.code) {
               const err = result && result.stderr ? String(result.stderr).trim() : ''
@@ -757,37 +763,31 @@ async function probeStockAccountUsage(request, opts) {
               continue
             }
             const text = String(result.stdout || '').trim()
-            if (!text.startsWith('[')) {
-              failures.push({ kind: 'failed', message: 'probe returned non-JSON' })
-              continue
-            }
-            const parsed = JSON.parse(text)
-            const missingDeps = probeMissingDeps(parsed)
+            const first = pinnedPage(text)
+            const missingDeps = probeMissingDeps(first.snapshots)
             if (missingDeps) {
               // Wrong interpreter for every home, not just this one.
               failures.push({ kind: 'no-deps', message: missingDeps })
               deadPythons.add(python)
               break
             }
-            if (Array.isArray(parsed)) {
-              try {
-                const all = [...parsed]
-                let offset = parsed.length
-                // A short page can mean byte-budget exhaustion, not end of list.
-                for (let page = 0; offset && page < 256; page++) {
-                  const next = await probeNextSlice(request, python, probe, flags, offset)
-                  if (!next.length) break
-                  all.push(...next)
-                  offset += next.length
-                  if (page === 255) throw new Error('probe returned too many pages')
-                }
-                return { snapshots: all, error: null }
-              } catch (error) {
-                failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
-                continue
+            try {
+              const all = [...first.snapshots]
+              let offset = all.length
+              // A short page can mean byte-budget exhaustion, not end of list.
+              for (let page = 0; offset && page < 256; page++) {
+                const next = await probeNextSlice(request, python, probe, flags, first.snapshot_token, offset)
+                if (!next.length) break
+                all.push(...next)
+                offset += next.length
+                if (page === 255) throw new Error('probe returned too many pages')
               }
+              return { snapshots: all, error: null }
+            } catch (error) {
+              // A valid first page owns this invocation. Never restart with
+              // another interpreter or a newer cache after a pin fails.
+              return { snapshots: null, error: errorMessage(error, 'probe snapshot failed') }
             }
-            failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
           } catch (error) {
             failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
           }

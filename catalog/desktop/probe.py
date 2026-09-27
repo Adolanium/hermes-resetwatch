@@ -20,7 +20,9 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +40,9 @@ PROBE_MIN_INTERVAL_SECONDS = 5 * 60
 # Floor for --fresh. The Refresh button skips the 5-minute cache, but it
 # must not turn into a vendor API hammer when clicked repeatedly.
 FRESH_MIN_INTERVAL_SECONDS = 60
+# A page pin is independent of the shared 5-minute result cache. Expired or
+# missing pins fail rather than silently collecting a different result.
+PAGE_PIN_SECONDS = 15 * 60
 # Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
 # need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
@@ -384,6 +389,53 @@ def _store_probe_result_cache(snapshots: list, *, cli_only: bool) -> None:
             "disabled_providers": sorted(_disabled_providers),
         },
     )
+
+
+def _pin_probe_snapshots(snapshots: list) -> str:
+    """Publish one immutable private result; return its unguessable page key."""
+    directory = _resetwatch_cache_dir()
+    now = time.time()
+    for old in directory.glob("probe_page.*.json"):
+        if not re.fullmatch(r"probe_page\.[a-f0-9]{32}\.json", old.name):
+            continue
+        try:
+            if now - old.lstat().st_mtime > PAGE_PIN_SECONDS:
+                old.unlink()
+        except OSError:
+            pass
+    token = secrets.token_hex(16)
+    target = directory / f"probe_page.{token}.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix="probe_page.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(_json_safe(snapshots), stream, ensure_ascii=True, allow_nan=False)
+        # link fails if a token already exists; unlike replace it never mutates
+        # an earlier reader's result. The complete file becomes visible at once.
+        os.link(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return token
+
+
+def _read_pinned_snapshots(token: str) -> list:
+    if not re.fullmatch(r"[a-f0-9]{32}", token):
+        raise ValueError("Invalid snapshot token")
+    path = _resetwatch_cache_dir() / f"probe_page.{token}.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime > PAGE_PIN_SECONDS:
+                raise ValueError("Snapshot pin expired")
+            rows = json.load(stream)
+        if not isinstance(rows, list):
+            raise ValueError("Invalid snapshot pin")
+        return rows
+    except OSError as exc:
+        raise ValueError("Snapshot pin unavailable") from exc
 
 
 def _anthropic_ratelimit_remaining(scope: str) -> float:
@@ -3445,6 +3497,7 @@ def _apply_slice(snapshots: list[dict]) -> list[dict]:
                 str(snap.get("provider") or "resetwatch")[:80],
                 "usage row exceeds shell.exec output limit",
                 account_label=str(snap.get("account_label") or "")[:80],
+                account_key=str(snap.get("account_key") or "")[:80],
             )
             encoded = json.dumps(snap, ensure_ascii=True, separators=(",", ":"))
         extra = len(encoded) + (1 if page else 0)
@@ -3554,6 +3607,11 @@ def _main_inner() -> int:
             if not sep or not offset.isdecimal() or not limit.isdecimal() or int(limit) < 1:
                 raise ValueError("--slice requires OFFSET:LIMIT")
             _slice_args = (int(offset), min(int(limit), 8))
+    pin = "--pin-snapshot" in sys.argv
+    tokens = [arg[len("--snapshot-token="):] for arg in sys.argv[1:]
+              if arg.startswith("--snapshot-token=")]
+    if (pin and tokens) or len(tokens) > 1 or ((pin or tokens) and _slice_args is None):
+        raise ValueError("Snapshot paging requires one mode and --slice")
     if "--profile" in sys.argv:
         index = sys.argv.index("--profile")
         if index + 1 >= len(sys.argv):
@@ -3571,12 +3629,25 @@ def _main_inner() -> int:
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout
+    if tokens:
+        # Never consult the shared cache or vendors for a continuation.
+        token = tokens[0]
+        _emit_json({"snapshot_token": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
+        os._exit(0)
+
+    def emit_page(snapshots: list) -> None:
+        if pin:
+            token = _pin_probe_snapshots(snapshots)
+            _emit_json({"snapshot_token": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
+        else:
+            _emit_json(_apply_slice(snapshots), real_stdout)
+
     # --fresh skips the 5-minute cache but still honours a short floor, so
     # repeated Refresh clicks cannot hammer vendor APIs.
     max_age = FRESH_MIN_INTERVAL_SECONDS if fresh else PROBE_MIN_INTERVAL_SECONDS
     cached = _read_probe_result_cache(cli_only=cli_only, max_age=max_age)
     if cached is not None:
-        _emit_json(_apply_slice(cached), real_stdout)
+        emit_page(cached)
         # Non-daemon pool threads must not keep this process alive.
         os._exit(0)
     snapshots: list[dict] = []
@@ -3593,7 +3664,7 @@ def _main_inner() -> int:
             _keep_snapshot(snapshots, have, labelled, snap)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
-    _emit_json(_apply_slice(snapshots), real_stdout)
+    emit_page(snapshots)
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)
 
