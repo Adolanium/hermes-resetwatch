@@ -2044,6 +2044,7 @@ def _codex_pool_entries() -> list[dict]:
 def _codex_pool_accounts() -> list[dict]:
     accounts: list[dict] = []
     seen_tokens: set[str] = set()
+    seen_accounts: set[str] = set()
     for entry in _codex_pool_entries():
         if str(entry.get("last_status") or "").strip().lower() == "dead":
             continue
@@ -2053,10 +2054,17 @@ def _codex_pool_accounts() -> list[dict]:
         if _codex_token_expiring(token):
             continue
         seen_tokens.add(token)
+        account_id = _codex_account_id_from_token(token)
+        # Separate OAuth logins can belong to the same subscription. Unknown
+        # identities remain separate; labels and quota values are not identity.
+        if account_id:
+            if account_id in seen_accounts:
+                continue
+            seen_accounts.add(account_id)
         accounts.append(
             {
                 "token": token,
-                "account_id": _codex_account_id_from_token(token),
+                "account_id": account_id,
                 "base_url": str(entry.get("base_url") or "").strip() or None,
                 "label": _codex_card_label(entry, token),
                 "key": str(entry.get("id") or "").strip(),
