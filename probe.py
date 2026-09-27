@@ -96,6 +96,7 @@ LIVE_PROVIDERS = (
     "ai-gateway", "commandcode",
 )
 _disabled_providers: set[str] = set()
+_slice_args: Optional[tuple[int, int]] = None
 
 
 def _note_vendor_refresh(vendor: str) -> None:
@@ -2868,8 +2869,26 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
     return _snapshot("deepseek", None, windows)
 
 
-def _opencode_go_api_key() -> Optional[str]:
-    return _hermes_env_value("OPENCODE_GO_API_KEY")
+def _opencode_go_api_keys() -> list[tuple[str, Optional[str]]]:
+    """Find the primary key and contiguous numbered subscriptions, without exposing keys."""
+    accounts: list[tuple[str, Optional[str]]] = []
+    seen: set[str] = set()
+    primary = (_hermes_env_value("OPENCODE_GO_API_KEY") or "").strip()
+    if primary and primary.lower() != "none":
+        accounts.append((primary, None))
+        seen.add(primary)
+    index = 2
+    while True:
+        token = (_hermes_env_value(f"OPENCODE_GO_API_KEY_{index}") or "").strip()
+        if not token or token.lower() == "none":
+            break
+        if token not in seen:
+            accounts.append((token, str(index)))
+            seen.add(token)
+        index += 1
+    if len(accounts) > 1 and accounts[0][1] is None:
+        accounts[0] = (primary, "1")
+    return accounts
 
 
 def _opencode_go_base_url() -> str:
@@ -2888,9 +2907,10 @@ def _opencode_go_usage_url() -> str:
     return f"{_opencode_go_base_url().rstrip('/')}/usage"
 
 
-def _fetch_opencode_go_account_usage() -> Optional[dict]:
+def _fetch_opencode_go_account_usage(
+    token: str, account_label: Optional[str] = None,
+) -> Optional[dict]:
     """OpenCode Go plan windows from GET /zen/go/v1/usage (Hermes API key)."""
-    token = _opencode_go_api_key()
     if not token:
         return None
     import httpx
@@ -2928,7 +2948,7 @@ def _fetch_opencode_go_account_usage() -> Optional[dict]:
         windows.append(_win(label, used, _parse_dt(item.get("resetsAt")), detail))
     if not windows:
         return None
-    return _snapshot("opencode-go", "Go", windows)
+    return _snapshot("opencode-go", "Go", windows, account_label=account_label)
 
 
 def _ollama_api_key() -> Optional[str]:
@@ -3624,7 +3644,16 @@ def _collect_cli() -> tuple[list[dict], bool]:
             ("grok", None, None, _fetch_grok_account_usage),
             ("glm", None, None, _fetch_glm_zcode_account_usage),
             ("deepseek", None, None, _fetch_deepseek_account_usage),
-            ("opencode-go", None, None, _fetch_opencode_go_account_usage),
+        )
+    )
+    if "opencode-go" not in _disabled_providers:
+        fetchers.extend(
+            ("opencode-go", label, None,
+             lambda token=token, label=label: _fetch_opencode_go_account_usage(token, label))
+            for token, label in _opencode_go_api_keys()
+        )
+    fetchers.extend(
+        (
             ("ollama", None, None, _fetch_ollama_cloud_account_usage),
             ("minimax", None, None, _fetch_minimax_account_usage),
             ("novita", None, None, _fetch_novita_account_usage),
@@ -3728,9 +3757,34 @@ def _keep_snapshot(snapshots: list[dict], have: set[str], labelled: set[str], sn
 
 
 def _emit_json(payload: Any, stream) -> None:
-    text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False)
+    text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     stream.write(text)
     stream.flush()
+
+
+def _apply_slice(snapshots: list[dict]) -> list[dict]:
+    """Fit each page under shell.exec's last-4000-character stdout limit."""
+    if _slice_args is None:
+        return snapshots
+    offset, limit = _slice_args
+    page: list[dict] = []
+    size = 2  # JSON array brackets
+    for snap in snapshots[offset:offset + limit]:
+        encoded = json.dumps(_json_safe(snap), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        if len(encoded) + 2 > 3500:
+            # Keep a visible failure card rather than emitting invalid/truncated JSON.
+            snap = _error_snapshot(
+                str(snap.get("provider") or "resetwatch")[:80],
+                "usage row exceeds shell.exec output limit",
+                account_label=str(snap.get("account_label") or "")[:80],
+            )
+            encoded = json.dumps(snap, ensure_ascii=True, separators=(",", ":"))
+        extra = len(encoded) + (1 if page else 0)
+        if size + extra > 3500:
+            break
+        page.append(snap)
+        size += extra
+    return page
 
 
 def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Path]:
@@ -3818,7 +3872,7 @@ def _use_gateway_python() -> None:
 
 
 def _main_inner() -> int:
-    global _profile_home, _profile_inherits_env, _disabled_providers
+    global _profile_home, _profile_inherits_env, _disabled_providers, _slice_args
     if "--gateway-runtime" in sys.argv:
         sys.argv.remove("--gateway-runtime")
         _use_gateway_python()
@@ -3827,6 +3881,11 @@ def _main_inner() -> int:
             _disabled_providers = set(filter(None, arg.split("=", 1)[1].split(",")))
             if not _disabled_providers <= set(LIVE_PROVIDERS):
                 raise ValueError("Unknown disabled provider")
+        if arg.startswith("--slice="):
+            offset, sep, limit = arg[len("--slice="):].partition(":")
+            if not sep or not offset.isdecimal() or not limit.isdecimal() or int(limit) < 1:
+                raise ValueError("--slice requires OFFSET:LIMIT")
+            _slice_args = (int(offset), min(int(limit), 8))
     if "--profile" in sys.argv:
         index = sys.argv.index("--profile")
         if index + 1 >= len(sys.argv):
@@ -3849,7 +3908,7 @@ def _main_inner() -> int:
     max_age = FRESH_MIN_INTERVAL_SECONDS if fresh else PROBE_MIN_INTERVAL_SECONDS
     cached = _read_probe_result_cache(cli_only=cli_only, max_age=max_age)
     if cached is not None:
-        _emit_json(cached, real_stdout)
+        _emit_json(_apply_slice(cached), real_stdout)
         _wait_for_credential_writes()
         # Non-daemon pool threads must not keep this process alive.
         os._exit(0)
@@ -3867,7 +3926,7 @@ def _main_inner() -> int:
             _keep_snapshot(snapshots, have, labelled, snap)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
-    _emit_json(snapshots, real_stdout)
+    _emit_json(_apply_slice(snapshots), real_stdout)
     _wait_for_credential_writes()
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)

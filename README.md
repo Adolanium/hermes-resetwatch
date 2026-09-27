@@ -70,7 +70,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Grok:** Grok CLI
 - **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
 - **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Funded USD and CNY balances appear separately with their own top-up and granted amounts. An empty USD row does not hide CNY funds; currencies are never added or compared by amount. Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
-- **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
+- **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly). For more than one subscription, add consecutive `OPENCODE_GO_API_KEY_2`, `_3`, etc. Each distinct key gets its own numbered account card; duplicate keys are fetched once. Keep the numbers consecutive (a missing number ends discovery). Keys are never included in card labels or probe output.
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
 - **MiniMax:** `MINIMAX_API_KEY` (or `MINIMAX_CN_API_KEY`) in Hermes env (Token Plan 5h / weekly)
 - **Novita:** `NOVITA_API_KEY` in Hermes env (dollar balance)
@@ -125,6 +125,8 @@ Live data goes through the desktop plugin SDK (`host.request` JSON-RPC), plus `p
 
 It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached.
 
+The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop requests `probe.py --slice=OFFSET:LIMIT` pages (up to eight rows and 3500 JSON characters per page); the first request may use `--fresh`, and later requests reuse the probe cache. A single oversized row becomes a visible error card rather than broken JSON. Direct calls without `--slice` retain the original full-list output. Incomplete, uncached runs can change between pages if vendors respond differently; refresh after a timeout.
+
 ## Compatibility
 
 Resetwatch uses the desktop plugin SDK and the standard Hermes gateway methods. It is one uncompiled `plugin.js` plus `probe.py`. No package manager.
@@ -146,11 +148,13 @@ Run the profile tests with Python and Node.js. No packages need to be installed:
 ```sh
 python -m unittest test_profile_switch test_probe_runtime test_provider_controls
 node --test test_profile_routing.cjs
+python -m unittest test_opencode_go_multi test_probe_slicing
+node --test test_probe_pagination.cjs
 ```
 
 The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.
 
-The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` in the test environment for vendor response fixtures.
+The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` and `PyYAML` in the test environment for vendor response and secret-cache fixtures.
 
 ## License
 

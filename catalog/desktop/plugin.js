@@ -679,6 +679,24 @@ async function profileRequester(connectionId, profile) {
   }
 }
 
+// shell.exec returns only the last 4000 characters of stdout. Each probe
+// invocation requests at most eight snapshots and probe.py also caps bytes.
+const PROBE_SLICE = 8
+
+async function probeNextSlice(request, python, probe, flags, offset) {
+  const result = await request('shell.exec', {
+    command: `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --slice=${offset}:${PROBE_SLICE}`
+  })
+  if (!result || result.code) {
+    throw new Error((result && String(result.stderr || '').trim()) || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
+  }
+  const text = String(result.stdout || '').trim()
+  if (!text.startsWith('[')) throw new Error('probe returned non-JSON')
+  const parsed = JSON.parse(text)
+  if (!Array.isArray(parsed)) throw new Error('probe JSON was not a list')
+  return parsed
+}
+
 async function probeStockAccountUsage(request, opts) {
   try {
     const shown = await request('config.show', {})
@@ -722,7 +740,7 @@ async function probeStockAccountUsage(request, opts) {
           if (deadProbes.has(probe)) continue
           try {
             const result = await request('shell.exec', {
-              command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
+              command: `${quoteShell(python)} ${quoteShell(probe)}${flags} --slice=0:${PROBE_SLICE}`
             })
             if (!result || result.code) {
               const err = result && result.stderr ? String(result.stderr).trim() : ''
@@ -751,7 +769,24 @@ async function probeStockAccountUsage(request, opts) {
               deadPythons.add(python)
               break
             }
-            if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
+            if (Array.isArray(parsed)) {
+              try {
+                const all = [...parsed]
+                let offset = parsed.length
+                // A short page can mean byte-budget exhaustion, not end of list.
+                for (let page = 0; offset && page < 256; page++) {
+                  const next = await probeNextSlice(request, python, probe, flags, offset)
+                  if (!next.length) break
+                  all.push(...next)
+                  offset += next.length
+                  if (page === 255) throw new Error('probe returned too many pages')
+                }
+                return { snapshots: all, error: null }
+              } catch (error) {
+                failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
+                continue
+              }
+            }
             failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
           } catch (error) {
             failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
