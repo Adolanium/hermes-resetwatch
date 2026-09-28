@@ -7,7 +7,7 @@ const { test } = require('node:test')
 for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
   const source = fs.readFileSync(path.join(__dirname, file), 'utf8')
     .replace(/^import .*$/gm, '').replace('export default {', 'const pluginDefinition = {')
-  function setup(rows, { fresh = false, pageBudget = Infinity, onPage = () => {} } = {}) {
+  function setup(rows, { fresh = false, pageBudget = Infinity, onPage = () => {}, crashAt = -1 } = {}) {
     const commands = []
     const context = vm.createContext({ sdk: { host: {}, atom: value => ({ get: () => value, set: () => {} }) }, console })
     vm.runInContext(source, context)
@@ -22,6 +22,8 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
       const match = params.command.match(/--slice=(\d+):(\d+)/)
       assert.ok(match, 'every call, including the first, must request a slice')
       const [offset, limit] = match.slice(1).map(Number)
+      // probe.py main() prints a bare card list when it raises.
+      if (offset === crashAt) return { code: 0, stdout: JSON.stringify([{ provider: 'resetwatch', details: ['probe failed: ValueError: boom'] }]) }
       const tokenMatch = params.command.match(/--snapshot-token=([a-f0-9]{32})/)
       let snapshot, token
       if (params.command.includes('--pin-snapshot')) {
@@ -90,5 +92,15 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
     const result = await runner.run()
     assert.equal(result.snapshots, null)
     assert.match(result.error, /snapshot|pin/i)
+  })
+  test(`${file}: first-page crash card is shown instead of a pin error`, async () => {
+    const result = await setup([{ provider: 'p' }], { crashAt: 0 }).run()
+    assert.equal(result.error, null)
+    assert.match(result.snapshots[0].details[0], /ValueError: boom/)
+  })
+  test(`${file}: continuation crash reports the probe failure`, async () => {
+    const result = await setup(Array.from({ length: 12 }, (_, i) => ({ provider: `p-${i}` })), { crashAt: 8 }).run()
+    assert.equal(result.snapshots, null)
+    assert.match(result.error, /ValueError: boom/)
   })
 }

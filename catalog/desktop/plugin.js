@@ -684,7 +684,18 @@ async function profileRequester(connectionId, profile) {
 const PROBE_SLICE = 8
 
 function pinnedPage(text, expectedToken) {
-  const parsed = JSON.parse(text)
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error('probe returned non-JSON')
+  }
+  // probe.py main() reports a crash as a bare card list, even when paging.
+  if (Array.isArray(parsed)) {
+    if (!expectedToken) return { snapshot_token: null, snapshots: parsed }
+    const crash = parsed.find(snap => snap && snap.provider === 'resetwatch')
+    throw new Error((crash && String((crash.details || [])[0] || '')) || 'probe returned invalid snapshot pin')
+  }
   const token = parsed && parsed.snapshot_token
   if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
     throw new Error('probe returned invalid snapshot pin')
@@ -771,6 +782,7 @@ async function probeStockAccountUsage(request, opts) {
               deadPythons.add(python)
               break
             }
+            if (!first.snapshot_token) return { snapshots: first.snapshots, error: null }
             try {
               const all = [...first.snapshots]
               let offset = all.length
