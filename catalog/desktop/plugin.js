@@ -679,6 +679,41 @@ async function profileRequester(connectionId, profile) {
   }
 }
 
+// shell.exec returns only the last 4000 characters of stdout. Each probe
+// invocation requests at most eight snapshots and probe.py also caps bytes.
+const PROBE_SLICE = 8
+
+function pinnedPage(text, expectedToken) {
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error('probe returned non-JSON')
+  }
+  // probe.py main() reports a crash as a bare card list, even when paging.
+  if (Array.isArray(parsed)) {
+    if (!expectedToken) return { snapshot_token: null, snapshots: parsed }
+    const crash = parsed.find(snap => snap && snap.provider === 'resetwatch')
+    throw new Error((crash && String((crash.details || [])[0] || '')) || 'probe returned invalid snapshot pin')
+  }
+  const token = parsed && parsed.snapshot_token
+  if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
+    throw new Error('probe returned invalid snapshot pin')
+  }
+  return parsed
+}
+
+async function probeNextSlice(request, python, probe, flags, token, offset) {
+  const result = await request('shell.exec', {
+    command: `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --snapshot-token=${token} --slice=${offset}:${PROBE_SLICE}`
+  })
+  if (!result || result.code) {
+    throw new Error((result && String(result.stderr || '').trim()) || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
+  }
+  const text = String(result.stdout || '').trim()
+  return pinnedPage(text, token).snapshots
+}
+
 async function probeStockAccountUsage(request, opts) {
   try {
     const shown = await request('config.show', {})
@@ -722,7 +757,7 @@ async function probeStockAccountUsage(request, opts) {
           if (deadProbes.has(probe)) continue
           try {
             const result = await request('shell.exec', {
-              command: `${quoteShell(python)} ${quoteShell(probe)}${flags}`
+              command: `${quoteShell(python)} ${quoteShell(probe)}${flags} --pin-snapshot --slice=0:${PROBE_SLICE}`
             })
             if (!result || result.code) {
               const err = result && result.stderr ? String(result.stderr).trim() : ''
@@ -739,20 +774,32 @@ async function probeStockAccountUsage(request, opts) {
               continue
             }
             const text = String(result.stdout || '').trim()
-            if (!text.startsWith('[')) {
-              failures.push({ kind: 'failed', message: 'probe returned non-JSON' })
-              continue
-            }
-            const parsed = JSON.parse(text)
-            const missingDeps = probeMissingDeps(parsed)
+            const first = pinnedPage(text)
+            const missingDeps = probeMissingDeps(first.snapshots)
             if (missingDeps) {
               // Wrong interpreter for every home, not just this one.
               failures.push({ kind: 'no-deps', message: missingDeps })
               deadPythons.add(python)
               break
             }
-            if (Array.isArray(parsed)) return { snapshots: parsed, error: null }
-            failures.push({ kind: 'failed', message: 'probe JSON was not a list' })
+            if (!first.snapshot_token) return { snapshots: first.snapshots, error: null }
+            try {
+              const all = [...first.snapshots]
+              let offset = all.length
+              // A short page can mean byte-budget exhaustion, not end of list.
+              for (let page = 0; offset && page < 256; page++) {
+                const next = await probeNextSlice(request, python, probe, flags, first.snapshot_token, offset)
+                if (!next.length) break
+                all.push(...next)
+                offset += next.length
+                if (page === 255) throw new Error('probe returned too many pages')
+              }
+              return { snapshots: all, error: null }
+            } catch (error) {
+              // A valid first page owns this invocation. Never restart with
+              // another interpreter or a newer cache after a pin fails.
+              return { snapshots: null, error: errorMessage(error, 'probe snapshot failed') }
+            }
           } catch (error) {
             failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
           }

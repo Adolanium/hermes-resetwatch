@@ -49,7 +49,9 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -68,6 +70,9 @@ PROBE_MIN_INTERVAL_SECONDS = 5 * 60
 # Floor for --fresh. The Refresh button skips the 5-minute cache, but it
 # must not turn into a vendor API hammer when clicked repeatedly.
 FRESH_MIN_INTERVAL_SECONDS = 60
+# A page pin is independent of the shared 5-minute result cache. Expired or
+# missing pins fail rather than silently collecting a different result.
+PAGE_PIN_SECONDS = 15 * 60
 # Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
 # need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
@@ -96,6 +101,7 @@ LIVE_PROVIDERS = (
     "ai-gateway", "commandcode",
 )
 _disabled_providers: set[str] = set()
+_slice_args: Optional[tuple[int, int]] = None
 
 
 def _note_vendor_refresh(vendor: str) -> None:
@@ -484,6 +490,53 @@ def _store_probe_result_cache(snapshots: list, *, cli_only: bool) -> None:
             "disabled_providers": sorted(_disabled_providers),
         },
     )
+
+
+def _pin_probe_snapshots(snapshots: list) -> str:
+    """Publish one immutable private result; return its unguessable page key."""
+    directory = _resetwatch_cache_dir()
+    now = time.time()
+    for old in directory.glob("probe_page.*.json"):
+        if not re.fullmatch(r"probe_page\.[a-f0-9]{32}\.json", old.name):
+            continue
+        try:
+            if now - old.lstat().st_mtime > PAGE_PIN_SECONDS:
+                old.unlink()
+        except OSError:
+            pass
+    token = secrets.token_hex(16)
+    target = directory / f"probe_page.{token}.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix="probe_page.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(_json_safe(snapshots), stream, ensure_ascii=True, allow_nan=False)
+        # link fails if a token already exists; unlike replace it never mutates
+        # an earlier reader's result. The complete file becomes visible at once.
+        os.link(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return token
+
+
+def _read_pinned_snapshots(token: str) -> list:
+    if not re.fullmatch(r"[a-f0-9]{32}", token):
+        raise ValueError("Invalid snapshot token")
+    path = _resetwatch_cache_dir() / f"probe_page.{token}.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime > PAGE_PIN_SECONDS:
+                raise ValueError("Snapshot pin expired")
+            rows = json.load(stream)
+        if not isinstance(rows, list):
+            raise ValueError("Invalid snapshot pin")
+        return rows
+    except OSError as exc:
+        raise ValueError("Snapshot pin unavailable") from exc
 
 
 def _anthropic_ratelimit_remaining(scope: str) -> float:
@@ -2323,6 +2376,7 @@ def _codex_pool_entries() -> list[dict]:
 def _codex_pool_accounts() -> list[dict]:
     accounts: list[dict] = []
     seen_tokens: set[str] = set()
+    seen_accounts: set[str] = set()
     for entry in _codex_pool_entries():
         if str(entry.get("last_status") or "").strip().lower() == "dead":
             continue
@@ -2332,10 +2386,17 @@ def _codex_pool_accounts() -> list[dict]:
         if _codex_token_expiring(token):
             continue
         seen_tokens.add(token)
+        account_id = _codex_account_id_from_token(token)
+        # Separate OAuth logins can belong to the same subscription. Unknown
+        # identities remain separate; labels and quota values are not identity.
+        if account_id:
+            if account_id in seen_accounts:
+                continue
+            seen_accounts.add(account_id)
         accounts.append(
             {
                 "token": token,
-                "account_id": _codex_account_id_from_token(token),
+                "account_id": account_id,
                 "base_url": str(entry.get("base_url") or "").strip() or None,
                 "label": _codex_card_label(entry, token),
                 "key": str(entry.get("id") or "").strip(),
@@ -2868,8 +2929,26 @@ def _fetch_deepseek_account_usage() -> Optional[dict]:
     return _snapshot("deepseek", None, windows)
 
 
-def _opencode_go_api_key() -> Optional[str]:
-    return _hermes_env_value("OPENCODE_GO_API_KEY")
+def _opencode_go_api_keys() -> list[tuple[str, Optional[str]]]:
+    """Find the primary key and contiguous numbered subscriptions, without exposing keys."""
+    accounts: list[tuple[str, Optional[str]]] = []
+    seen: set[str] = set()
+    primary = (_hermes_env_value("OPENCODE_GO_API_KEY") or "").strip()
+    if primary and primary.lower() != "none":
+        accounts.append((primary, None))
+        seen.add(primary)
+    index = 2
+    while True:
+        token = (_hermes_env_value(f"OPENCODE_GO_API_KEY_{index}") or "").strip()
+        if not token or token.lower() == "none":
+            break
+        if token not in seen:
+            accounts.append((token, str(index)))
+            seen.add(token)
+        index += 1
+    if len(accounts) > 1 and accounts[0][1] is None:
+        accounts[0] = (primary, "1")
+    return accounts
 
 
 def _opencode_go_base_url() -> str:
@@ -2888,9 +2967,10 @@ def _opencode_go_usage_url() -> str:
     return f"{_opencode_go_base_url().rstrip('/')}/usage"
 
 
-def _fetch_opencode_go_account_usage() -> Optional[dict]:
+def _fetch_opencode_go_account_usage(
+    token: str, account_label: Optional[str] = None,
+) -> Optional[dict]:
     """OpenCode Go plan windows from GET /zen/go/v1/usage (Hermes API key)."""
-    token = _opencode_go_api_key()
     if not token:
         return None
     import httpx
@@ -2928,7 +3008,7 @@ def _fetch_opencode_go_account_usage() -> Optional[dict]:
         windows.append(_win(label, used, _parse_dt(item.get("resetsAt")), detail))
     if not windows:
         return None
-    return _snapshot("opencode-go", "Go", windows)
+    return _snapshot("opencode-go", "Go", windows, account_label=account_label)
 
 
 def _ollama_api_key() -> Optional[str]:
@@ -3624,7 +3704,16 @@ def _collect_cli() -> tuple[list[dict], bool]:
             ("grok", None, None, _fetch_grok_account_usage),
             ("glm", None, None, _fetch_glm_zcode_account_usage),
             ("deepseek", None, None, _fetch_deepseek_account_usage),
-            ("opencode-go", None, None, _fetch_opencode_go_account_usage),
+        )
+    )
+    if "opencode-go" not in _disabled_providers:
+        fetchers.extend(
+            ("opencode-go", label, None,
+             lambda token=token, label=label: _fetch_opencode_go_account_usage(token, label))
+            for token, label in _opencode_go_api_keys()
+        )
+    fetchers.extend(
+        (
             ("ollama", None, None, _fetch_ollama_cloud_account_usage),
             ("minimax", None, None, _fetch_minimax_account_usage),
             ("novita", None, None, _fetch_novita_account_usage),
@@ -3728,9 +3817,35 @@ def _keep_snapshot(snapshots: list[dict], have: set[str], labelled: set[str], sn
 
 
 def _emit_json(payload: Any, stream) -> None:
-    text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False)
+    text = json.dumps(_json_safe(payload), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     stream.write(text)
     stream.flush()
+
+
+def _apply_slice(snapshots: list[dict]) -> list[dict]:
+    """Fit each page under shell.exec's last-4000-character stdout limit."""
+    if _slice_args is None:
+        return snapshots
+    offset, limit = _slice_args
+    page: list[dict] = []
+    size = 2  # JSON array brackets
+    for snap in snapshots[offset:offset + limit]:
+        encoded = json.dumps(_json_safe(snap), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        if len(encoded) + 2 > 3500:
+            # Keep a visible failure card rather than emitting invalid/truncated JSON.
+            snap = _error_snapshot(
+                str(snap.get("provider") or "resetwatch")[:80],
+                "usage row exceeds shell.exec output limit",
+                account_label=str(snap.get("account_label") or "")[:80],
+                account_key=str(snap.get("account_key") or "")[:80],
+            )
+            encoded = json.dumps(snap, ensure_ascii=True, separators=(",", ":"))
+        extra = len(encoded) + (1 if page else 0)
+        if size + extra > 3500:
+            break
+        page.append(snap)
+        size += extra
+    return page
 
 
 def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Path]:
@@ -3818,7 +3933,7 @@ def _use_gateway_python() -> None:
 
 
 def _main_inner() -> int:
-    global _profile_home, _profile_inherits_env, _disabled_providers
+    global _profile_home, _profile_inherits_env, _disabled_providers, _slice_args
     if "--gateway-runtime" in sys.argv:
         sys.argv.remove("--gateway-runtime")
         _use_gateway_python()
@@ -3827,6 +3942,16 @@ def _main_inner() -> int:
             _disabled_providers = set(filter(None, arg.split("=", 1)[1].split(",")))
             if not _disabled_providers <= set(LIVE_PROVIDERS):
                 raise ValueError("Unknown disabled provider")
+        if arg.startswith("--slice="):
+            offset, sep, limit = arg[len("--slice="):].partition(":")
+            if not sep or not offset.isdecimal() or not limit.isdecimal() or int(limit) < 1:
+                raise ValueError("--slice requires OFFSET:LIMIT")
+            _slice_args = (int(offset), min(int(limit), 8))
+    pin = "--pin-snapshot" in sys.argv
+    tokens = [arg[len("--snapshot-token="):] for arg in sys.argv[1:]
+              if arg.startswith("--snapshot-token=")]
+    if (pin and tokens) or len(tokens) > 1 or ((pin or tokens) and _slice_args is None):
+        raise ValueError("Snapshot paging requires one mode and --slice")
     if "--profile" in sys.argv:
         index = sys.argv.index("--profile")
         if index + 1 >= len(sys.argv):
@@ -3844,12 +3969,25 @@ def _main_inner() -> int:
     cli_only = "--cli-only" in sys.argv
     fresh = "--fresh" in sys.argv
     real_stdout = sys.stdout
+    if tokens:
+        # Never consult the shared cache or vendors for a continuation.
+        token = tokens[0]
+        _emit_json({"snapshot_token": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
+        os._exit(0)
+
+    def emit_page(snapshots: list) -> None:
+        if pin:
+            token = _pin_probe_snapshots(snapshots)
+            _emit_json({"snapshot_token": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
+        else:
+            _emit_json(_apply_slice(snapshots), real_stdout)
+
     # --fresh skips the 5-minute cache but still honours a short floor, so
     # repeated Refresh clicks cannot hammer vendor APIs.
     max_age = FRESH_MIN_INTERVAL_SECONDS if fresh else PROBE_MIN_INTERVAL_SECONDS
     cached = _read_probe_result_cache(cli_only=cli_only, max_age=max_age)
     if cached is not None:
-        _emit_json(cached, real_stdout)
+        emit_page(cached)
         _wait_for_credential_writes()
         # Non-daemon pool threads must not keep this process alive.
         os._exit(0)
@@ -3867,7 +4005,7 @@ def _main_inner() -> int:
             _keep_snapshot(snapshots, have, labelled, snap)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
-    _emit_json(snapshots, real_stdout)
+    emit_page(snapshots)
     _wait_for_credential_writes()
     # Non-daemon pool threads must not keep this process alive after JSON is out.
     os._exit(0)

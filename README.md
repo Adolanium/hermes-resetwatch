@@ -70,7 +70,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Grok:** Grok CLI
 - **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
 - **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Funded USD and CNY balances appear separately with their own top-up and granted amounts. An empty USD row does not hide CNY funds; currencies are never added or compared by amount. Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
-- **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly)
+- **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly). For more than one subscription, add consecutive `OPENCODE_GO_API_KEY_2`, `_3`, etc. Each distinct key gets its own numbered account card; duplicate keys are fetched once. Keep the numbers consecutive (a missing number ends discovery). Keys are never included in card labels or probe output.
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly; no exact reset time from the API)
 - **MiniMax:** `MINIMAX_API_KEY` (or `MINIMAX_CN_API_KEY`) in Hermes env (Token Plan 5h / weekly)
 - **Novita:** `NOVITA_API_KEY` in Hermes env (dollar balance)
@@ -123,7 +123,9 @@ Live data goes through the desktop plugin SDK (`host.request` JSON-RPC), plus `p
 
 **Heads up on Kimi and Grok.** Those vendors rotate refresh tokens. If Resetwatch and the CLI both refresh close together, one of them can get signed out and you will need to log into that CLI again. It is rare, it is harmless, and when Resetwatch did refresh a token the card says so. If you would rather it never happen, run the CLI once so its token is fresh before opening the page.
 
-It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached.
+It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached in the shared 5-minute result cache. Desktop paging writes a separate private, immutable snapshot for each invocation (including incomplete results). These page pins expire after 15 minutes and old pins are removed when a new one is made.
+
+The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop starts with `probe.py --pin-snapshot --slice=0:8`, receiving a random `snapshot_token` and up to eight rows / 3500 JSON characters. Every later page uses `--snapshot-token=TOKEN --slice=OFFSET:8`; pages only read that frozen result, never the shared cache or vendors. A missing, invalid, or expired pin fails that refresh instead of mixing in another result. A short page can mean the byte budget was reached, so Desktop advances by rows actually returned and stops on an empty page. The first page may use `--fresh`; later pages do not. A single oversized row becomes a visible error card with its account identity. Direct calls without `--slice` retain the original full-list output. Update the Desktop plugin and gateway probe together; an older probe does not speak the pin protocol.
 
 ## Compatibility
 
@@ -146,11 +148,13 @@ Run the profile tests with Python and Node.js. No packages need to be installed:
 ```sh
 python -m unittest test_profile_switch test_probe_runtime test_provider_controls
 node --test test_profile_routing.cjs
+python -m unittest test_opencode_go_multi test_probe_slicing
+node --test test_probe_pagination.cjs
 ```
 
 The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.
 
-The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` in the test environment for vendor response fixtures.
+The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` and `PyYAML` in the test environment for vendor response and secret-cache fixtures.
 
 ## License
 
