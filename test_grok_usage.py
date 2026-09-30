@@ -58,6 +58,18 @@ class GrokUsageTests(unittest.TestCase):
              patch.object(module, "_grok_access_context", return_value=context):
             return module._fetch_grok_account_usage()
 
+    def test_parse_helper_pins_unified_billing_zero_usage(self):
+        result = probe._parse_grok_billing(
+            UNIFIED_BILLING, {"subscription_tier_display": " SuperGrok "}, None
+        )
+        self.assertEqual(result["windows"][0]["used_percent"], 0.0)
+        self.assertEqual(result["windows"][0]["detail"], ZERO_USAGE)
+
+    def test_parse_helper_pins_no_meter_without_period(self):
+        result = probe._parse_grok_billing({"subscriptionTier": "SuperGrok"}, {}, None)
+        self.assertEqual(result["windows"][0]["detail"], "No metered limits on this plan")
+        self.assertIsNone(result["windows"][0]["used_percent"])
+
     def test_unified_billing_without_usage_reads_as_zero(self):
         for module in (probe, catalog_probe):
             with self.subTest(module=module.__name__):

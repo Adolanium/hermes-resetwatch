@@ -1206,6 +1206,10 @@ def _fetch_grok_account_usage() -> Optional[dict]:
             settings = {}
     if not isinstance(payload, dict):
         return None
+    return _parse_grok_billing(payload, settings, None)
+
+
+def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional[list[str]]) -> Optional[dict]:
     config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
     windows: list[dict] = []
     period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else None
@@ -1269,7 +1273,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         windows.append(
             _win(_grok_period_label(period), None, reset_at, "No metered limits on this plan")
         )
-    return _snapshot("grok", plan, windows)
+    return _snapshot("grok", plan, windows, notes)
 
 
 def _claude_home() -> Path:
