@@ -1213,7 +1213,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     used_pct = config.get("creditUsagePercent")
     limit = _grok_cent(config.get("monthlyLimit"))
     used = _grok_cent(config.get("used"))
-    if isinstance(used_pct, (int, float)) and math.isfinite(used_pct):
+    if not isinstance(used_pct, bool) and isinstance(used_pct, (int, float)) and math.isfinite(used_pct):
         windows.append(_win(_grok_period_label(period), max(0.0, min(100.0, float(used_pct))), reset_at))
     elif limit is not None and limit > 0 and used is not None:
         windows.append(
@@ -1224,10 +1224,11 @@ def _fetch_grok_account_usage() -> Optional[dict]:
                 f"${used / 100:.2f} of ${limit / 100:.2f} used",
             )
         )
-    elif period is not None:
-        # Grok leaves out creditUsagePercent until the period records usage.
+    elif period is not None or (limit is not None and limit > 0):
+        # Omitted usage may be zero or below a reporting floor. Neither the
+        # period nor a limit establishes how much has been used.
         windows.append(
-            _win(_grok_period_label(period), 0.0, reset_at, "No usage recorded yet this period")
+            _win(_grok_period_label(period), None, reset_at, "Usage unavailable")
         )
     products = config.get("productUsage")
     if isinstance(products, list):
@@ -1235,7 +1236,9 @@ def _fetch_grok_account_usage() -> Optional[dict]:
             if not isinstance(item, dict):
                 continue
             pct = item.get("usagePercent")
-            if not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+                if isinstance(item.get("product"), str) and item["product"].strip():
+                    windows.append(_win(_grok_product_label(item["product"]), None, reset_at, "Usage unavailable"))
                 continue
             windows.append(
                 _win(
@@ -1249,13 +1252,14 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         windows.append(_win("Prepaid", None, None, f"${prepaid / 100:.2f} left"))
     demand_cap = _grok_cent(config.get("onDemandCap"))
     demand_used = _grok_cent(config.get("onDemandUsed"))
-    if demand_cap is not None and demand_cap > 0 and demand_used is not None:
+    if demand_cap is not None and demand_cap > 0:
         windows.append(
             _win(
                 "On demand",
-                max(0.0, min(100.0, demand_used / float(demand_cap) * 100.0)),
+                None if demand_used is None else max(0.0, min(100.0, demand_used / float(demand_cap) * 100.0)),
                 reset_at,
-                f"${demand_used / 100:.2f} of ${demand_cap / 100:.2f} used",
+                f"Usage unavailable; ${demand_cap / 100:.2f} cap" if demand_used is None
+                else f"${demand_used / 100:.2f} of ${demand_cap / 100:.2f} used",
             )
         )
     plan = settings.get("subscription_tier_display") or payload.get("subscriptionTier")
@@ -1267,7 +1271,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         if not (plan or reset_at):
             return None
         windows.append(
-            _win(_grok_period_label(period), None, reset_at, "No metered limits on this plan")
+            _win(_grok_period_label(period), None, reset_at, "Usage unavailable")
         )
     return _snapshot("grok", plan, windows)
 
