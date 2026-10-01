@@ -169,6 +169,37 @@ test('used-only data can display either mode; unknown balances and errors never 
   }
 })
 
+test('Grok unknown usage keeps its plan and reset without a meter, while explicit zero displays in both modes', () => {
+  const app = load()
+  app.context.snapshots = [{
+    provider: 'grok', plan: 'SuperGrok', details: [],
+    windows: [
+      { label: 'Weekly', used_percent: null, remaining_percent: null,
+        reset_at: '2026-09-30T14:17:12.715439+00:00', detail: 'Usage unavailable' },
+      { label: 'Build', used_percent: 0, remaining_percent: 100,
+        reset_at: '2026-09-30T14:17:12.715439+00:00', detail: null }
+    ]
+  }]
+  const cards = vm.runInContext('cardsFromAccountSnapshots(snapshots)', app.context)
+  assert.equal(cards[0].provider, 'Grok (SuperGrok)')
+  assert.equal(cards[0].remaining, null)
+  assert.equal(cards[0].used, null)
+  assert.equal(cards[0].resetAt, '2026-09-30T14:17:12.715439+00:00')
+  for (const mode of ['remaining', 'used']) {
+    app.context.mode = mode
+    app.context.card = cards[0]
+    const unknown = vm.runInContext('saveDisplayMode(mode); LimitCard({card, nowMs: Date.parse("2026-09-23T14:17:12.715439+00:00")})', app.context)
+    assert.equal(unknown.props.children[0].props.children[0].props.children, 'Weekly')
+    assert.match(unknown.props.children[0].props.children[2].props.children, /^Resets in 7d 0h /)
+    assert.equal(unknown.props.children[0].props.children[3].props.children, 'Usage unavailable')
+    assert.equal(unknown.props.children[1], null)
+    app.context.card = cards[1]
+    const zero = vm.runInContext('LimitCard({card, nowMs: 0})', app.context)
+    assert.equal(zero.props.children[1].props.children[1].props.children,
+      mode === 'used' ? '0% used' : '100% left')
+  }
+})
+
 test('provider controls persist toggles and order, filter cached cards, and route filtered fetches', async () => {
   const app = load()
   const saved = new Map()
