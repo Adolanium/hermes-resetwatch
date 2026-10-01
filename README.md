@@ -292,6 +292,6 @@ continue to use the existing root files.
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.19` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.20` and are not marked as the latest standalone release.
 
 The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort.
