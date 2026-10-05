@@ -44,12 +44,14 @@ It does not scrape vendor websites. Live rows come from Hermes OAuth plus the sa
 - If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
 - Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
 - Codex extra limits like Spark show up when that account has them.
-- Vendor fetches run in parallel with a time budget, so one slow API cannot wipe the page.
+- Vendor fetches run in parallel with a time budget that ends before the gateway's 30-second `shell.exec` limit, so one slow API cannot wipe the page.
 - Tokens never go to stdout.
 
 Open **Providers and order** to turn individual providers off or move them up and down. Disabled providers are hidden and skipped by future fetches; an already-running refresh may finish. The controls also list providers with no current login, so you can enable them later. **Reset providers** restores all providers and the original order. Manual clocks are unaffected.
 
 Choose **Remaining %** (the default) or **Used %** in the page header. Resetwatch remembers your choice and applies it to live quota rows and manual clocks; each meter fills to match its displayed percentage. Warning colors still indicate low remaining quota in either mode. Manual clock forms continue to accept the percentage remaining, and credit balances keep their original units.
+
+When Grok omits usage, its card keeps the available plan and reset time with "Usage unavailable" and no percentage or meter. A missing value does not establish zero usage or an unmetered plan. Explicit zero usage still shows 0% used or 100% left.
 
 These preferences are saved in this Desktop installation and apply across its connections and profiles. Changing order does not fetch again. Changing the enabled providers starts a query for that selection; cached results from a different selection are not reused. While any provider is disabled, Resetwatch uses individual probe fetchers instead of the gateway's broad `account.usage` and `/usage` calls, which cannot guarantee skipping a provider. Gateway-only providers outside the probe's supported list are unavailable in this mode. Nous still uses its own usage RPCs when enabled.
 

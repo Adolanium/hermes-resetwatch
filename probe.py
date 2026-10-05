@@ -76,6 +76,14 @@ PAGE_PIN_SECONDS = 15 * 60
 # Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
 # need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
+# Desktop runs this probe through the gateway's shell.exec, which kills the
+# process after 30 seconds and returns no output at all. The vendor wait ends
+# early enough to leave EXIT_RESERVE_SECONDS for pending writes and the JSON,
+# so a slow vendor costs its own card instead of the whole page.
+SHELL_EXEC_TIMEOUT_SECONDS = 30
+EXIT_RESERVE_SECONDS = 8
+# Carries the first start time across the gateway-runtime re-exec.
+_STARTED_AT_ENV = "RESETWATCH_PROBE_STARTED_AT"
 HTTP_TIMEOUT = 8.0
 CURSOR_CLI_TIMEOUT = 8
 # Anthropic usage cache: short when falling back without a live token,
@@ -86,6 +94,25 @@ MINIMAX_HTTP_TIMEOUT = 5.0
 # Credential write grace: wait briefly before os._exit so a finishing
 # Kimi/Grok refresh can land on disk.
 CREDENTIAL_WRITE_GRACE_SECONDS = 5.0
+
+
+def _process_started_at() -> float:
+    now = time.time()
+    try:
+        inherited = float(os.environ.get(_STARTED_AT_ENV, ""))
+    except ValueError:
+        return now
+    # Trust only a handoff from this probe's own re-exec moments ago.
+    return inherited if now - SHELL_EXEC_TIMEOUT_SECONDS <= inherited <= now else now
+
+
+_STARTED_AT = _process_started_at()
+
+
+def _seconds_left() -> float:
+    """Seconds until shell.exec would kill this probe, counted from the first start."""
+    return _STARTED_AT + SHELL_EXEC_TIMEOUT_SECONDS - time.time()
+
 
 _refresh_writes = 0
 _refresh_writes_lock = threading.Lock()
@@ -1550,7 +1577,7 @@ def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional
     used_pct = config.get("creditUsagePercent")
     limit = _grok_cent(config.get("monthlyLimit"))
     used = _grok_cent(config.get("used"))
-    if isinstance(used_pct, (int, float)) and math.isfinite(used_pct):
+    if not isinstance(used_pct, bool) and isinstance(used_pct, (int, float)) and math.isfinite(used_pct):
         windows.append(_win(_grok_period_label(period), max(0.0, min(100.0, float(used_pct))), reset_at))
     elif limit is not None and limit > 0 and used is not None:
         windows.append(
@@ -1561,10 +1588,11 @@ def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional
                 f"${used / 100:.2f} of ${limit / 100:.2f} used",
             )
         )
-    elif period is not None:
-        # Grok leaves out creditUsagePercent until the period records usage.
+    elif period is not None or (limit is not None and limit > 0):
+        # Omitted usage may be zero or below a reporting floor. Neither the
+        # period nor a limit establishes how much has been used.
         windows.append(
-            _win(_grok_period_label(period), 0.0, reset_at, "No usage recorded yet this period")
+            _win(_grok_period_label(period), None, reset_at, "Usage unavailable")
         )
     products = config.get("productUsage")
     if isinstance(products, list):
@@ -1572,7 +1600,9 @@ def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional
             if not isinstance(item, dict):
                 continue
             pct = item.get("usagePercent")
-            if not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+                if isinstance(item.get("product"), str) and item["product"].strip():
+                    windows.append(_win(_grok_product_label(item["product"]), None, reset_at, "Usage unavailable"))
                 continue
             windows.append(
                 _win(
@@ -1586,13 +1616,14 @@ def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional
         windows.append(_win("Prepaid", None, None, f"${prepaid / 100:.2f} left"))
     demand_cap = _grok_cent(config.get("onDemandCap"))
     demand_used = _grok_cent(config.get("onDemandUsed"))
-    if demand_cap is not None and demand_cap > 0 and demand_used is not None:
+    if demand_cap is not None and demand_cap > 0:
         windows.append(
             _win(
                 "On demand",
-                max(0.0, min(100.0, demand_used / float(demand_cap) * 100.0)),
+                None if demand_used is None else max(0.0, min(100.0, demand_used / float(demand_cap) * 100.0)),
                 reset_at,
-                f"${demand_used / 100:.2f} of ${demand_cap / 100:.2f} used",
+                f"Usage unavailable; ${demand_cap / 100:.2f} cap" if demand_used is None
+                else f"${demand_used / 100:.2f} of ${demand_cap / 100:.2f} used",
             )
         )
     plan = settings.get("subscription_tier_display") or payload.get("subscriptionTier")
@@ -1604,7 +1635,7 @@ def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional
         if not (plan or reset_at):
             return None
         windows.append(
-            _win(_grok_period_label(period), None, reset_at, "No metered limits on this plan")
+            _win(_grok_period_label(period), None, reset_at, "Usage unavailable")
         )
     return _snapshot("grok", plan, windows, notes)
 
@@ -3744,7 +3775,8 @@ def _collect_cli() -> tuple[list[dict], bool]:
     try:
         futures = {pool.submit(item[3]): index for index, item in enumerate(fetchers)}
         pending = set(futures)
-        deadline = time.monotonic() + PROBE_TOTAL_BUDGET_SECONDS
+        budget = min(PROBE_TOTAL_BUDGET_SECONDS, _seconds_left() - EXIT_RESERVE_SECONDS)
+        deadline = time.monotonic() + budget
         while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -3773,7 +3805,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
                 fut.cancel()
                 # Cancel only works if the thread never started. Either way the
                 # vendor gave nothing in time; show that rather than nothing.
-                _failed(futures[fut], f"no reply within {PROBE_TOTAL_BUDGET_SECONDS}s")
+                _failed(futures[fut], f"no reply within {max(0, int(budget))}s")
     finally:
         try:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -3932,6 +3964,7 @@ def _use_gateway_python() -> None:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=min(3, remaining),
             )
             if checked.returncode == 0:
+                os.environ[_STARTED_AT_ENV] = repr(_STARTED_AT)
                 os.execv(executable, [executable, str(Path(__file__).absolute()), *sys.argv[1:]])
         except (OSError, subprocess.TimeoutExpired):
             continue
