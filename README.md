@@ -14,7 +14,7 @@
 
   <br /><br />
 
-  [See the cards](#whats-left-on-one-page) &nbsp;·&nbsp; [Install it](#make-it-yours) &nbsp;·&nbsp; [Where the numbers come from](#where-the-numbers-come-from)
+  [Quick usage popup](#quick-usage-without-leaving-chat) &nbsp;·&nbsp; [See the cards](#whats-left-on-one-page) &nbsp;·&nbsp; [Install it](#make-it-yours) &nbsp;·&nbsp; [Where the numbers come from](#where-the-numbers-come-from)
 
 </div>
 
@@ -26,6 +26,23 @@ Resetwatch is a community plugin for [Hermes Desktop](https://github.com/NousRes
 
 Copy two files and open the page.
 
+## Quick usage without leaving chat
+
+Click **Usage** in the bottom-right status bar to open a compact popup above it. Circular meters show each provider's quota, with **Remaining %** or **Used %** and the existing countdown plus local reset date/time. The full page remains available for provider controls and manual clocks.
+
+<img src="assets/usage-button.png" width="102" alt="Usage button in the Hermes Desktop status bar" />
+
+<img src="assets/usage-popup.png" width="363" alt="ResetWatch status-bar popup with provider quota rings and reset clocks; account identifiers redacted" />
+
+*Real Hermes Desktop capture from the locally tested prototype. Its labels are in Thai; this contribution uses the repository's English UI copy. Images are cropped to exclude chats and other sessions, and account identifiers are redacted. Numbers and reset times are preserved from the capture, not mock values.*
+
+- The status-bar widget loads usage in the background every five minutes. Opening the popup does not start another refresh or change the chat route.
+- The full page and popup share one query per connection, profile, and enabled-provider selection, including across chat tabs.
+- The latest successful display snapshot is saved locally and shown immediately after a reload. Data older than 24 hours or belonging to another connection/profile/selection is not reused.
+- **Checked** means the last completed check, not a guarantee that every vendor returned a newly fetched response. Offline and stale cache are labeled. Unknown percentages stay unknown.
+- **Refresh** keeps the existing one-minute floor, shared across the popup and full page.
+- Older Desktop SDKs without Popover support keep the original full page and do not register a broken status-bar button.
+
 ## What's left, on one page
 
 Most usage pages live on a vendor site you have to remember to open. Resetwatch puts the bars in Hermes.
@@ -33,13 +50,13 @@ Most usage pages live on a vendor site you have to remember to open. Resetwatch 
 | | |
 | --- | --- |
 | **Live cards**<br />Nous, Claude, Codex, Cursor, and the rest fill themselves from logins already on this machine. Each card is one window: how full it is, how much is left, and when it resets. | **Plan names**<br />Claude shows Pro, Max, Max 5x, or Max 20x. Codex shows Plus. Cursor shows Ultra, or whatever that app is on. Kimi shows Advanced. GLM shows Lite, Pro, or Max. Nous shows the portal plan, not a bare Plus. |
-| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R. Not a HUD, not a chip, not a side pane. Click a section name to fold it. They start open, and they remember. |
+| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page plus quick usage**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R still open the full page. The bottom-right Usage button opens the compact popup. Click a page section name to fold it. They start open, and they remember. |
 
 It does not scrape vendor websites. Live rows come from Hermes OAuth plus the same CLI and app logins those vendors already use. Nothing leaves this machine except the usage calls those apps already make for you.
 
 ## Leave it open
 
-- Live cards refresh every 5 minutes while the page is open.
+- Live cards refresh every 5 minutes while the status-bar widget is mounted, even when the full page is closed.
 - Probe results are cached for 5 minutes. Refresh skips that cache, with a one-minute floor so repeated clicks do not hammer vendor APIs.
 - If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
 - Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
@@ -152,6 +169,8 @@ python -m unittest test_profile_switch test_probe_runtime test_provider_controls
 node --test test_profile_routing.cjs
 python -m unittest test_opencode_go_multi test_probe_slicing
 node --test test_probe_pagination.cjs
+node --test test_quick_usage.cjs
+HERMES_TEST_CATALOG=1 node --test test_quick_usage.cjs
 ```
 
 The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.

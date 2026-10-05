@@ -439,7 +439,7 @@ test('an old refresh writes only to its own profile cache', async () => {
   const result = { cards: [{ id: 'alpha' }], errors: [] }
   finish(result)
   await pending
-  assert.equal(JSON.stringify(app.cacheWrites[0].key), JSON.stringify(['resetwatch', 'live', 'one', 'alpha', 'same-session']))
+  assert.equal(JSON.stringify(app.cacheWrites[0].key), JSON.stringify(['resetwatch', 'live', 'one', 'alpha', '']))
   assert.equal(app.renderHook('open', 'same-session', 'two', 'beta').data, undefined)
 })
 
