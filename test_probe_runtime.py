@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -96,6 +97,50 @@ class ProbeRuntimeTests(unittest.TestCase):
                         probe._use_gateway_python()
                     replace.assert_called_once_with("/custom/venv/bin/python3", ["/custom/venv/bin/python3", str(Path(probe.__file__).absolute()), *flags[1:]])
                     self.assertTrue(all(call.kwargs["timeout"] <= 3 for call in check.call_args_list))
+
+    def test_vendor_wait_ends_before_the_gateway_shell_limit(self):
+        # shell.exec kills the probe at 30 s and returns no output, so a slow
+        # vendor must cost its own card, not the whole page.
+        for source, probe in probes():
+            release = threading.Event()
+            started_ago = probe.SHELL_EXEC_TIMEOUT_SECONDS - probe.EXIT_RESERVE_SECONDS - 0.3
+            others = set(probe.LIVE_PROVIDERS) - {"anthropic"}
+            with self.subTest(source=source), \
+                 patch.object(probe, "_STARTED_AT", time.time() - started_ago, create=True), \
+                 patch.object(probe, "_disabled_providers", others), \
+                 patch.object(probe, "_fetch_claude_accounts_usage", side_effect=lambda: release.wait(10)):
+                try:
+                    began = time.monotonic()
+                    snapshots, complete = probe._collect_cli()
+                    elapsed = time.monotonic() - began
+                finally:
+                    release.set()
+                self.assertLess(elapsed, 2)
+                self.assertFalse(complete)
+                self.assertEqual([snap["provider"] for snap in snapshots], ["anthropic"])
+                self.assertIn("no reply", snapshots[0]["error"])
+
+    def test_reexec_keeps_the_first_start_time_and_ignores_stale_values(self):
+        class ReplacedProcess(BaseException):
+            pass
+
+        for source, probe in probes():
+            with self.subTest(source=source), patch.dict(os.environ), \
+                 patch.object(probe, "_STARTED_AT", time.time() - 6, create=True), \
+                 patch.object(probe, "_gateway_python_candidates", return_value=["/gateway/python"]), \
+                 patch.object(probe.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(probe.os, "execv", side_effect=ReplacedProcess):
+                with self.assertRaises(ReplacedProcess):
+                    probe._use_gateway_python()
+                parent_start = probe._STARTED_AT
+                replaced = dict(probes())[source]
+                self.assertAlmostEqual(replaced._STARTED_AT, parent_start, places=3)
+                self.assertLess(replaced._seconds_left(), probe.SHELL_EXEC_TIMEOUT_SECONDS - 5)
+
+            for stale in (str(time.time() - 3600), str(time.time() + 3600), "not-a-time"):
+                with self.subTest(source=source, stale=stale), patch.dict(os.environ, {"RESETWATCH_PROBE_STARTED_AT": stale}):
+                    fresh = dict(probes())[source]
+                    self.assertGreater(fresh._seconds_left(), probe.SHELL_EXEC_TIMEOUT_SECONDS - 1)
 
     def test_current_python_without_httpx_does_not_hide_gateway_candidate(self):
         for source, probe in probes():

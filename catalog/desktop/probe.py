@@ -46,6 +46,14 @@ PAGE_PIN_SECONDS = 15 * 60
 # Hard ceiling for collecting vendor fetchers (parallel). Hung sockets still
 # need per-request timeouts below; this only bounds how long we wait for results.
 PROBE_TOTAL_BUDGET_SECONDS = 45
+# Desktop runs this probe through the gateway's shell.exec, which kills the
+# process after 30 seconds and returns no output at all. The vendor wait ends
+# early enough to leave EXIT_RESERVE_SECONDS for pending writes and the JSON,
+# so a slow vendor costs its own card instead of the whole page.
+SHELL_EXEC_TIMEOUT_SECONDS = 30
+EXIT_RESERVE_SECONDS = 8
+# Carries the first start time across the gateway-runtime re-exec.
+_STARTED_AT_ENV = "RESETWATCH_PROBE_STARTED_AT"
 HTTP_TIMEOUT = 8.0
 CURSOR_CLI_TIMEOUT = 8
 # Anthropic usage cache: short when falling back without a live token,
@@ -53,6 +61,25 @@ CURSOR_CLI_TIMEOUT = 8
 ANTHROPIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 ANTHROPIC_CACHE_FALLBACK_AGE_SECONDS = 15 * 60
 MINIMAX_HTTP_TIMEOUT = 5.0
+
+
+def _process_started_at() -> float:
+    now = time.time()
+    try:
+        inherited = float(os.environ.get(_STARTED_AT_ENV, ""))
+    except ValueError:
+        return now
+    # Trust only a handoff from this probe's own re-exec moments ago.
+    return inherited if now - SHELL_EXEC_TIMEOUT_SECONDS <= inherited <= now else now
+
+
+_STARTED_AT = _process_started_at()
+
+
+def _seconds_left() -> float:
+    """Seconds until shell.exec would kill this probe, counted from the first start."""
+    return _STARTED_AT + SHELL_EXEC_TIMEOUT_SECONDS - time.time()
+
 
 # Set only for --profile. Calls without it keep the existing lookup rules.
 _profile_home: Optional[Path] = None
@@ -3411,7 +3438,8 @@ def _collect_cli() -> tuple[list[dict], bool]:
     try:
         futures = {pool.submit(item[3]): index for index, item in enumerate(fetchers)}
         pending = set(futures)
-        deadline = time.monotonic() + PROBE_TOTAL_BUDGET_SECONDS
+        budget = min(PROBE_TOTAL_BUDGET_SECONDS, _seconds_left() - EXIT_RESERVE_SECONDS)
+        deadline = time.monotonic() + budget
         while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -3440,7 +3468,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
                 fut.cancel()
                 # Cancel only works if the thread never started. Either way the
                 # vendor gave nothing in time; show that rather than nothing.
-                _failed(futures[fut], f"no reply within {PROBE_TOTAL_BUDGET_SECONDS}s")
+                _failed(futures[fut], f"no reply within {max(0, int(budget))}s")
     finally:
         try:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -3599,6 +3627,7 @@ def _use_gateway_python() -> None:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=min(3, remaining),
             )
             if checked.returncode == 0:
+                os.environ[_STARTED_AT_ENV] = repr(_STARTED_AT)
                 os.execv(executable, [executable, str(Path(__file__).absolute()), *sys.argv[1:]])
         except (OSError, subprocess.TimeoutExpired):
             continue

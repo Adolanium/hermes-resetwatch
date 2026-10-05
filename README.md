@@ -44,7 +44,7 @@ It does not scrape vendor websites. Live rows come from Hermes OAuth plus the sa
 - If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
 - Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
 - Codex extra limits like Spark show up when that account has them.
-- Vendor fetches run in parallel with a time budget, so one slow API cannot wipe the page.
+- Vendor fetches run in parallel with a time budget that ends before the gateway's 30-second `shell.exec` limit, so one slow API cannot wipe the page.
 - Tokens never go to stdout.
 
 Open **Providers and order** to turn individual providers off or move them up and down. Disabled providers are hidden and skipped by future fetches; an already-running refresh may finish. The controls also list providers with no current login, so you can enable them later. **Reset providers** restores all providers and the original order. Manual clocks are unaffected.
