@@ -112,11 +112,12 @@ class ProbeRuntimeTests(unittest.TestCase):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 home = root / ".hermes"
-                bare = home / "tools" / "python-3.14.7" / "bin" / "python3"
+                # /proc argv[0] is a POSIX path; a temp path would be C:\... on Windows.
+                bare = "/home/user/.hermes/tools/python-3.14.7/bin/python3"
                 proc = root / "proc"
                 folder = proc / "20"
                 folder.mkdir(parents=True)
-                (folder / "cmdline").write_bytes(str(bare).encode() + b"\0-I\0-c\0launcher")
+                (folder / "cmdline").write_bytes(bare.encode() + b"\0-I\0-c\0launcher")
                 (folder / "status").write_text("PPid:\t0\n")
                 active = make_install_venv(probe, home, "a1b2", "f2cc", mtime=1_000)
                 stale = make_install_venv(probe, home, "a1b2", "0ld0", mtime=2_000)
@@ -124,7 +125,7 @@ class ProbeRuntimeTests(unittest.TestCase):
                 with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=20), \
                      patch.object(probe, "_hermes_homes", return_value=[home]):
                     self.assertEqual(probe._gateway_python_candidates(proc),
-                                     [str(bare), interpreter(probe, active), interpreter(probe, stale)])
+                                     [bare, interpreter(probe, active), interpreter(probe, stale)])
 
     def test_dependency_venvs_without_facts_are_tried_newest_first(self):
         for source, probe in probes():
