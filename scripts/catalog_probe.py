@@ -49,7 +49,7 @@ def readonly_probe(source):
                 if vendor == "Kimi":
                     replacement = replacement[:replacement.index('    note = _vendor_refresh_note')] + '    return snap\n'
                 else:
-                    replacement = replacement[:replacement.index('    note = _vendor_refresh_note')] + '    return _snapshot("grok", plan, windows)\n'
+                    replacement = replacement[:replacement.index('    note = _vendor_refresh_note')] + '    return _parse_grok_billing(payload, settings, None)\n'
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             names = {target.id for target in targets if isinstance(target, ast.Name)}
