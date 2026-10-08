@@ -112,7 +112,8 @@ DEEPSEEK_PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
 
 OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 
-OLLAMA_CLOUD_USAGE_URL = "https://ollama.com/api/usage"
+# https://docs.ollama.com/api/balance
+OLLAMA_CLOUD_BALANCE_URL = "https://ollama.com/api/balance"
 OLLAMA_CLOUD_ME_URL = "https://ollama.com/api/me"
 
 MINIMAX_TOKEN_PLAN_URLS = (
@@ -2714,13 +2715,10 @@ def _ollama_api_key() -> Optional[str]:
     return _hermes_env_value("OLLAMA_API_KEY")
 
 
-def _ollama_used_percent(value: Any) -> Optional[float]:
-    """Ollama Cloud limits.usage is a 0-1 fraction. Do not also accept 0-100."""
-    if isinstance(value, bool):
+def _ollama_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= float(value) <= 1.0:
-        return max(0.0, min(100.0, float(value) * 100.0))
-    return None
+    return float(value)
 
 
 def _ollama_plan_name(payload: Optional[dict]) -> Optional[str]:
@@ -2734,11 +2732,7 @@ def _ollama_plan_name(payload: Optional[dict]) -> Optional[str]:
 
 
 def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
-    """Ollama Cloud session/weekly from GET /api/usage (Hermes OLLAMA_API_KEY).
-
-    Undocumented private endpoint the web settings page uses. Best-effort;
-    no reset timestamps in the payload (session ~5h, weekly ~7d on pricing).
-    """
+    """Ollama Cloud included and purchased credits from GET /api/balance (Hermes OLLAMA_API_KEY)."""
     token = _ollama_api_key()
     if not token:
         return None
@@ -2765,35 +2759,51 @@ def _fetch_ollama_cloud_account_usage() -> Optional[dict]:
                 plan = _ollama_plan_name(body if isinstance(body, dict) else None)
         except Exception:
             plan = None
-        response = client.get(OLLAMA_CLOUD_USAGE_URL, headers=headers)
+        response = client.get(OLLAMA_CLOUD_BALANCE_URL, headers=headers)
         response.raise_for_status()
         payload = response.json() or {}
     if not isinstance(payload, dict):
-        return None
-    limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+        raise ValueError("balance API returned a non-object body")
+    return _parse_ollama_balance(payload, plan)
+
+
+def _parse_ollama_balance(payload: dict, plan: Optional[str]) -> Optional[dict]:
+    included = payload.get("included") if isinstance(payload.get("included"), dict) else {}
     windows: list[dict] = []
-    for key, label, hint in (
-        ("session", "5h", "resets about every 5h"),
-        ("weekly", "Weekly", "resets about every 7 days"),
-    ):
-        item = limits.get(key) if isinstance(limits, dict) else None
+    # Plans with session and weekly limits report remaining percent (0-100).
+    for key, label in (("session", "5h"), ("weekly", "Weekly")):
+        item = included.get(key)
         if not isinstance(item, dict):
             continue
-        used = _ollama_used_percent(item.get("usage"))
-        if used is None:
+        remaining = _ollama_number(item.get("remaining_percent"))
+        if remaining is None or not 0.0 <= remaining <= 100.0:
             continue
-        windows.append(_win(label, used, None, hint))
-    activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
-    cost = activity.get("cost") if isinstance(activity, dict) else None
-    if isinstance(cost, str) and cost.strip():
-        text = cost.strip()
-        if text[:1].isdigit():
-            text = f"${text}"
-        windows.append(_win("Activity", None, None, f"{text} last 4 weeks"))
-    elif isinstance(cost, (int, float)) and math.isfinite(cost):
-        windows.append(_win("Activity", None, None, f"${float(cost):.5f} last 4 weeks"))
+        windows.append(_win(label, 100.0 - remaining, _parse_dt(item.get("resets_at"))))
+    # Other plans get a USD allowance for the monthly billing period.
+    balance = _ollama_number(included.get("balance_usd"))
+    allowance = _ollama_number(included.get("allowance_usd"))
+    has_allowance = balance is not None and allowance is not None
+    if has_allowance and allowance > 0:
+        period = included.get("period") if isinstance(included.get("period"), dict) else {}
+        used = max(0.0, allowance - balance)
+        windows.append(
+            _win(
+                "Monthly",
+                min(100.0, used * 100.0 / allowance),
+                _parse_dt(period.get("until")),
+                f"${used:.2f} of ${allowance:.2f} used",
+            )
+        )
+    purchased = payload.get("purchased") if isinstance(payload.get("purchased"), dict) else {}
+    bought = _ollama_number(purchased.get("balance_usd"))
+    if bought is not None and bought > 0:
+        windows.append(_win("Purchased", None, None, f"${bought:.2f} left"))
     if not windows:
-        return None
+        if has_allowance:
+            # No included allowance and no purchased credits to track.
+            return None
+        # Say so when the response shape changes instead of hiding the card.
+        raise ValueError("balance API returned no included or purchased credits")
     return _snapshot("ollama", plan, windows)
 
 
