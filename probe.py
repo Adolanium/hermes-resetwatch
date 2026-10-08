@@ -3913,6 +3913,51 @@ def _resolve_profile_home(name: str, here: Optional[Path] = None) -> Optional[Pa
     return candidate.resolve() if candidate.is_dir() else None
 
 
+def _hermes_install_pythons() -> list[str]:
+    """Interpreters of installer-managed Hermes dependency environments, active first.
+
+    The default installer starts the gateway on a bare bundled interpreter
+    (``~/.hermes/tools/python-*/bin/python3 -I``), so neither its argv[0] nor a
+    ``python3`` on the gateway's PATH imports httpx. Its packages live in a
+    generated venv, ``<HERMES_HOME>/installs/<id>/environments/<hash>/venv``,
+    whose hash changes on every update. ``installs/<id>/facts.json`` names the
+    active one (``packages.venv.environment``). Other environments follow,
+    newest first, for an install whose facts are missing or unreadable. Named
+    profiles live under ``<base>/profiles/<name>``; installs stay in the base.
+    """
+    interpreter = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+    roots: list[Path] = []
+    for home in _hermes_homes():
+        roots.append(home)
+        if home.parent.name == "profiles":
+            roots.append(home.parent.parent)
+    active: list[str] = []
+    others: list[tuple[float, str]] = []
+    for root in dict.fromkeys(roots):
+        installs = root / "installs"
+        try:
+            if not installs.is_dir():
+                continue
+            facts_files = sorted(installs.glob("*/facts.json"))
+            venvs = list(installs.glob("*/environments/*/venv"))
+        except OSError:
+            continue
+        for facts in facts_files:
+            try:
+                environment = json.loads(facts.read_text(encoding="utf-8"))["packages"]["venv"]["environment"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if isinstance(environment, str) and Path(environment).is_absolute():
+                active.append(str(Path(environment) / interpreter))
+        for venv in venvs:
+            try:
+                others.append(((venv / "pyvenv.cfg").stat().st_mtime, str(venv / interpreter)))
+            except OSError:
+                continue
+    ordered = active + [path for _, path in sorted(others, reverse=True)]
+    return [path for path in dict.fromkeys(ordered) if Path(path).is_file()]
+
+
 def _gateway_python_candidates(proc_root: Path = Path("/proc")) -> list[str]:
     """Discover on this backend, without resolving venv interpreter symlinks.
 
@@ -3920,7 +3965,9 @@ def _gateway_python_candidates(proc_root: Path = Path("/proc")) -> list[str]:
     ancestors, reading argv[0] (never returning or logging command arguments).
     /proc/<pid>/exe would lose the venv by resolving to the system binary.
     Other platforms and restricted proc mounts retain the environment and
-    Desktop's existing home/PATH fallbacks.
+    Desktop's existing home/PATH fallbacks. A gateway from the default
+    installer runs a bare bundled interpreter; its dependency venv comes last,
+    from the installer's own records (``_hermes_install_pythons``).
     """
     candidates: list[str] = []
     explicit = os.environ.get("HERMES_PYTHON", "").strip()
@@ -3947,6 +3994,7 @@ def _gateway_python_candidates(proc_root: Path = Path("/proc")) -> list[str]:
             pid = int(parent.group(1))
         except (OSError, ValueError):
             break
+    candidates.extend(_hermes_install_pythons())
     return list(dict.fromkeys(candidates))
 
 

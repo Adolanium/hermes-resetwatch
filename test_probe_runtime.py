@@ -23,6 +23,26 @@ def probes():
 MISSING = {"provider": "resetwatch", "details": ["probe cannot import httpx: No module named 'httpx'"]}
 
 
+def interpreter(probe, venv):
+    return str(venv / ("Scripts/python.exe" if probe.os.name == "nt" else "bin/python"))
+
+
+def make_install_venv(probe, home, install_id, environment, *, mtime):
+    """A dependency venv laid out like the default Hermes installer's."""
+    venv = home / "installs" / install_id / "environments" / environment / "venv"
+    python = Path(interpreter(probe, venv))
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    (venv / "pyvenv.cfg").write_text("home = /bundled/python/bin\n")
+    os.utime(venv / "pyvenv.cfg", (mtime, mtime))
+    return venv
+
+
+def write_facts(home, install_id, venv):
+    facts = {"schema": 1, "packages": {"venv": {"environment": str(venv), "extras": ["all"]}}}
+    (home / "installs" / install_id / "facts.json").write_text(json.dumps(facts))
+
+
 class ProbeRuntimeTests(unittest.TestCase):
     def test_dependency_failure_is_not_a_complete_collection(self):
         for source, probe in probes():
@@ -62,14 +82,16 @@ class ProbeRuntimeTests(unittest.TestCase):
                     folder.mkdir()
                     (folder / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv))
                     (folder / "status").write_text(f"Name:\tprocess\nPPid:\t{parent}\n")
-                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=30):
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=30), \
+                     patch.object(probe, "_hermes_homes", return_value=[]):
                     self.assertEqual(probe._gateway_python_candidates(proc), ["/opt/custom install/venv/bin/python3"])
 
     def test_backend_overrides_and_missing_proc(self):
         for source, probe in probes():
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
                 runtime = str(Path(tmp) / "custom python")
-                with patch.dict(os.environ, {"HERMES_PYTHON": runtime}, clear=True):
+                with patch.dict(os.environ, {"HERMES_PYTHON": runtime}, clear=True), \
+                     patch.object(probe, "_hermes_homes", return_value=[]):
                     self.assertEqual(probe._gateway_python_candidates(Path(tmp)), [runtime])
 
     def test_container_gateway_at_pid_one_is_discovered(self):
@@ -79,8 +101,76 @@ class ProbeRuntimeTests(unittest.TestCase):
                 folder.mkdir()
                 (folder / "cmdline").write_bytes(b"/usr/local/lib/hermes-agent/venv/bin/python3\0-m\0tui_gateway")
                 (folder / "status").write_text("PPid:\t0\n")
-                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=1):
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=1), \
+                     patch.object(probe, "_hermes_homes", return_value=[]):
                     self.assertEqual(probe._gateway_python_candidates(Path(tmp)), ["/usr/local/lib/hermes-agent/venv/bin/python3"])
+
+    def test_default_installer_venv_comes_from_install_facts(self):
+        # The default installer runs the gateway on a bare bundled interpreter
+        # and keeps httpx in a generated venv that facts.json names (#35).
+        for source, probe in probes():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                home = root / ".hermes"
+                bare = home / "tools" / "python-3.14.7" / "bin" / "python3"
+                proc = root / "proc"
+                folder = proc / "20"
+                folder.mkdir(parents=True)
+                (folder / "cmdline").write_bytes(str(bare).encode() + b"\0-I\0-c\0launcher")
+                (folder / "status").write_text("PPid:\t0\n")
+                active = make_install_venv(probe, home, "a1b2", "f2cc", mtime=1_000)
+                stale = make_install_venv(probe, home, "a1b2", "0ld0", mtime=2_000)
+                write_facts(home, "a1b2", active)
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=20), \
+                     patch.object(probe, "_hermes_homes", return_value=[home]):
+                    self.assertEqual(probe._gateway_python_candidates(proc),
+                                     [str(bare), interpreter(probe, active), interpreter(probe, stale)])
+
+    def test_dependency_venvs_without_facts_are_tried_newest_first(self):
+        for source, probe in probes():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".hermes"
+                older = make_install_venv(probe, home, "a1b2", "1111", mtime=1_000)
+                newer = make_install_venv(probe, home, "a1b2", "2222", mtime=2_000)
+                broken = make_install_venv(probe, home, "a1b2", "3333", mtime=3_000)
+                Path(interpreter(probe, broken)).unlink()
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=0), \
+                     patch.object(probe, "_hermes_homes", return_value=[home]):
+                    self.assertEqual(probe._gateway_python_candidates(Path(tmp) / "proc"),
+                                     [interpreter(probe, newer), interpreter(probe, older)])
+
+    def test_named_profile_home_uses_the_base_installs(self):
+        for source, probe in probes():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp) / ".hermes"
+                active = make_install_venv(probe, base, "a1b2", "f2cc", mtime=1_000)
+                write_facts(base, "a1b2", active)
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=0), \
+                     patch.object(probe, "_hermes_homes", return_value=[base / "profiles" / "work"]):
+                    self.assertEqual(probe._gateway_python_candidates(Path(tmp) / "proc"), [interpreter(probe, active)])
+
+    def test_gateway_runtime_reexecs_from_bare_interpreter_into_installer_venv(self):
+        class ReplacedProcess(BaseException):
+            pass
+
+        for source, probe in probes():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".hermes"
+                active = make_install_venv(probe, home, "a1b2", "f2cc", mtime=1_000)
+                write_facts(home, "a1b2", active)
+                flags = [source, "--profile", "default", "--pin-snapshot", "--slice=0:8"]
+                with patch.dict(os.environ, {}, clear=True), patch.object(probe.os, "getppid", return_value=0), \
+                     patch.object(probe, "_hermes_homes", return_value=[home]), \
+                     patch.object(probe.sys, "argv", flags), \
+                     patch.dict("sys.modules", {"httpx": None}), \
+                     patch.object(probe.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as check, \
+                     patch.object(probe.os, "execv", side_effect=ReplacedProcess) as replace:
+                    with self.assertRaises(ReplacedProcess):
+                        probe._use_gateway_python()
+                    self.assertEqual(check.call_args.args[0], [interpreter(probe, active), "-c", "import httpx"])
+                    replace.assert_called_once_with(
+                        interpreter(probe, active),
+                        [interpreter(probe, active), str(Path(probe.__file__).absolute()), *flags[1:]])
 
     def test_failed_candidates_fall_back_and_reexec_preserves_profile_flags(self):
         class ReplacedProcess(BaseException):
