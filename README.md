@@ -33,13 +33,13 @@ Most usage pages live on a vendor site you have to remember to open. Resetwatch 
 | | |
 | --- | --- |
 | **Live cards**<br />Nous, Claude, Codex, Cursor, and the rest fill themselves from logins already on this machine. Each card is one window: how full it is, how much is left, and when it resets. | **Plan names**<br />Claude shows Pro, Max, Max 5x, or Max 20x. Codex shows Plus. Cursor shows Ultra, or whatever that app is on. Kimi shows Advanced. GLM shows Lite, Pro, or Max. Nous shows the portal plan, not a bare Plus. |
-| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R. Not a HUD, not a chip, not a side pane. Click a section name to fold it. They start open, and they remember. |
+| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R. Not a HUD, not a side pane. An opt-in status-bar popup shows the same cards without leaving chat. Click a section name to fold it. They start open, and they remember. |
 
 It does not scrape vendor websites. Live rows come from Hermes OAuth plus the same CLI and app logins those vendors already use. Nothing leaves this machine except the usage calls those apps already make for you.
 
 ## Leave it open
 
-- Live cards refresh every 5 minutes while the page is open.
+- Live cards refresh every 5 minutes while the page or the status-bar popup is open.
 - Probe results are cached for 5 minutes. Refresh skips that cache, with a one-minute floor so repeated clicks do not hammer vendor APIs.
 - If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
 - Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
@@ -58,6 +58,17 @@ These preferences are saved in this Desktop installation and apply across its co
 Update both Desktop `plugin.js` and the selected gateway's `probe.py` to use provider filtering. For direct probe calls, pass `--disabled-providers=cursor,kimi` (comma-separated provider IDs).
 
 Want another live row? Open an issue. We can add it if that app or CLI already has a remaining-quota path we can read on your machine.
+
+## Quick usage without leaving chat
+
+Choose **Status bar** in the page header to add a small chip to the bottom-right status bar. It shows the window with the least left. Click it for a popup with a meter per window, in **Remaining %** or **Used %**, with the same countdowns and local reset times as the page. Provider controls and manual clocks stay on the page.
+
+- It is off by default. Turning it off removes the chip and deletes its saved snapshot.
+- While the popup is closed, the chip shows the last check and calls no vendor. While it is open, it refreshes every 5 minutes, like the page.
+- The page and the popup share one check per connection, profile, and provider selection, across chat tabs. **Refresh** keeps the one-minute floor for both.
+- While it is on, the last successful check is saved on this machine for up to 24 hours, so the chip and page fill in right after a reload. Only card fields are saved: provider, account label as shown on the card, percentages, and reset times. Tokens, raw responses, and errors are never saved. Older snapshots are deleted.
+- **Checked** shows when the last check finished. A check from an earlier day shows its date. Unknown percentages stay unknown.
+- Desktop builds without status-bar popovers show the page only.
 
 ## Works with the logins you already have
 
@@ -152,6 +163,8 @@ python -m unittest test_profile_switch test_probe_runtime test_provider_controls
 node --test test_profile_routing.cjs
 python -m unittest test_opencode_go_multi test_probe_slicing
 node --test test_probe_pagination.cjs
+node --test test_quick_usage.cjs
+HERMES_TEST_CATALOG=1 node --test test_quick_usage.cjs
 ```
 
 The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.

@@ -2,13 +2,14 @@
  * Resetwatch: remaining subscription quota and reset clocks for Hermes Desktop.
  *
  * One uncompiled plugin.js. A full page (sidebar + palette +
- * keybind), not a HUD. Live rows come from gateway RPCs plus probe.py
- * for CLI and app logins Hermes does not OAuth itself.
- * Manual clocks cover plans with no public remaining-quota API.
+ * keybind), not a HUD, plus an opt-in status-bar popup. Live rows come
+ * from gateway RPCs plus probe.py for CLI and app logins Hermes does not
+ * OAuth itself. Manual clocks cover plans with no public remaining-quota API.
  *
  * 1. Import the SDK as a namespace so missing named exports cannot crash load.
- * 2. No hardcoded colours. No polling faster than 5 minutes.
- * 3. No cookies, no scrape, no composer chip, no status bar, no right pane.
+ * 2. No hardcoded colours. No polling faster than 5 minutes, and none while
+ *    neither the page nor the popup is open.
+ * 3. No cookies, no scrape, no composer chip, no right pane. Unknown quota stays unknown.
  */
 
 import * as sdk from '@hermes/plugin-sdk'
@@ -34,6 +35,10 @@ const {
   SIDEBAR_NAV_AREA,
   PALETTE_AREA,
   KEYBINDS_AREA,
+  STATUSBAR_AREAS,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Badge,
   haptic
 } = sdk
@@ -60,6 +65,7 @@ const PRESETS = [
 ]
 
 let storage = null
+let quickUsageSupported = false
 let os = null
 
 const $clocks = atom([])
@@ -67,6 +73,116 @@ const $now = atom(Date.now())
 const $missingState = atom(null)
 const $providerPreferences = atom({ disabled: [], order: [] })
 const $displayMode = atom('remaining')
+const $refreshUntil = atom({})
+const $freshRequests = atom({})
+const $refreshErrors = atom({})
+const $quickOpen = atom(false)
+const $quickUsage = atom(false)
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const QUOTA_CACHE_KEY = 'quick_cache'
+
+// Account quota belongs to a connection/profile, not an individual chat tab.
+function liveQueryKey(connectionId, profile, disabled = []) {
+  return [PLUGIN_ID, 'live', connectionId, profile || '', [...disabled].sort().join(',')]
+}
+
+function quotaCacheEntries() {
+  const entries = stored(QUOTA_CACHE_KEY, {})
+  return entries && typeof entries === 'object' && !Array.isArray(entries) ? entries : {}
+}
+
+// Drop snapshots past the 24h limit so old account data does not linger.
+function freshQuotaCacheEntries() {
+  const now = Date.now()
+  return Object.fromEntries(Object.entries(quotaCacheEntries()).filter(([, entry]) =>
+    entry && Number.isFinite(entry.checkedAt) && entry.checkedAt <= now && now - entry.checkedAt <= CACHE_MAX_AGE_MS))
+}
+
+function pruneQuotaCache() {
+  const entries = quotaCacheEntries()
+  const fresh = freshQuotaCacheEntries()
+  if (Object.keys(fresh).length !== Object.keys(entries).length) remember(QUOTA_CACHE_KEY, fresh)
+}
+
+function clearRefreshError(contextKey) {
+  const previous = $refreshErrors.get()
+  if (!(contextKey in previous)) return
+  const next = { ...previous }
+  delete next[contextKey]
+  $refreshErrors.set(next)
+}
+
+function validQuotaCacheCard(card) {
+  if (!card || typeof card !== 'object' || Array.isArray(card) ||
+    typeof card.id !== 'string' || typeof card.label !== 'string') return false
+  const textFields = ['source', 'provider', 'group', 'account', 'resetText', 'detail']
+  if (textFields.some(field => card[field] != null && typeof card[field] !== 'string')) return false
+  if (['remaining', 'used'].some(field => card[field] != null &&
+    (typeof card[field] !== 'number' || !Number.isFinite(card[field]) || card[field] < 0 || card[field] > 100))) return false
+  if (card.resetAt != null && card.resetAt !== '' &&
+    ((typeof card.resetAt !== 'string' && typeof card.resetAt !== 'number') ||
+      !Number.isFinite(new Date(card.resetAt).getTime()))) return false
+  return card.error == null || card.error === false
+}
+
+// Snapshots persist only while the status-bar popup is turned on.
+function readQuotaCache(key) {
+  if (!$quickUsage.get() || !key[2] || !key[3]) return undefined
+  const cached = quotaCacheEntries()[JSON.stringify(key)]
+  if (!cached || !Array.isArray(cached.cards) || !Number.isFinite(cached.checkedAt)) return undefined
+  if (!cached.cards.every(validQuotaCacheCard)) return undefined
+  const age = Date.now() - cached.checkedAt
+  if (age < 0 || age > CACHE_MAX_AGE_MS) return undefined
+  return { ...cached, errors: [], cached: true }
+}
+
+function saveQuotaCache(key, payload) {
+  if (!$quickUsage.get() || !key[2] || !key[3] || !payload || !Array.isArray(payload.cards) ||
+    !Number.isFinite(payload.checkedAt)) return
+  const successful = payload.cards.filter(card => card && !card.error)
+  // An empty successful check (for example after logout) must replace old data.
+  // Failed checks retain the previous snapshot instead of pretending it is empty.
+  if (!successful.length && (payload.cards.length || payload.errors?.length)) return
+  if (!successful.every(validQuotaCacheCard)) return
+  // Persist only usage fields, never raw RPC/probe responses or errors.
+  const cards = successful.map(card => ({
+    id: card.id, source: card.source, provider: card.provider, group: card.group,
+    account: card.account, label: card.label, remaining: card.remaining,
+    used: card.used, resetAt: card.resetAt, resetText: card.resetText, detail: card.detail
+  }))
+  remember(QUOTA_CACHE_KEY, { ...freshQuotaCacheEntries(), [JSON.stringify(key)]: { cards, errors: [],
+    checkedAt: payload.checkedAt, hadSession: payload.hadSession, haveAccountRpc: payload.haveAccountRpc } })
+}
+
+function saveQuickUsage(on) {
+  $quickUsage.set(!!on)
+  remember('quick_usage', !!on)
+  if (!on) {
+    $quickOpen.set(false)
+    remember(QUOTA_CACHE_KEY, {})
+  }
+}
+
+// A check from an earlier day shows its date too.
+function checkedTime(checkedAt, nowMs) {
+  if (!Number.isFinite(checkedAt)) return ''
+  const date = new Date(checkedAt)
+  return date.toDateString() === new Date(nowMs).toDateString()
+    ? date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+    : date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
+// Re-render exactly when a refresh cooldown ends; $now ticks only every 30s.
+function useCoolingDown(until) {
+  const [tick, setTick] = useState(0)
+  const wait = until - Date.now()
+  useEffect(() => {
+    if (wait <= 0) return undefined
+    const id = setTimeout(() => setTick(value => value + 1), wait + 50)
+    return () => clearTimeout(id)
+  }, [until, tick])
+  return wait > 0
+}
 
 function stored(key, fallback) {
   return storage ? storage.get(key, fallback) : fallback
@@ -935,7 +1051,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     seen.add(card.id)
     unique.push(card)
   }
-  return { cards: arrangeProviderCards(unique, { disabled }), errors, hadSession: Boolean(sid), haveAccountRpc }
+  return { cards: arrangeProviderCards(unique, { disabled }), errors, hadSession: Boolean(sid), haveAccountRpc, checkedAt: Date.now() }
 }
 
 function SmallButton({ onClick, children, active, title, disabled }) {
@@ -1350,44 +1466,65 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile, disabled 
   return { data, isFetching, refetch: () => load({ fresh: true }) }
 }
 
-function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled = []) {
+function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled = [], active = true) {
   const sid = sessionId || ''
-  const key = [PLUGIN_ID, 'live', connectionId, profile || '', sid]
-  if (disabled.length) key.push(disabled.join(','))
+  const key = liveQueryKey(connectionId, profile, disabled)
   const contextKey = JSON.stringify(key)
-  const [manual, setManual] = useState({ key: '', fetching: false, error: '' })
-  const manualFetching = manual.key === contextKey && manual.fetching
-  const manualError = manual.key === contextKey ? manual.error : ''
+  const refreshUntil = useValue($refreshUntil)
+  const freshRequests = useValue($freshRequests)
+  const refreshErrors = useValue($refreshErrors)
+  const manualError = refreshErrors[contextKey] || ''
   const query = useQuery({
     queryKey: key,
-    queryFn: () => fetchLiveCards(sid, { disabled }, connectionId, profile),
-    enabled: gateway === 'open',
+    queryFn: async () => {
+      const data = await fetchLiveCards(sid, { disabled }, connectionId, profile)
+      saveQuotaCache(key, data)
+      clearRefreshError(contextKey)
+      return data
+    },
+    initialData: () => readQuotaCache(key),
+    initialDataUpdatedAt: () => readQuotaCache(key)?.checkedAt,
+    enabled: gateway === 'open' && active,
+    staleTime: POLL_MS,
+    gcTime: CACHE_MAX_AGE_MS,
     refetchInterval: POLL_MS,
     retry: false
   })
   const refetch = () => {
-    if (!queryClient || typeof queryClient.fetchQuery !== 'function') {
-      return query.refetch && query.refetch()
-    }
-    setManual({ key: contextKey, fetching: true, error: '' })
-    return queryClient
-      .fetchQuery({
+    if (gateway !== 'open' || query.isFetching || $freshRequests.get()[contextKey] ||
+      ($refreshUntil.get()[contextKey] || 0) > Date.now()) return Promise.resolve(null)
+    $refreshUntil.set({ ...$refreshUntil.get(), [contextKey]: Date.now() + REFRESH_COOLDOWN_MS })
+    clearRefreshError(contextKey)
+    $freshRequests.set({ ...$freshRequests.get(), [contextKey]: true })
+    const request = queryClient && typeof queryClient.fetchQuery === 'function'
+      ? queryClient.fetchQuery({
         queryKey: [...key, 'fresh'],
         queryFn: () => fetchLiveCards(sid, { fresh: true, disabled }, connectionId, profile),
         staleTime: 0,
         retry: false
       })
+      : typeof query.refetch === 'function'
+        ? Promise.resolve(query.refetch()).then(result => {
+          if (result.error) throw result.error
+          return result.data
+        })
+        : Promise.reject(new Error('Refresh unavailable on this SDK'))
+    return request
       .then(data => {
-        queryClient.setQueryData(key, data)
-        setManual(previous => previous.key === contextKey ? { key: contextKey, fetching: false, error: '' } : previous)
+        saveQuotaCache(key, data)
+        clearRefreshError(contextKey)
+        if (queryClient && typeof queryClient.setQueryData === 'function') queryClient.setQueryData(key, data)
         return data
       })
       .catch(error => {
         // Keep the last good cards, but say the refresh did not land.
-        setManual(previous => previous.key === contextKey
-          ? { key: contextKey, fetching: false, error: errorMessage(error, 'Refresh failed') }
-          : previous)
+        $refreshErrors.set({ ...$refreshErrors.get(), [contextKey]: errorMessage(error, 'Refresh failed') })
         return null
+      })
+      .finally(() => {
+        const next = { ...$freshRequests.get() }
+        delete next[contextKey]
+        $freshRequests.set(next)
       })
   }
   let data = query.data
@@ -1399,7 +1536,8 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled =
     const base = data || { cards: [], errors: [], hadSession: false, haveAccountRpc: false }
     data = { ...base, errors: [...(base.errors || []), `Refresh failed: ${manualError}`] }
   }
-  return { data, isFetching: !!(query.isFetching || manualFetching), refetch }
+  return { data, isFetching: !!(query.isFetching || freshRequests[contextKey]), refetch,
+    cooldownUntil: refreshUntil[contextKey] || 0 }
 }
 
 const useLiveCards = typeof useQuery === 'function' ? useLiveCardsQuery : useLiveCardsPolled
@@ -1419,10 +1557,8 @@ function groupLiveCards(cards) {
   return groups
 }
 
-function PluginPageContent() {
+function useFocusedLiveCards(active = true) {
   const gateway = useValue(host.state.gateway)
-  const nowMs = useValue($now)
-  const clocks = useValue($clocks)
   const sessionId = useValue(host.state.focusedSessionId)
   const owner = useValue(host.state.focusedSessionOwner || $missingState)
   const focusedProfile = useValue(host.state.focusedSessionProfile || $missingState)
@@ -1437,15 +1573,22 @@ function PluginPageContent() {
   const connectionId = unresolved ? null : hasOwnerState ? owner.connectionId : activeConnectionId || ''
   const profile = hasOwnerState ? owner && owner.profile : focusedProfile || activeProfile
   const preferences = useValue($providerPreferences)
+  const live = useLiveCards(gateway, sessionId, connectionId, profile, preferences.disabled, active)
+  return { gateway, profile, preferences, live }
+}
+
+function PluginPageContent() {
+  const { gateway, preferences, live } = useFocusedLiveCards()
+  const nowMs = useValue($now)
+  const clocks = useValue($clocks)
   const displayMode = useValue($displayMode)
-  const live = useLiveCards(gateway, sessionId, connectionId, profile, preferences.disabled)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [liveOpen, toggleLive] = useSectionOpen('live')
   const [manualOpen, toggleManual] = useSectionOpen('manual')
+  const quickUsage = useValue($quickUsage)
   const [cooldownUntil, setCooldownUntil] = useState(0)
-  const [cooldownTick, setCooldownTick] = useState(0)
-  const coolingDown = cooldownUntil > Date.now()
+  const coolingDown = useCoolingDown(Math.max(cooldownUntil, live.cooldownUntil || 0))
   const payload = live.data || { cards: [], errors: [], hadSession: false }
   const groups = useMemo(
     () => groupLiveCards(arrangeProviderCards(payload.cards, preferences)).filter(group => group.cards.length),
@@ -1454,17 +1597,7 @@ function PluginPageContent() {
 
   useEffect(() => {
     $now.set(Date.now())
-    const id = setInterval(() => $now.set(Date.now()), 30000)
-    return () => clearInterval(id)
   }, [])
-
-  // Re-enable the Refresh button exactly when the cooldown ends.
-  useEffect(() => {
-    const wait = cooldownUntil - Date.now()
-    if (wait <= 0) return undefined
-    const id = setTimeout(() => setCooldownTick(tick => tick + 1), wait + 50)
-    return () => clearTimeout(id)
-  }, [cooldownUntil, cooldownTick])
 
   const openExternal = url => {
     if (!isHttpUrl(url)) return
@@ -1527,8 +1660,23 @@ function PluginPageContent() {
               }),
               jsx('span', {
                 style: { fontSize: '0.6875rem', color: text.tertiary },
-                children: `gateway ${gateway || 'idle'}`
+                children: Number.isFinite(payload.checkedAt)
+                  ? `gateway ${gateway || 'idle'} · checked ${checkedTime(payload.checkedAt, nowMs)}`
+                  : `gateway ${gateway || 'idle'}`
               }),
+              quickUsageSupported
+                ? jsx(SmallButton, {
+                  active: quickUsage,
+                  title: quickUsage
+                    ? 'Remove the usage popup from the status bar'
+                    : 'Add a usage popup to the status bar. It refreshes only while open.',
+                  onClick: () => {
+                    tap()
+                    saveQuickUsage(!quickUsage)
+                  },
+                  children: 'Status bar'
+                })
+                : null,
               jsx(SmallButton, {
                 disabled: !!live.isFetching || coolingDown,
                 title: coolingDown ? 'Wait a minute between refreshes' : 'Skip the cache and ask every vendor again',
@@ -1688,6 +1836,109 @@ function PluginPageContent() {
   })
 }
 
+
+function QuotaRing({ card, mode, size = 64, showValue = true }) {
+  const percent = card.error ? null : quotaPercent(card, mode)
+  const remaining = quotaPercent(card, 'remaining')
+  const color = percent === null ? text.quaternary : remaining <= 10 ? text.red : remaining <= 30 ? text.yellow : text.accent
+  const label = `${card.provider || ''} ${card.label}: ${percent === null ? 'usage unavailable' : `${percent}% ${mode === 'used' ? 'used' : 'remaining'}`}`
+  return jsxs('div', {
+    role: percent === null ? 'img' : 'meter', 'aria-label': label,
+    ...(percent === null ? {} : { 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent }),
+    'data-resetwatch-ring': card.id,
+    style: { position: 'relative', width: size, height: size, flexShrink: 0, color },
+    children: [
+      jsxs('svg', { viewBox: '0 0 64 64', width: size, height: size, 'aria-hidden': true, children: [
+        jsx('circle', { cx: 32, cy: 32, r: 27, fill: 'none', stroke: 'var(--ui-stroke-secondary)', strokeWidth: 4 }),
+        percent === null ? null : jsx('circle', { cx: 32, cy: 32, r: 27, fill: 'none', stroke: 'currentColor', strokeWidth: 4,
+          pathLength: 100, strokeDasharray: `${percent} 100`, strokeLinecap: percent === 0 ? 'butt' : 'round', transform: 'rotate(-90 32 32)' })
+      ] }),
+      showValue ? jsx('span', { style: { position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
+        fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
+        children: percent === null ? '?' : `${percent}%` }) : null
+    ]
+  })
+}
+
+// The chip shows whichever window has the least left.
+function lowestQuotaCard(cards) {
+  return cards.filter(card => !card.error && quotaPercent(card, 'remaining') !== null)
+    .reduce((low, card) => !low || quotaPercent(card, 'remaining') < quotaPercent(low, 'remaining') ? card : low, null)
+}
+
+function QuickUsageSlot() {
+  return useValue($quickUsage) ? jsx(QuickUsage, {}) : null
+}
+
+function QuickUsage() {
+  const open = useValue($quickOpen)
+  // Closed, the chip reads the shared cache only. Vendors are asked while it is open.
+  const { gateway, profile, preferences, live } = useFocusedLiveCards(open)
+  const nowMs = useValue($now)
+  const mode = useValue($displayMode)
+  const cards = arrangeProviderCards(live.data?.cards || [], preferences)
+  const groups = groupLiveCards(cards)
+  const coolingDown = useCoolingDown(live.cooldownUntil || 0)
+  const lowest = lowestQuotaCard(cards)
+  const lowestPercent = lowest ? quotaPercent(lowest, mode) : null
+  const checkedAt = live.data?.checkedAt
+  const stale = checkedAt && nowMs - checkedAt >= POLL_MS
+  const label = mode === 'used' ? 'Used' : 'Remaining'
+  return jsxs(Popover, { open, onOpenChange: value => $quickOpen.set(value), children: [
+    jsx(PopoverTrigger, { asChild: true, children: jsxs('button', {
+      type: 'button', 'aria-label': 'Open usage and reset clocks', 'data-resetwatch-trigger': true,
+      title: lowest
+        ? `${PLUGIN_NAME}: lowest is ${[lowest.provider, lowest.label].filter(Boolean).join(' ')}, ${quotaPercent(lowest, 'remaining')}% left`
+        : `${PLUGIN_NAME}: usage and reset clocks`,
+      style: { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '0 6px', height: '100%',
+        color: text.tertiary, background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '0.6875rem',
+        fontVariantNumeric: 'tabular-nums' },
+      children: [jsx(QuotaRing, { card: lowest || { id: 'unknown', label: 'Usage', remaining: null, used: null },
+        mode, size: 12, showValue: false }), lowestPercent === null ? 'Usage' : `${lowestPercent}%`]
+    }) }),
+    jsxs(PopoverContent, {
+      side: 'top', align: 'end', sideOffset: 8, 'aria-label': `${PLUGIN_NAME} usage`, 'data-resetwatch-popup': true,
+      style: { width: 'min(420px, calc(100vw - 24px))', padding: 14, color: text.primary },
+      children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }, children: [
+          jsx('strong', { style: { flex: 1, fontSize: 14 }, children: 'Usage & reset' }),
+          jsx('select', { 'aria-label': 'Quick quota display mode', value: mode, onChange: event => saveDisplayMode(event.target.value),
+            style: { color: text.primary, background: 'var(--ui-bg-primary)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 4, fontSize: 11 },
+            children: [jsx('option', { value: 'remaining', children: 'Remaining %' }), jsx('option', { value: 'used', children: 'Used %' })] }),
+          jsx(SmallButton, { disabled: gateway !== 'open' || live.isFetching || coolingDown,
+            title: coolingDown ? 'Wait at least one minute between refreshes' : 'Refresh usage',
+            onClick: () => live.refetch(), children: live.isFetching ? 'Updating' : 'Refresh' })
+        ] }),
+        jsx('div', { style: { fontSize: 11, color: text.tertiary, marginBottom: 10 }, children:
+          `${profile || 'Unknown profile'} | ${label} | ${gateway !== 'open' ? 'Offline, cached data' : live.isFetching ? 'Showing last data while updating' : stale ? 'Stale cache, waiting for refresh' : 'Latest check'}` }),
+        jsx('div', { style: { maxHeight: 'min(480px, 65vh)', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }, children:
+          groups.length ? groups.map(group => jsxs('section', { children: [
+            jsx('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 7 }, children: group.title }),
+            ...group.cards.map(card => jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '7px 0',
+              borderBottom: '1px solid var(--ui-stroke-secondary)' }, children: [
+              jsx(QuotaRing, { card, mode }),
+              jsxs('div', { style: { minWidth: 0, flex: 1 }, children: [
+                jsx('div', { style: { fontSize: 12, fontWeight: 500 }, children: card.label }),
+                card.account ? jsx('div', { style: { fontSize: 11, color: text.tertiary }, children: card.account }) : null,
+                jsx('div', { style: { fontSize: 11, color: text.secondary, marginTop: 3 },
+                  children: formatReset(card.resetAt, card.resetText, nowMs) || 'Reset time unavailable' }),
+                card.error || quotaPercent(card, mode) === null ? jsx('div', { style: { fontSize: 11, color: text.tertiary, overflowWrap: 'anywhere' },
+                  children: card.detail || 'Provider did not report a percentage' }) : null
+              ] })
+            ] }, card.id))
+          ] }, group.title)) : jsx('div', { style: { padding: '20px 0', fontSize: 12, color: text.secondary },
+            children: live.isFetching ? 'Reading usage for the first time. Later opens show the last check right away.' : 'No usage data yet. Open the full page to check providers.' }) }),
+        live.data?.errors?.length ? jsx('div', { role: 'status', style: { fontSize: 11, color: text.yellow, marginTop: 8, overflowWrap: 'anywhere' },
+          children: live.data.errors.join(' | ') }) : null,
+        jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }, children: [
+          jsx('span', { style: { flex: 1, fontSize: 10, color: text.tertiary }, children: checkedAt
+            ? `Checked ${checkedTime(checkedAt, nowMs)} | Refreshes every 5 min while open` : 'Refreshes every 5 min while open' }),
+          jsx(SmallButton, { onClick: () => { $quickOpen.set(false); go(ROUTE) }, children: 'Full page' })
+        ] })
+      ]
+    })
+  ] })
+}
 
 // BEGIN SIGNED DESKTOP UPDATER
 // Kept inline: Desktop loads this file directly, without sibling module imports.
@@ -1961,6 +2212,11 @@ export default {
     loadClocks()
     $providerPreferences.set(normalizeProviderPreferences(stored('providers', {})))
     $displayMode.set(normalizeDisplayMode(stored('display_mode', 'remaining')))
+    $quickUsage.set(stored('quick_usage', false) === true)
+    pruneQuotaCache()
+    $now.set(Date.now())
+    const clockTimer = setInterval(() => $now.set(Date.now()), 30000)
+    onDispose(() => clearInterval(clockTimer))
 
     const contributions = [
       { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(Page, {}) },
@@ -1993,6 +2249,11 @@ export default {
           run: () => go(ROUTE)
         }
       })
+    }
+    quickUsageSupported = !!(Popover && PopoverContent && PopoverTrigger && typeof useQuery === 'function')
+    if (quickUsageSupported) {
+      contributions.push({ id: 'quick-usage', area: (STATUSBAR_AREAS && STATUSBAR_AREAS.right) || 'statusBar.right',
+        order: 100, render: () => jsx(QuickUsageSlot, {}) })
     }
     ctx.registerMany(contributions)
     onDispose(() => {
