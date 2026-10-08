@@ -22,8 +22,10 @@ const snapshots = [
   ] }
 ]
 function atom(value) { return { get: () => value, set: next => { value = next } } }
-function load({ modern = true, lifecycle = false, withQueryClient = true } = {}) {
+function load({ modern = true, lifecycle = false, withQueryClient = true, quickUsage = true, cache } = {}) {
   const saved = new Map(), registered = [], disposers = [], calls = [], queries = [], writes = [], cleared = []
+  if (quickUsage) saved.set('quick_usage', true)
+  if (cache) saved.set('quick_cache', cache)
   const queryResult = {}
   const consumerStates = new Map()
   let activeConsumer = 'default', stateCursor = 0
@@ -58,7 +60,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true } = {})
       if (!(index in states)) states[index] = value
       return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
     }, jsx, jsxs: jsx })
-  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, quotaCacheKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage };', context)
+  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, $quickOpen, $displayMode };', context)
   context.plugin.register({ storage: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
     set: (key, value) => saved.set(key, value) }, onDispose: fn => disposers.push(fn),
     registerMany: rows => registered.push(...rows) })
@@ -66,12 +68,13 @@ function load({ modern = true, lifecycle = false, withQueryClient = true } = {})
   const key = api.liveQueryKey('local', 'default', [])
   const cards = api.cardsFromAccountSnapshots(snapshots)
   const payload = { cards, errors: [], checkedAt: Date.now(), hadSession: true, haveAccountRpc: true }
+  const seed = entry => saved.set('quick_cache', { [JSON.stringify(key)]: entry })
   const renderConsumer = (name, ...args) => {
     activeConsumer = name
     stateCursor = 0
     return api.useLiveCardsQuery(...args)
   }
-  return { api, key, cards, payload, context, sdk, host, saved, registered, disposers, calls, queries, writes, cleared, renderConsumer, queryResult }
+  return { api, key, cards, payload, context, sdk, host, saved, seed, registered, disposers, calls, queries, writes, cleared, renderConsumer, queryResult }
 }
 
 test('modern SDK registers one status-bar popup and preserves page/sidebar', () => {
@@ -159,10 +162,10 @@ test('a failed empty check retains last good persistent usage', () => {
   assert.equal(api.readQuotaCache(key).cards.length, payload.cards.length)
 })
 test('expired, future, and malformed persistent quota cache is rejected', () => {
-  const { api, key, payload, saved } = load()
+  const { api, key, payload, seed } = load()
   for (const cached of [{ ...payload, checkedAt: Date.now() - 86400001 }, { ...payload, checkedAt: Date.now() + 60000 },
     { ...payload, cards: [null] }, { ...payload, cards: [{}] }, { ...payload, cards: 'not an array' }]) {
-    saved.set(api.quotaCacheKey(key), cached)
+    seed(cached)
     assert.equal(api.readQuotaCache(key), undefined)
   }
 })
@@ -173,19 +176,19 @@ test('provider selection normalizes ordering without mixing selections', () => {
   assert.notEqual(JSON.stringify(key), JSON.stringify(api.liveQueryKey('local', 'default', ['anthropic'])))
 })
 test('cached display fields reject objects before they can reach JSX', () => {
-  const { api, key, payload, saved } = load()
+  const { api, key, payload, seed } = load()
   for (const field of ['source', 'provider', 'group', 'account', 'resetText', 'detail', 'remaining', 'used', 'resetAt']) {
     for (const value of [{ invalid: true }, [], true]) {
-      saved.set(api.quotaCacheKey(key), { ...payload, cards: [{ ...payload.cards[0], [field]: value }] })
+      seed({ ...payload, cards: [{ ...payload.cards[0], [field]: value }] })
       assert.equal(api.readQuotaCache(key), undefined, `${field} must not accept ${JSON.stringify(value)}`)
     }
   }
 })
 test('cached quota and reset values reject invalid numeric and date types', () => {
-  const { api, key, payload, saved } = load()
+  const { api, key, payload, seed } = load()
   for (const card of [{ ...payload.cards[0], used: '13' }, { ...payload.cards[0], remaining: -1 },
     { ...payload.cards[0], used: 101 }, { ...payload.cards[0], resetAt: 'not-a-date' }]) {
-    saved.set(api.quotaCacheKey(key), { ...payload, cards: [card] })
+    seed({ ...payload, cards: [card] })
     assert.equal(api.readQuotaCache(key), undefined)
   }
 })
@@ -200,12 +203,16 @@ test('same-profile chat switches share query identity and cached initial data', 
   api.useLiveCardsQuery('open', 'two', 'local', 'default', [])
   assert.equal(JSON.stringify(queries.at(-1).queryKey), JSON.stringify(first.queryKey))
 })
-test('offline or unresolved owner disables fetching', () => {
+test('offline gateway disables fetching', () => {
   const { api, queries } = load()
   api.useLiveCardsQuery('closed', 'one', 'local', 'default', [])
   assert.equal(queries.at(-1).enabled, false)
+})
+test('an unresolved session owner still reports why the page is empty', async () => {
+  const { api, queries } = load()
   api.useLiveCardsQuery('open', 'one', null, null, [])
-  assert.equal(queries.at(-1).enabled, false)
+  assert.equal(queries.at(-1).enabled, true)
+  await assert.rejects(queries.at(-1).queryFn(), /Could not find the owner of the focused session/)
 })
 test('popup opens upward and has a viewport-bounded scroll body', () => {
   const { api } = load()
@@ -294,4 +301,69 @@ test('plugin disposal releases the countdown interval', () => {
   const { disposers, cleared } = load()
   for (const dispose of disposers) dispose()
   assert(cleared.includes(42))
+})
+test('the status-bar popup is off until the page turns it on', () => {
+  const { api, saved, registered } = load({ quickUsage: false })
+  assert.equal(registered.filter(row => row.area === 'statusBar.right').length, 1)
+  assert.equal(api.QuickUsageSlot(), null)
+  api.saveQuickUsage(true)
+  assert.equal(saved.get('quick_usage'), true)
+  assert.equal(api.QuickUsageSlot().type, api.QuickUsage)
+})
+test('usage is not saved locally unless the popup is turned on', () => {
+  const { api, key, payload, saved } = load({ quickUsage: false })
+  api.saveQuotaCache(key, payload)
+  assert.equal(saved.has('quick_cache'), false)
+  assert.equal(api.readQuotaCache(key), undefined)
+})
+test('turning the popup off deletes saved usage', () => {
+  const { api, key, payload, saved } = load()
+  api.saveQuotaCache(key, payload)
+  api.$quickOpen.set(true)
+  api.saveQuickUsage(false)
+  assert.equal(JSON.stringify(saved.get('quick_cache')), '{}')
+  assert.equal(api.$quickOpen.get(), false)
+  api.saveQuotaCache(key, payload)
+  assert.equal(JSON.stringify(saved.get('quick_cache')), '{}')
+})
+test('a closed popup reads the cache without asking vendors', () => {
+  const { api, queries } = load()
+  api.$quickOpen.set(false)
+  api.QuickUsage()
+  assert.equal(queries.at(-1).enabled, false)
+  api.$quickOpen.set(true)
+  api.QuickUsage()
+  assert.equal(queries.at(-1).enabled, true)
+  assert.equal(queries.at(-1).refetchInterval, 300000)
+  api.useLiveCardsQuery('open', 'one', 'local', 'default', [])
+  assert.equal(queries.at(-1).enabled, true, 'the full page keeps polling while it is open')
+})
+test('expired snapshots are deleted on load and on the next save', () => {
+  const old = { cards: [], errors: [], checkedAt: Date.now() - 86400001 }
+  const other = JSON.stringify(['resetwatch', 'live', 'remote', 'other', ''])
+  const { api, key, payload, saved } = load({ cache: { [other]: old } })
+  assert.equal(JSON.stringify(saved.get('quick_cache')), '{}')
+  saved.set('quick_cache', { [other]: old })
+  api.saveQuotaCache(key, payload)
+  assert.deepEqual(Object.keys(saved.get('quick_cache')), [JSON.stringify(key)])
+})
+test('the chip shows the window with the least left', () => {
+  const { api, key, payload } = load()
+  // The lowest window is the last numeric card, so the first card is not enough.
+  const low = payload.cards.findLast(card => typeof card.remaining === 'number')
+  api.saveQuotaCache(key, { ...payload, cards: payload.cards.map(card => card === low ? { ...card, remaining: 4, used: 96 } : card) })
+  api.$displayMode.set('remaining')
+  const trigger = api.QuickUsage().props.children[0].props.children
+  assert.equal(trigger.props.children[1], '4%')
+  assert(trigger.props.title.endsWith(`${low.label}, 4% left`))
+  api.$displayMode.set('used')
+  assert.equal(api.QuickUsage().props.children[0].props.children.props.children[1], '96%')
+})
+test('older checks show their date, not just a time', () => {
+  const { api } = load()
+  const checkedAt = Date.parse('2030-01-01T12:00:00Z')
+  const sameDay = api.checkedTime(checkedAt, checkedAt)
+  const later = api.checkedTime(checkedAt, checkedAt + 2 * 86400000)
+  assert(sameDay && later.length > sameDay.length, `${later} should carry a date beyond ${sameDay}`)
+  assert.equal(api.checkedTime(undefined, checkedAt), '')
 })

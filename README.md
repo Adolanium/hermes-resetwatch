@@ -14,7 +14,7 @@
 
   <br /><br />
 
-  [Quick usage popup](#quick-usage-without-leaving-chat) &nbsp;·&nbsp; [See the cards](#whats-left-on-one-page) &nbsp;·&nbsp; [Install it](#make-it-yours) &nbsp;·&nbsp; [Where the numbers come from](#where-the-numbers-come-from)
+  [See the cards](#whats-left-on-one-page) &nbsp;·&nbsp; [Install it](#make-it-yours) &nbsp;·&nbsp; [Where the numbers come from](#where-the-numbers-come-from)
 
 </div>
 
@@ -26,23 +26,6 @@ Resetwatch is a community plugin for [Hermes Desktop](https://github.com/NousRes
 
 Copy two files and open the page.
 
-## Quick usage without leaving chat
-
-Click **Usage** in the bottom-right status bar to open a compact popup above it. Circular meters show each provider's quota, with **Remaining %** or **Used %** and the existing countdown plus local reset date/time. The full page remains available for provider controls and manual clocks.
-
-<img src="assets/usage-button.png" width="102" alt="Usage button in the Hermes Desktop status bar" />
-
-<img src="assets/usage-popup.png" width="363" alt="ResetWatch status-bar popup with provider quota rings and reset clocks; account identifiers redacted" />
-
-*Real Hermes Desktop capture from the locally tested prototype. Its labels are in Thai; this contribution uses the repository's English UI copy. Images are cropped to exclude chats and other sessions, and account identifiers are redacted. Numbers and reset times are preserved from the capture, not mock values.*
-
-- The status-bar widget loads usage in the background every five minutes. Opening the popup does not start another refresh or change the chat route.
-- The full page and popup share one query per connection, profile, and enabled-provider selection, including across chat tabs.
-- The latest successful display snapshot is saved locally and shown immediately after a reload. Data older than 24 hours or belonging to another connection/profile/selection is not reused.
-- **Checked** means the last completed check, not a guarantee that every vendor returned a newly fetched response. Offline and stale cache are labeled. Unknown percentages stay unknown.
-- **Refresh** keeps the existing one-minute floor, shared across the popup and full page.
-- Older Desktop SDKs without Popover support keep the original full page and do not register a broken status-bar button.
-
 ## What's left, on one page
 
 Most usage pages live on a vendor site you have to remember to open. Resetwatch puts the bars in Hermes.
@@ -50,13 +33,13 @@ Most usage pages live on a vendor site you have to remember to open. Resetwatch 
 | | |
 | --- | --- |
 | **Live cards**<br />Nous, Claude, Codex, Cursor, and the rest fill themselves from logins already on this machine. Each card is one window: how full it is, how much is left, and when it resets. | **Plan names**<br />Claude shows Pro, Max, Max 5x, or Max 20x. Codex shows Plus. Cursor shows Ultra, or whatever that app is on. Kimi shows Advanced. GLM shows Lite, Pro, or Max. Nous shows the portal plan, not a bare Plus. |
-| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page plus quick usage**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R still open the full page. The bottom-right Usage button opens the compact popup. Click a page section name to fold it. They start open, and they remember. |
+| **Manual clocks**<br />Gemini, Perplexity, or anything you type. Paste the percent left and the reset time from the vendor page. Open takes you there in the system browser. | **A full page**<br />Sidebar, palette ("Resetwatch: Open"), or Ctrl/Cmd+Alt+R. Not a HUD, not a side pane. An opt-in status-bar popup shows the same cards without leaving chat. Click a section name to fold it. They start open, and they remember. |
 
 It does not scrape vendor websites. Live rows come from Hermes OAuth plus the same CLI and app logins those vendors already use. Nothing leaves this machine except the usage calls those apps already make for you.
 
 ## Leave it open
 
-- Live cards refresh every 5 minutes while the status-bar widget is mounted, even when the full page is closed.
+- Live cards refresh every 5 minutes while the page or the status-bar popup is open.
 - Probe results are cached for 5 minutes. Refresh skips that cache, with a one-minute floor so repeated clicks do not hammer vendor APIs.
 - If a login exists but the vendor call fails (HTTP error, timeout, changed payload), the card stays on the page marked "unavailable" with the reason. A vendor you never signed into shows nothing.
 - Claude and Codex pool accounts share one fold per vendor. Each account has its own rate-limit backoff.
@@ -75,6 +58,17 @@ These preferences are saved in this Desktop installation and apply across its co
 Update both Desktop `plugin.js` and the selected gateway's `probe.py` to use provider filtering. For direct probe calls, pass `--disabled-providers=cursor,kimi` (comma-separated provider IDs).
 
 Want another live row? Open an issue. We can add it if that app or CLI already has a remaining-quota path we can read on your machine.
+
+## Quick usage without leaving chat
+
+Choose **Status bar** in the page header to add a small chip to the bottom-right status bar. It shows the window with the least left. Click it for a popup with a meter per window, in **Remaining %** or **Used %**, with the same countdowns and local reset times as the page. Provider controls and manual clocks stay on the page.
+
+- It is off by default. Turning it off removes the chip and deletes its saved snapshot.
+- While the popup is closed, the chip shows the last check and calls no vendor. While it is open, it refreshes every 5 minutes, like the page.
+- The page and the popup share one check per connection, profile, and provider selection, across chat tabs. **Refresh** keeps the one-minute floor for both.
+- While it is on, the last successful check is saved on this machine for up to 24 hours, so the chip and page fill in right after a reload. Only card fields are saved: provider, account label as shown on the card, percentages, and reset times. Tokens, raw responses, and errors are never saved. Older snapshots are deleted.
+- **Checked** shows when the last check finished. A check from an earlier day shows its date. Unknown percentages stay unknown.
+- Desktop builds without status-bar popovers show the page only.
 
 ## Works with the logins you already have
 
