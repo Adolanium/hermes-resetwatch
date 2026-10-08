@@ -59,16 +59,29 @@ class GrokUsageTests(unittest.TestCase):
             return module._fetch_grok_account_usage()
 
     def test_parse_helper_keeps_unified_billing_usage_unknown(self):
-        result = probe._parse_grok_billing(
-            UNIFIED_BILLING, {"subscription_tier_display": " SuperGrok "}, None
-        )
-        self.assertIsNone(result["windows"][0]["used_percent"])
-        self.assertEqual(result["windows"][0]["detail"], UNKNOWN_USAGE)
+        for module in (probe, catalog_probe):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(
+                    module._parse_grok_billing(UNIFIED_BILLING, {"subscription_tier_display": " SuperGrok "}, None),
+                    {"provider": "grok", "plan": "SuperGrok", "details": [],
+                     "windows": [row("Weekly", None, detail=UNKNOWN_USAGE)]},
+                )
 
     def test_parse_helper_keeps_no_period_usage_unknown(self):
-        result = probe._parse_grok_billing({"subscriptionTier": "SuperGrok"}, {}, None)
-        self.assertEqual(result["windows"][0]["detail"], UNKNOWN_USAGE)
-        self.assertIsNone(result["windows"][0]["used_percent"])
+        for module in (probe, catalog_probe):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(
+                    module._parse_grok_billing({"subscriptionTier": "SuperGrok"}, {}, None)["windows"],
+                    [row("Weekly", None, None, UNKNOWN_USAGE)],
+                )
+
+    def test_parse_helper_passes_notes_to_the_card(self):
+        for module in (probe, catalog_probe):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(
+                    module._parse_grok_billing(UNIFIED_BILLING_USED, {}, ["Login refreshed"])["details"],
+                    ["Login refreshed"],
+                )
 
     def test_unified_billing_without_usage_stays_unknown(self):
         for module in (probe, catalog_probe):

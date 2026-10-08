@@ -1565,11 +1565,10 @@ def _fetch_grok_account_usage() -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
     note = _vendor_refresh_note("grok", "the Grok CLI")
-    parsed = _parse_grok_billing(payload, settings, [note] if note else None)
-    return parsed
+    return _parse_grok_billing(payload, settings, [note] if note else None)
 
 
-def _parse_grok_billing(payload: dict, settings: Optional[dict], notes: Optional[list[str]]) -> Optional[dict]:
+def _parse_grok_billing(payload: dict, settings: dict, notes: Optional[list[str]]) -> Optional[dict]:
     config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
     windows: list[dict] = []
     period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else None
