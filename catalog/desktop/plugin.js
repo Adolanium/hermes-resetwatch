@@ -40,8 +40,157 @@ const {
   PopoverContent,
   PopoverTrigger,
   Badge,
-  haptic
+  haptic,
+  usePluginI18n
 } = sdk
+
+// Desktop UI text. Desktop's ctx.i18n looks a key up by dotted path in the
+// active language, then in English, then returns the key itself. Functions take the values to insert. A translation only needs the
+// keys it translates: add it to LOCALES, e.g. zh: { common: { refresh: '...' } }.
+// Card text from vendors and probe.py, and the self-updater, stay English.
+const EN = {
+  name: PLUGIN_NAME,
+  open: {
+    palette: 'Resetwatch: Open',
+    keybind: 'Open Resetwatch'
+  },
+  common: {
+    refresh: 'Refresh',
+    cancel: 'Cancel'
+  },
+  mode: {
+    remaining: 'Remaining %',
+    used: 'Used %'
+  },
+  page: {
+    subtitleLeft: 'How much is left, and when it comes back',
+    subtitleUsed: 'How much is used, and when it resets',
+    displayMode: 'Quota display mode',
+    gateway: state => `gateway ${state}`,
+    gatewayChecked: (state, time) => `gateway ${state} · checked ${time}`,
+    statusBar: 'Status bar',
+    statusBarAdd: 'Add a usage popup to the status bar. It refreshes only while open.',
+    statusBarRemove: 'Remove the usage popup from the status bar',
+    refreshing: 'Refreshing…',
+    refreshWait: 'Wait a minute between refreshes',
+    refreshHint: 'Skip the cache and ask every vendor again',
+    intro: 'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. Click a section name to fold it up.',
+    automatic: 'Automatic',
+    allOff: 'All providers are off. Enable a provider in Providers and order to see live usage.',
+    noWindows: 'No quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
+  },
+  providers: {
+    title: 'Providers and order',
+    hint: 'Choose which providers to fetch and show. Move providers to set their card order. Saved for this Desktop installation across profiles. An in-progress refresh may finish.',
+    moveUp: name => `Move ${name} up`,
+    moveDown: name => `Move ${name} down`,
+    reset: 'Reset providers'
+  },
+  card: {
+    left: percent => `${percent}% left`,
+    used: percent => `${percent}% used`,
+    unavailable: 'unavailable'
+  },
+  reset: {
+    now: when => `Reset now · ${when}`,
+    minutes: (minutes, when) => `Resets in ${minutes}m · ${when}`,
+    hours: (hours, minutes, when) => `Resets in ${hours}h ${minutes}m · ${when}`,
+    days: (days, hours, when) => `Resets in ${days}d ${hours}h · ${when}`,
+    at: when => `Resets ${when}`,
+    unknown: 'Reset time unavailable'
+  },
+  clocks: {
+    title: 'Manual clocks',
+    add: 'Add clock',
+    close: 'Close',
+    custom: 'Custom',
+    name: 'Name',
+    namePlaceholder: 'Plan name',
+    left: '% left',
+    resets: 'Resets',
+    url: 'Dashboard URL (optional)',
+    typed: 'Typed by you. Update when the vendor page changes.',
+    open: 'Open',
+    edit: 'Edit',
+    remove: 'Remove',
+    save: 'Save'
+  },
+  popup: {
+    open: 'Open usage and reset clocks',
+    lowest: (name, percent) => `${PLUGIN_NAME}: lowest is ${name}, ${percent}% left`,
+    idle: `${PLUGIN_NAME}: usage and reset clocks`,
+    label: `${PLUGIN_NAME} usage`,
+    usage: 'Usage',
+    title: 'Usage & reset',
+    displayMode: 'Quick quota display mode',
+    updating: 'Updating',
+    refreshWait: 'Wait at least one minute between refreshes',
+    refreshHint: 'Refresh usage',
+    unknownProfile: 'Unknown profile',
+    remaining: 'Remaining',
+    used: 'Used',
+    offline: 'Offline, cached data',
+    showingLast: 'Showing last data while updating',
+    stale: 'Stale cache, waiting for refresh',
+    latest: 'Latest check',
+    noPercent: 'Provider did not report a percentage',
+    firstRead: 'Reading usage for the first time. Later opens show the last check right away.',
+    empty: 'No usage data yet. Open the full page to check providers.',
+    checked: time => `Checked ${time} | Refreshes every 5 min while open`,
+    cadence: 'Refreshes every 5 min while open',
+    fullPage: 'Full page',
+    ringUnavailable: 'usage unavailable',
+    ringUsed: percent => `${percent}% used`,
+    ringRemaining: percent => `${percent}% remaining`
+  },
+  errors: {
+    liveUsage: 'Could not read live usage',
+    refreshFailed: 'Refresh failed',
+    refreshFailedWith: message => `Refresh failed: ${message}`,
+    refreshUnavailable: 'Refresh unavailable on this SDK',
+    nousUsage: 'Could not read Nous usage',
+    subscription: 'Could not read subscription state',
+    accountLimits: 'Could not read signed-in account limits',
+    usageCommand: 'Could not run /usage',
+    noOwner: 'Could not find the owner of the focused session',
+    noRoute: profile => `No Desktop route for ${profile}`,
+    noHome: 'Could not find Hermes home for probe.py',
+    badProfile: 'Invalid Hermes profile name',
+    noHttpx: 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.',
+    noProbe: 'probe.py not found in the standalone or combined-package installation on this Gateway',
+    noPython: 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)',
+    probeRun: 'Could not run probe.py',
+    probeNoPython: 'Could not run probe.py (no working Hermes Python)'
+  }
+}
+
+const LOCALES = { en: EN }
+
+let i18n = null
+
+// Same lookup as Desktop's, for builds without ctx.i18n.
+function englishText(key, args) {
+  const value = String(key).split('.').reduce((node, part) =>
+    node && typeof node === 'object' ? node[part] : undefined, EN)
+  if (typeof value === 'function') return value(...args)
+  return typeof value === 'string' ? value : key
+}
+
+// Outside React. Reads the active language at call time.
+function tr(key, ...args) {
+  return i18n ? i18n.t(key, ...args) : englishText(key, args)
+}
+
+// In components. The SDK hook re-renders them when the language changes.
+function useTr() {
+  const t = typeof usePluginI18n === 'function' ? usePluginI18n(PLUGIN_ID) : null
+  return t && i18n ? t : tr
+}
+
+// Vendor reset text and unparseable times arrive without "Resets".
+function isBareReset(card) {
+  return !!card.resetText || (!!card.resetAt && Number.isNaN(new Date(card.resetAt).getTime()))
+}
 
 const text = {
   primary: 'var(--ui-text-primary)',
@@ -270,15 +419,15 @@ function formatReset(resetAt, resetText, nowMs) {
     hour: 'numeric',
     minute: '2-digit'
   })
-  if (delta <= 0) return `Reset now · ${local}`
+  if (delta <= 0) return tr('reset.now', local)
   const minutes = Math.round(delta / 60000)
-  if (minutes < 1) return `Reset now · ${local}`
-  if (minutes < 60) return `Resets in ${minutes}m · ${local}`
+  if (minutes < 1) return tr('reset.now', local)
+  if (minutes < 60) return tr('reset.minutes', minutes, local)
   const hours = Math.floor(minutes / 60)
   const rem = minutes % 60
-  if (hours < 24) return `Resets in ${hours}h ${rem}m · ${local}`
+  if (hours < 24) return tr('reset.hours', hours, rem, local)
   const days = Math.floor(hours / 24)
-  return `Resets in ${days}d ${hours % 24}h · ${local}`
+  return tr('reset.days', days, hours % 24, local)
 }
 
 function toDatetimeLocal(iso) {
@@ -400,6 +549,7 @@ function arrangeProviderCards(cards, preferences) {
 }
 
 function ProviderControls({ preferences }) {
+  const t = useTr()
   const order = [...preferences.order, ...LIVE_PROVIDERS.filter(key => !preferences.order.includes(key))]
   const move = (index, delta) => {
     if (index + delta < 0 || index + delta >= order.length) return
@@ -410,9 +560,9 @@ function ProviderControls({ preferences }) {
   }
   return jsxs('details', {
     children: [
-      jsx('summary', { style: { cursor: 'pointer', color: text.secondary }, children: 'Providers and order' }),
+      jsx('summary', { style: { cursor: 'pointer', color: text.secondary }, children: t('providers.title') }),
       jsx('p', { style: { color: text.tertiary, fontSize: '0.75rem' },
-        children: 'Choose which providers to fetch and show. Move providers to set their card order. Saved for this Desktop installation across profiles. An in-progress refresh may finish.' }),
+        children: t('providers.hint') }),
       ...order.map((key, index) => jsxs('div', {
         style: { display: 'flex', alignItems: 'center', gap: 8, maxWidth: 400, padding: '4px 0' },
         children: [
@@ -422,11 +572,11 @@ function ProviderControls({ preferences }) {
                 disabled: event.target.checked ? preferences.disabled.filter(item => item !== key) : [...preferences.disabled, key] }) }),
             PROVIDER_LABELS[key]
           ] }),
-          jsx(SmallButton, { disabled: index === 0, title: `Move ${PROVIDER_LABELS[key]} up`, onClick: () => move(index, -1), children: '↑' }),
-          jsx(SmallButton, { disabled: index === order.length - 1, title: `Move ${PROVIDER_LABELS[key]} down`, onClick: () => move(index, 1), children: '↓' })
+          jsx(SmallButton, { disabled: index === 0, title: t('providers.moveUp', PROVIDER_LABELS[key]), onClick: () => move(index, -1), children: '↑' }),
+          jsx(SmallButton, { disabled: index === order.length - 1, title: t('providers.moveDown', PROVIDER_LABELS[key]), onClick: () => move(index, 1), children: '↓' })
         ]
       }, key)),
-      jsx(SmallButton, { onClick: () => saveProviderPreferences({}), children: 'Reset providers' })
+      jsx(SmallButton, { onClick: () => saveProviderPreferences({}), children: t('providers.reset') })
     ]
   })
 }
@@ -768,19 +918,19 @@ function pickProbeFailure(failures) {
   if (real) return real.message
   const kinds = new Set(list.map(item => item.kind))
   if (kinds.has('no-deps')) {
-    return 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.'
+    return tr('errors.noHttpx')
   }
   if (kinds.has('no-probe') && !kinds.has('no-python')) {
-    return 'probe.py not found in the standalone or combined-package installation on this Gateway'
+    return tr('errors.noProbe')
   }
   if (kinds.has('no-python') && !kinds.has('no-probe')) {
-    return 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)'
+    return tr('errors.noPython')
   }
   return list[list.length - 1].message
 }
 
 async function profileRequester(connectionId, profile) {
-  if (connectionId === null) throw new Error('Could not find the owner of the focused session')
+  if (connectionId === null) throw new Error(tr('errors.noOwner'))
   const active = String(profile || '').trim()
   if (!active || !connectionId || typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
     return { request: (method, params = {}) => host.request(method, params), profile: active }
@@ -788,7 +938,7 @@ async function profileRequester(connectionId, profile) {
   const routes = await host.profileRoutes()
   const sourceRoutes = routes.filter(item => item && item.connectionId === connectionId)
   const route = sourceRoutes.find(item => item.profile === active) || sourceRoutes.find(item => item.targetProfile === active)
-  if (!route) throw new Error(`No Desktop route for ${active}`)
+  if (!route) throw new Error(tr('errors.noRoute', active))
   return {
     request: (method, params = {}) => host.requestProfile(route, method, params),
     profile: route.targetProfile || route.profile
@@ -834,10 +984,10 @@ async function probeStockAccountUsage(request, opts) {
   try {
     const shown = await request('config.show', {})
     const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
-    if (!homes.length) return { snapshots: null, error: 'Could not find Hermes home for probe.py' }
+    if (!homes.length) return { snapshots: null, error: tr('errors.noHome') }
     const profileArg = String((opts && opts.profile) || '').trim()
     if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
-      return { snapshots: null, error: 'Invalid Hermes profile name' }
+      return { snapshots: null, error: tr('errors.badProfile') }
     }
     const disabled = normalizeProviderPreferences({ disabled: opts && opts.disabled }).disabled
     const flags = [
@@ -924,10 +1074,10 @@ async function probeStockAccountUsage(request, opts) {
     }
     return {
       snapshots: null,
-      error: pickProbeFailure(failures) || 'Could not run probe.py (no working Hermes Python)'
+      error: pickProbeFailure(failures) || tr('errors.probeNoPython')
     }
   } catch (error) {
-    return { snapshots: null, error: errorMessage(error, 'Could not run probe.py') }
+    return { snapshots: null, error: errorMessage(error, tr('errors.probeRun')) }
   }
 }
 
@@ -960,7 +1110,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     cards.push(...cardsFromUsageBars(barsResult.value))
   } else {
     const error = barsResult.reason
-    barsError = error && error.message ? error.message : 'Could not read Nous usage'
+    barsError = error && error.message ? error.message : tr('errors.nousUsage')
   }
 
   if (nousEnabled && !cards.length) {
@@ -968,7 +1118,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
       const sub = await request('subscription.state', {})
       if (sub && sub.usage) cards.push(...cardsFromUsageBars(sub.usage))
     } catch (error) {
-      errors.push(error && error.message ? error.message : 'Could not read subscription state')
+      errors.push(error && error.message ? error.message : tr('errors.subscription'))
     }
   }
   // Only report the usage.bars failure if the fallback did not fill the Nous cards.
@@ -989,7 +1139,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     const error = accountResult.reason
     const message = error && error.message ? error.message : ''
     if (!/unknown method|not found|-32601/i.test(message)) {
-      errors.push(message || 'Could not read signed-in account limits')
+      errors.push(message || tr('errors.accountLimits'))
     }
   }
 
@@ -1039,7 +1189,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     } catch (error) {
       const message = error && error.message ? error.message : ''
       if (!/session not found/i.test(message)) {
-        errors.push(message || 'Could not run /usage')
+        errors.push(message || tr('errors.usageCommand'))
       }
     }
   }
@@ -1157,12 +1307,13 @@ function renderDetailText(detail) {
 }
 
 function LimitCard({ card, nowMs, actions }) {
+  const t = useTr()
   const displayMode = useValue($displayMode)
   const remaining = quotaPercent(card, 'remaining')
   const percent = quotaPercent(card, displayMode)
   const tone = toneForRemaining(remaining)
   const reset = formatReset(card.resetAt, card.resetText, nowMs)
-  const percentLabel = `${percent}% ${displayMode === 'used' ? 'used' : 'left'}`
+  const percentLabel = t(displayMode === 'used' ? 'card.used' : 'card.left', percent)
   const detail = displayDetail(card)
   return jsxs('div', {
     style: {
@@ -1191,7 +1342,7 @@ function LimitCard({ card, nowMs, actions }) {
           reset
             ? jsx('div', {
                 style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
-                children: reset.startsWith('Resets') || reset.startsWith('Reset') ? reset : `Resets ${reset}`
+                children: isBareReset(card) && !reset.startsWith('Reset') ? t('reset.at', reset) : reset
               })
             : null,
           detail
@@ -1206,7 +1357,7 @@ function LimitCard({ card, nowMs, actions }) {
         ? jsx('div', {
             title: detail,
             style: { fontSize: '0.75rem', color: text.quaternary, flexShrink: 0 },
-            children: 'unavailable'
+            children: t('card.unavailable')
           })
         : percent === null
           ? null
@@ -1302,6 +1453,7 @@ function ProviderBlock({ title, cards, nowMs, empty, actionsFor }) {
 }
 
 function ClockForm({ onSave, onCancel }) {
+  const t = useTr()
   const [presetId, setPresetId] = useState('gemini')
   const preset = PRESETS.find(item => item.id === presetId) || PRESETS[0]
   const [name, setName] = useState(preset.name)
@@ -1340,29 +1492,29 @@ function ClockForm({ onSave, onCancel }) {
                 tap()
                 setPresetId(item.id)
               },
-              children: item.name
+              children: item.id === 'custom' ? t('clocks.custom') : item.name
             },
             item.id
           )
         )
       ] }),
       jsxs('div', { style: { display: 'grid', gridTemplateColumns: '1fr 90px 1fr', gap: 8 }, children: [
-        jsx(Field, { label: 'Name', children: jsx(NativeInput, { value: name, onChange: setName, placeholder: 'Plan name' }) }),
+        jsx(Field, { label: t('clocks.name'), children: jsx(NativeInput, { value: name, onChange: setName, placeholder: t('clocks.namePlaceholder') }) }),
         jsx(Field, {
-          label: '% left',
+          label: t('clocks.left'),
           children: jsx(NativeInput, { value: left, onChange: setLeft, type: 'number', placeholder: '70' })
         }),
         jsx(Field, {
-          label: 'Resets',
+          label: t('clocks.resets'),
           children: jsx(NativeInput, { value: resetLocal, onChange: setResetLocal, type: 'datetime-local' })
         })
       ] }),
       jsx(Field, {
-        label: 'Dashboard URL (optional)',
+        label: t('clocks.url'),
         children: jsx(NativeInput, { value: url, onChange: setUrl, placeholder: 'https://' })
       }),
       jsxs('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' }, children: [
-        jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
+        jsx(SmallButton, { onClick: onCancel, children: t('common.cancel') }),
         jsx(SmallButton, {
           active: true,
           disabled: !canSave,
@@ -1377,7 +1529,7 @@ function ClockForm({ onSave, onCancel }) {
               url: url.trim()
             })
           },
-          children: 'Add clock'
+          children: t('clocks.add')
         })
       ] })
     ]
@@ -1385,6 +1537,7 @@ function ClockForm({ onSave, onCancel }) {
 }
 
 function EditClock({ clock, onSave, onCancel }) {
+  const t = useTr()
   const [name, setName] = useState(clock.name)
   const [left, setLeft] = useState(String(clock.remaining))
   const [resetLocal, setResetLocal] = useState(toDatetimeLocal(clock.resetAt))
@@ -1401,7 +1554,7 @@ function EditClock({ clock, onSave, onCancel }) {
       ] }),
       jsx(NativeInput, { value: url, onChange: setUrl, placeholder: 'https://' }),
       jsxs('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' }, children: [
-        jsx(SmallButton, { onClick: onCancel, children: 'Cancel' }),
+        jsx(SmallButton, { onClick: onCancel, children: t('common.cancel') }),
         jsx(SmallButton, {
           active: true,
           disabled: !canSave,
@@ -1409,7 +1562,7 @@ function EditClock({ clock, onSave, onCancel }) {
             if (!canSave) return
             onSave({ ...clock, name: name.trim(), remaining, resetAt: fromDatetimeLocal(resetLocal), url: url.trim() })
           },
-          children: 'Save'
+          children: t('clocks.save')
         })
       ] })
     ]
@@ -1438,7 +1591,7 @@ function useLiveCardsPolled(gateway, sessionId, connectionId, profile, disabled 
         if (gen !== genRef.current) return
         setData({
           cards: [],
-          errors: [errorMessage(error, 'Could not read live usage')],
+          errors: [errorMessage(error, tr('errors.liveUsage'))],
           hadSession: Boolean(sid),
           haveAccountRpc: false
         })
@@ -1508,7 +1661,7 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled =
           if (result.error) throw result.error
           return result.data
         })
-        : Promise.reject(new Error('Refresh unavailable on this SDK'))
+        : Promise.reject(new Error(tr('errors.refreshUnavailable')))
     return request
       .then(data => {
         saveQuotaCache(key, data)
@@ -1518,7 +1671,7 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled =
       })
       .catch(error => {
         // Keep the last good cards, but say the refresh did not land.
-        $refreshErrors.set({ ...$refreshErrors.get(), [contextKey]: errorMessage(error, 'Refresh failed') })
+        $refreshErrors.set({ ...$refreshErrors.get(), [contextKey]: errorMessage(error, tr('errors.refreshFailed')) })
         return null
       })
       .finally(() => {
@@ -1530,11 +1683,11 @@ function useLiveCardsQuery(gateway, sessionId, connectionId, profile, disabled =
   let data = query.data
   if (query.error) {
     const base = data || { cards: [], errors: [], hadSession: Boolean(sid), haveAccountRpc: false }
-    data = { ...base, errors: [...(base.errors || []), errorMessage(query.error, 'Could not read live usage')] }
+    data = { ...base, errors: [...(base.errors || []), errorMessage(query.error, tr('errors.liveUsage'))] }
   }
   if (manualError) {
     const base = data || { cards: [], errors: [], hadSession: false, haveAccountRpc: false }
-    data = { ...base, errors: [...(base.errors || []), `Refresh failed: ${manualError}`] }
+    data = { ...base, errors: [...(base.errors || []), tr('errors.refreshFailedWith', manualError)] }
   }
   return { data, isFetching: !!(query.isFetching || freshRequests[contextKey]), refetch,
     cooldownUntil: refreshUntil[contextKey] || 0 }
@@ -1578,6 +1731,7 @@ function useFocusedLiveCards(active = true) {
 }
 
 function PluginPageContent() {
+  const t = useTr()
   const { gateway, preferences, live } = useFocusedLiveCards()
   const nowMs = useValue($now)
   const clocks = useValue($clocks)
@@ -1614,7 +1768,7 @@ function PluginPageContent() {
     used: remainingFromUsed(clock.remaining),
     resetAt: clock.resetAt,
     resetText: '',
-    detail: clock.url ? clock.url.replace(/^https?:\/\//, '') : 'Typed by you. Update when the vendor page changes.',
+    detail: clock.url ? clock.url.replace(/^https?:\/\//, '') : t('clocks.typed'),
     url: clock.url
   }))
 
@@ -1630,19 +1784,17 @@ function PluginPageContent() {
           borderBottom: '1px solid var(--ui-stroke-secondary)'
         },
         children: [
-          jsx('h1', { style: { fontSize: '1rem', fontWeight: 600, color: text.primary, margin: 0 }, children: PLUGIN_NAME }),
+          jsx('h1', { style: { fontSize: '1rem', fontWeight: 600, color: text.primary, margin: 0 }, children: t('name') }),
           jsx('span', {
             style: { color: text.tertiary, fontSize: '0.75rem' },
-            children: displayMode === 'used'
-              ? 'How much is used, and when it resets'
-              : 'How much is left, and when it comes back'
+            children: t(displayMode === 'used' ? 'page.subtitleUsed' : 'page.subtitleLeft')
           }),
           Badge ? jsx(Badge, { variant: 'muted', children: VERSION }) : null,
           jsxs('div', {
             style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' },
             children: [
               jsxs('select', {
-                'aria-label': 'Quota display mode',
+                'aria-label': t('page.displayMode'),
                 value: displayMode,
                 onChange: event => saveDisplayMode(event.target.value),
                 style: {
@@ -1654,32 +1806,30 @@ function PluginPageContent() {
                   padding: '2px 6px'
                 },
                 children: [
-                  jsx('option', { value: 'remaining', children: 'Remaining %' }),
-                  jsx('option', { value: 'used', children: 'Used %' })
+                  jsx('option', { value: 'remaining', children: t('mode.remaining') }),
+                  jsx('option', { value: 'used', children: t('mode.used') })
                 ]
               }),
               jsx('span', {
                 style: { fontSize: '0.6875rem', color: text.tertiary },
                 children: Number.isFinite(payload.checkedAt)
-                  ? `gateway ${gateway || 'idle'} · checked ${checkedTime(payload.checkedAt, nowMs)}`
-                  : `gateway ${gateway || 'idle'}`
+                  ? t('page.gatewayChecked', gateway || 'idle', checkedTime(payload.checkedAt, nowMs))
+                  : t('page.gateway', gateway || 'idle')
               }),
               quickUsageSupported
                 ? jsx(SmallButton, {
                   active: quickUsage,
-                  title: quickUsage
-                    ? 'Remove the usage popup from the status bar'
-                    : 'Add a usage popup to the status bar. It refreshes only while open.',
+                  title: t(quickUsage ? 'page.statusBarRemove' : 'page.statusBarAdd'),
                   onClick: () => {
                     tap()
                     saveQuickUsage(!quickUsage)
                   },
-                  children: 'Status bar'
+                  children: t('page.statusBar')
                 })
                 : null,
               jsx(SmallButton, {
                 disabled: !!live.isFetching || coolingDown,
-                title: coolingDown ? 'Wait a minute between refreshes' : 'Skip the cache and ask every vendor again',
+                title: t(coolingDown ? 'page.refreshWait' : 'page.refreshHint'),
                 onClick: () => {
                   if (live.isFetching || coolingDown) return
                   tap()
@@ -1687,7 +1837,7 @@ function PluginPageContent() {
                   if (live.refetch) live.refetch()
                   else if (queryClient) queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'live'] })
                 },
-                children: live.isFetching ? 'Refreshing…' : 'Refresh'
+                children: live.isFetching ? t('page.refreshing') : t('common.refresh')
               })
             ]
           })
@@ -1706,15 +1856,14 @@ function PluginPageContent() {
         children: [
           jsx('p', {
             style: { margin: 0, maxWidth: 640, fontSize: '0.8125rem', color: text.secondary, lineHeight: 1.45 },
-            children:
-              'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. Click a section name to fold it up.'
+            children: t('page.intro')
           }),
           jsx(ProviderControls, { preferences }),
           jsxs('section', {
             style: { display: 'flex', flexDirection: 'column', gap: 12 },
             children: [
               jsx(SectionHeader, {
-                title: 'Automatic',
+                title: t('page.automatic'),
                 open: liveOpen,
                 onToggle: toggleLive
               }),
@@ -1738,8 +1887,8 @@ function PluginPageContent() {
                         : jsx('div', {
                             style: { fontSize: '0.8125rem', color: text.tertiary },
                             children: preferences.disabled.length === LIVE_PROVIDERS.length
-                              ? 'All providers are off. Enable a provider in Providers and order to see live usage.'
-                              : 'No quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
+                              ? t('page.allOff')
+                              : t('page.noWindows')
                           }),
                       payload.errors && payload.errors.length
                         ? jsx('div', {
@@ -1755,7 +1904,7 @@ function PluginPageContent() {
             style: { display: 'flex', flexDirection: 'column', gap: 8 },
             children: [
               jsx(SectionHeader, {
-                title: 'Manual clocks',
+                title: t('clocks.title'),
                 open: manualOpen,
                 onToggle: toggleManual,
                 extra: jsx(SmallButton, {
@@ -1765,7 +1914,7 @@ function PluginPageContent() {
                     if (!manualOpen) toggleManual()
                     setAdding(open => !open)
                   },
-                  children: adding ? 'Close' : 'Add clock'
+                  children: t(adding ? 'clocks.close' : 'clocks.add')
                 })
               }),
               !manualOpen || !adding
@@ -1805,7 +1954,7 @@ function PluginPageContent() {
                                 isHttpUrl(card.url)
                                   ? jsx(SmallButton, {
                                       onClick: () => openExternal(card.url),
-                                      children: 'Open'
+                                      children: t('clocks.open')
                                     })
                                   : null,
                                 jsx(SmallButton, {
@@ -1813,14 +1962,14 @@ function PluginPageContent() {
                                     tap()
                                     setEditingId(card.id)
                                   },
-                                  children: 'Edit'
+                                  children: t('clocks.edit')
                                 }),
                                 jsx(SmallButton, {
                                   onClick: () => {
                                     tap()
                                     saveClocks(clocks.filter(item => item.id !== card.id))
                                   },
-                                  children: 'Remove'
+                                  children: t('clocks.remove')
                                 })
                               ]
                             })
@@ -1838,10 +1987,11 @@ function PluginPageContent() {
 
 
 function QuotaRing({ card, mode, size = 64, showValue = true }) {
+  const t = useTr()
   const percent = card.error ? null : quotaPercent(card, mode)
   const remaining = quotaPercent(card, 'remaining')
   const color = percent === null ? text.quaternary : remaining <= 10 ? text.red : remaining <= 30 ? text.yellow : text.accent
-  const label = `${card.provider || ''} ${card.label}: ${percent === null ? 'usage unavailable' : `${percent}% ${mode === 'used' ? 'used' : 'remaining'}`}`
+  const label = `${card.provider || ''} ${card.label}: ${percent === null ? t('popup.ringUnavailable') : t(mode === 'used' ? 'popup.ringUsed' : 'popup.ringRemaining', percent)}`
   return jsxs('div', {
     role: percent === null ? 'img' : 'meter', 'aria-label': label,
     ...(percent === null ? {} : { 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent }),
@@ -1871,6 +2021,7 @@ function QuickUsageSlot() {
 }
 
 function QuickUsage() {
+  const t = useTr()
   const open = useValue($quickOpen)
   // Closed, the chip reads the shared cache only. Vendors are asked while it is open.
   const { gateway, profile, preferences, live } = useFocusedLiveCards(open)
@@ -1883,34 +2034,34 @@ function QuickUsage() {
   const lowestPercent = lowest ? quotaPercent(lowest, mode) : null
   const checkedAt = live.data?.checkedAt
   const stale = checkedAt && nowMs - checkedAt >= POLL_MS
-  const label = mode === 'used' ? 'Used' : 'Remaining'
+  const label = t(mode === 'used' ? 'popup.used' : 'popup.remaining')
   return jsxs(Popover, { open, onOpenChange: value => $quickOpen.set(value), children: [
     jsx(PopoverTrigger, { asChild: true, children: jsxs('button', {
-      type: 'button', 'aria-label': 'Open usage and reset clocks', 'data-resetwatch-trigger': true,
+      type: 'button', 'aria-label': t('popup.open'), 'data-resetwatch-trigger': true,
       title: lowest
-        ? `${PLUGIN_NAME}: lowest is ${[lowest.provider, lowest.label].filter(Boolean).join(' ')}, ${quotaPercent(lowest, 'remaining')}% left`
-        : `${PLUGIN_NAME}: usage and reset clocks`,
+        ? t('popup.lowest', [lowest.provider, lowest.label].filter(Boolean).join(' '), quotaPercent(lowest, 'remaining'))
+        : t('popup.idle'),
       style: { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '0 6px', height: '100%',
         color: text.tertiary, background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '0.6875rem',
         fontVariantNumeric: 'tabular-nums' },
-      children: [jsx(QuotaRing, { card: lowest || { id: 'unknown', label: 'Usage', remaining: null, used: null },
-        mode, size: 12, showValue: false }), lowestPercent === null ? 'Usage' : `${lowestPercent}%`]
+      children: [jsx(QuotaRing, { card: lowest || { id: 'unknown', label: t('popup.usage'), remaining: null, used: null },
+        mode, size: 12, showValue: false }), lowestPercent === null ? t('popup.usage') : `${lowestPercent}%`]
     }) }),
     jsxs(PopoverContent, {
-      side: 'top', align: 'end', sideOffset: 8, 'aria-label': `${PLUGIN_NAME} usage`, 'data-resetwatch-popup': true,
+      side: 'top', align: 'end', sideOffset: 8, 'aria-label': t('popup.label'), 'data-resetwatch-popup': true,
       style: { width: 'min(420px, calc(100vw - 24px))', padding: 14, color: text.primary },
       children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }, children: [
-          jsx('strong', { style: { flex: 1, fontSize: 14 }, children: 'Usage & reset' }),
-          jsx('select', { 'aria-label': 'Quick quota display mode', value: mode, onChange: event => saveDisplayMode(event.target.value),
+          jsx('strong', { style: { flex: 1, fontSize: 14 }, children: t('popup.title') }),
+          jsx('select', { 'aria-label': t('popup.displayMode'), value: mode, onChange: event => saveDisplayMode(event.target.value),
             style: { color: text.primary, background: 'var(--ui-bg-primary)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 4, fontSize: 11 },
-            children: [jsx('option', { value: 'remaining', children: 'Remaining %' }), jsx('option', { value: 'used', children: 'Used %' })] }),
+            children: [jsx('option', { value: 'remaining', children: t('mode.remaining') }), jsx('option', { value: 'used', children: t('mode.used') })] }),
           jsx(SmallButton, { disabled: gateway !== 'open' || live.isFetching || coolingDown,
-            title: coolingDown ? 'Wait at least one minute between refreshes' : 'Refresh usage',
-            onClick: () => live.refetch(), children: live.isFetching ? 'Updating' : 'Refresh' })
+            title: t(coolingDown ? 'popup.refreshWait' : 'popup.refreshHint'),
+            onClick: () => live.refetch(), children: live.isFetching ? t('popup.updating') : t('common.refresh') })
         ] }),
         jsx('div', { style: { fontSize: 11, color: text.tertiary, marginBottom: 10 }, children:
-          `${profile || 'Unknown profile'} | ${label} | ${gateway !== 'open' ? 'Offline, cached data' : live.isFetching ? 'Showing last data while updating' : stale ? 'Stale cache, waiting for refresh' : 'Latest check'}` }),
+          `${profile || t('popup.unknownProfile')} | ${label} | ${t(gateway !== 'open' ? 'popup.offline' : live.isFetching ? 'popup.showingLast' : stale ? 'popup.stale' : 'popup.latest')}` }),
         jsx('div', { style: { maxHeight: 'min(480px, 65vh)', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }, children:
           groups.length ? groups.map(group => jsxs('section', { children: [
             jsx('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 7 }, children: group.title }),
@@ -1921,19 +2072,19 @@ function QuickUsage() {
                 jsx('div', { style: { fontSize: 12, fontWeight: 500 }, children: card.label }),
                 card.account ? jsx('div', { style: { fontSize: 11, color: text.tertiary }, children: card.account }) : null,
                 jsx('div', { style: { fontSize: 11, color: text.secondary, marginTop: 3 },
-                  children: formatReset(card.resetAt, card.resetText, nowMs) || 'Reset time unavailable' }),
+                  children: formatReset(card.resetAt, card.resetText, nowMs) || t('reset.unknown') }),
                 card.error || quotaPercent(card, mode) === null ? jsx('div', { style: { fontSize: 11, color: text.tertiary, overflowWrap: 'anywhere' },
-                  children: card.detail || 'Provider did not report a percentage' }) : null
+                  children: card.detail || t('popup.noPercent') }) : null
               ] })
             ] }, card.id))
           ] }, group.title)) : jsx('div', { style: { padding: '20px 0', fontSize: 12, color: text.secondary },
-            children: live.isFetching ? 'Reading usage for the first time. Later opens show the last check right away.' : 'No usage data yet. Open the full page to check providers.' }) }),
+            children: t(live.isFetching ? 'popup.firstRead' : 'popup.empty') }) }),
         live.data?.errors?.length ? jsx('div', { role: 'status', style: { fontSize: 11, color: text.yellow, marginTop: 8, overflowWrap: 'anywhere' },
           children: live.data.errors.join(' | ') }) : null,
         jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }, children: [
           jsx('span', { style: { flex: 1, fontSize: 10, color: text.tertiary }, children: checkedAt
-            ? `Checked ${checkedTime(checkedAt, nowMs)} | Refreshes every 5 min while open` : 'Refreshes every 5 min while open' }),
-          jsx(SmallButton, { onClick: () => { $quickOpen.set(false); go(ROUTE) }, children: 'Full page' })
+            ? t('popup.checked', checkedTime(checkedAt, nowMs)) : t('popup.cadence') }),
+          jsx(SmallButton, { onClick: () => { $quickOpen.set(false); go(ROUTE) }, children: t('popup.fullPage') })
         ] })
       ]
     })
@@ -1959,6 +2110,8 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     const onDispose = typeof ctx.onDispose === 'function' ? fn => ctx.onDispose(fn) : () => {}
+    i18n = ctx.i18n && typeof ctx.i18n.register === 'function' && typeof ctx.i18n.t === 'function' ? ctx.i18n : null
+    if (i18n) i18n.register(LOCALES)
     storage = ctx.storage || null
     os = ctx.os || null
     loadClocks()
@@ -1970,47 +2123,56 @@ export default {
     const clockTimer = setInterval(() => $now.set(Date.now()), 30000)
     onDispose(() => clearInterval(clockTimer))
 
+    // Desktop reads these labels once, so they are re-registered in the new language.
+    const labelled = () => {
+      const rows = [
+        {
+          id: 'nav',
+          area: SIDEBAR_NAV_AREA,
+          order: 62,
+          data: { path: ROUTE, label: tr('name'), codicon: 'watch' }
+        },
+        {
+          id: 'open',
+          area: PALETTE_AREA,
+          data: {
+            id: 'resetwatch.open',
+            label: tr('open.palette'),
+            keywords: ['usage', 'quota', 'reset', 'limits', 'subscription'],
+            run: () => go(ROUTE)
+          }
+        }
+      ]
+      if (KEYBINDS_AREA) {
+        rows.push({
+          id: 'open-key',
+          area: KEYBINDS_AREA,
+          data: {
+            id: 'resetwatch.open',
+            label: tr('open.keybind'),
+            category: tr('name'),
+            defaults: ['mod+alt+r'],
+            run: () => go(ROUTE)
+          }
+        })
+      }
+      return rows
+    }
     const contributions = [
       { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(Page, {}) },
-      {
-        id: 'nav',
-        area: SIDEBAR_NAV_AREA,
-        order: 62,
-        data: { path: ROUTE, label: PLUGIN_NAME, codicon: 'watch' }
-      },
-      {
-        id: 'open',
-        area: PALETTE_AREA,
-        data: {
-          id: 'resetwatch.open',
-          label: 'Resetwatch: Open',
-          keywords: ['usage', 'quota', 'reset', 'limits', 'subscription'],
-          run: () => go(ROUTE)
-        }
-      }
+      ...labelled()
     ]
-    if (KEYBINDS_AREA) {
-      contributions.push({
-        id: 'open-key',
-        area: KEYBINDS_AREA,
-        data: {
-          id: 'resetwatch.open',
-          label: 'Open Resetwatch',
-          category: PLUGIN_NAME,
-          defaults: ['mod+alt+r'],
-          run: () => go(ROUTE)
-        }
-      })
-    }
     quickUsageSupported = !!(Popover && PopoverContent && PopoverTrigger && typeof useQuery === 'function')
     if (quickUsageSupported) {
       contributions.push({ id: 'quick-usage', area: (STATUSBAR_AREAS && STATUSBAR_AREAS.right) || 'statusBar.right',
         order: 100, render: () => jsx(QuickUsageSlot, {}) })
     }
     ctx.registerMany(contributions)
+    if (i18n && typeof i18n.onLocaleChange === 'function') i18n.onLocaleChange(() => ctx.registerMany(labelled()))
     onDispose(() => {
       storage = null
       os = null
+      i18n = null
     })
   }
 }
