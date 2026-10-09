@@ -165,11 +165,29 @@ python -m unittest test_opencode_go_multi test_probe_slicing
 node --test test_probe_pagination.cjs
 node --test test_quick_usage.cjs
 HERMES_TEST_CATALOG=1 node --test test_quick_usage.cjs
+node --test test_i18n.cjs
+HERMES_TEST_CATALOG=1 node --test test_i18n.cjs
 ```
 
 The tests use temporary homes and fake credentials. Vendor access is blocked, including when a probe cache is missing. On Linux, the routing suite also launches a fixture gateway in a custom venv to exercise UI interpreter discovery with system Python and a stale dependency cache. CI runs it against both standalone and catalog packages.
 
 The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` and `PyYAML` in the test environment for vendor response and secret-cache fixtures.
+
+### Translations
+
+The page, the status-bar popup, and the sidebar, palette, and shortcut labels read their text from the `EN` bundle near the top of `plugin.js`. To add a language, add a bundle to `LOCALES` under its Desktop locale, such as `zh` or `zh-hant`. A bundle only needs the keys it translates; Desktop shows English for the rest. Entries written as functions, such as `card.left`, take the values to insert, so their translations are functions too:
+
+```js
+const LOCALES = {
+  en: EN,
+  zh: {
+    common: { refresh: '刷新' },
+    card: { left: percent => `剩余 ${percent}%` }
+  }
+}
+```
+
+Card text that comes from vendors or `probe.py`, such as plan names and "Usage unavailable", stays English for now, as does the self-updater panel. Desktop builds without plugin translations show English. After editing, run `python scripts/build_catalog.py` and the `test_i18n.cjs` commands above.
 
 ## License
 
