@@ -2073,6 +2073,13 @@ def _pool_entries(provider: str) -> list[dict]:
     return []
 
 
+CODEX_DEAD_LOGIN = "Hermes reports this login is no longer valid. Sign in to Codex again in Hermes."
+CODEX_EXPIRED_LOGIN = (
+    "The access token has expired, so usage was not checked. Resetwatch does not renew logins; "
+    "Hermes may renew it the next time it uses this account."
+)
+
+
 def _codex_pool_entries() -> list[dict]:
     return _pool_entries("openai-codex")
 
@@ -2081,13 +2088,16 @@ def _codex_pool_accounts() -> list[dict]:
     accounts: list[dict] = []
     seen_tokens: set[str] = set()
     seen_accounts: set[str] = set()
+    unusable: list[tuple[dict, str, str]] = []
     for entry in _codex_pool_entries():
-        if str(entry.get("last_status") or "").strip().lower() == "dead":
-            continue
         token = str(entry.get("access_token") or "").strip()
         if not token or token in seen_tokens:
             continue
+        if str(entry.get("last_status") or "").strip().lower() == "dead":
+            unusable.append((entry, token, CODEX_DEAD_LOGIN))
+            continue
         if _codex_token_expiring(token):
+            unusable.append((entry, token, CODEX_EXPIRED_LOGIN))
             continue
         seen_tokens.add(token)
         account_id = _codex_account_id_from_token(token)
@@ -2106,11 +2116,38 @@ def _codex_pool_accounts() -> list[dict]:
                 "key": str(entry.get("id") or "").strip(),
             }
         )
+    # A login that cannot be checked read-only still gets a card saying why,
+    # unless another login for the same account already has numbers.
+    for entry, token, status in unusable:
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        account_id = _codex_account_id_from_token(token)
+        if account_id:
+            if account_id in seen_accounts:
+                continue
+            seen_accounts.add(account_id)
+        accounts.append(
+            {
+                "token": token,
+                "account_id": account_id,
+                "label": _codex_card_label(entry, token),
+                "key": str(entry.get("id") or "").strip(),
+                "status": status,
+            }
+        )
     return accounts
 
 
 def _codex_pool_fetcher(account: dict):
     def fetch() -> Optional[dict]:
+        if account.get("status"):
+            return _error_snapshot(
+                "openai-codex",
+                account["status"],
+                account_label=account.get("label"),
+                account_key=account.get("key"),
+            )
         return _fetch_codex_usage(
             account.get("token") or "",
             account.get("account_id"),
@@ -3390,6 +3427,13 @@ def _collect_cli() -> tuple[list[dict], bool]:
     cli_context = _codex_cli_access_context() if "openai-codex" not in _disabled_providers else None
     if cli_context:
         cli_token = str(cli_context[0] or "").strip()
+        cli_account = str(cli_context[1] or "").strip() or _codex_account_id_from_token(cli_token)
+        # A working Codex CLI login covers its account; drop a stale pool card for it.
+        if cli_account:
+            pool_accounts = [
+                account for account in pool_accounts
+                if not (account.get("status") and account.get("account_id") == cli_account)
+            ]
     # (provider, label, key, fetcher). provider/label/key name the error card
     # when a fetcher raises or runs past the budget.
     fetchers: list[tuple[str, Optional[str], Optional[str], Any]] = [
