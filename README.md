@@ -81,7 +81,7 @@ Live cards fill on their own when that login is already on the machine:
 - **Cursor:** Cursor app or `cursor-agent`
 - **Kimi:** Kimi Code CLI, or `KIMI_CODING_API_KEY` / `KIMI_API_KEY` in Hermes env (Coding Plan)
 - **Grok:** Grok CLI
-- **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing)
+- **GLM:** ZCode Coding Plan, or `ZAI_API_KEY` / `GLM_API_KEY` in Hermes env (includes peak / off-peak pricing). `GLM_BASE_URL` / `ZAI_BASE_URL` / `Z_AI_BASE_URL` in Hermes env steer the monitor call at the matching region (China `open.bigmodel.cn` vs international `api.z.ai`).
 - **DeepSeek:** `DEEPSEEK_API_KEY` in Hermes env (balance plus peak / off-peak). Funded USD and CNY balances appear separately with their own top-up and granted amounts. An empty USD row does not hide CNY funds; currencies are never added or compared by amount. Peak pricing is Monday-Friday, 01:00-04:00 and 06:00-10:00 UTC. All other hours, including weekends, are off-peak at half price. [Official schedule](https://api-docs.deepseek.com/quick_start/pricing/).
 - **OpenCode Go:** `OPENCODE_GO_API_KEY` in Hermes env (5h, weekly, monthly). For more than one subscription, add consecutive `OPENCODE_GO_API_KEY_2`, `_3`, etc. Each distinct key gets its own numbered account card; duplicate keys are fetched once. Keep the numbers consecutive (a missing number ends discovery). Keys are never included in card labels or probe output.
 - **Ollama Cloud:** `OLLAMA_API_KEY` in Hermes env (5h / weekly limits or the monthly included allowance, with reset times, plus purchased credits)
