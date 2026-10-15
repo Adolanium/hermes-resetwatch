@@ -2370,6 +2370,15 @@ def _glm_hermes_api_key() -> Optional[str]:
     return None
 
 
+def _glm_hermes_base_url() -> Optional[str]:
+    """Monitor base inferred from a Hermes GLM_BASE_URL override (region-aware)."""
+    for name in ("GLM_BASE_URL", "ZAI_BASE_URL", "Z_AI_BASE_URL"):
+        value = (_hermes_env_value(name) or "").strip()
+        if value:
+            return _zai_monitor_base(value)
+    return None
+
+
 def _fetch_glm_zcode_usage() -> Optional[dict]:
     creds = _zcode_coding_credentials()
     if not creds:
@@ -2382,7 +2391,7 @@ def _fetch_glm_hermes_api_key_usage() -> Optional[dict]:
     token = _glm_hermes_api_key()
     if not token:
         return None
-    return _fetch_glm_quota(token, "https://api.z.ai")
+    return _fetch_glm_quota(token, _glm_hermes_base_url() or "https://api.z.ai")
 
 
 def _fetch_glm_zcode_account_usage() -> Optional[dict]:
