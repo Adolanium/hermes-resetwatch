@@ -300,7 +300,7 @@ function saveQuotaCache(key, payload) {
     used: card.used, resetAt: card.resetAt, resetText: card.resetText, detail: card.detail
   }))
   remember(QUOTA_CACHE_KEY, { ...freshQuotaCacheEntries(), [JSON.stringify(key)]: { cards, errors: [],
-    checkedAt: payload.checkedAt, hadSession: payload.hadSession, haveAccountRpc: payload.haveAccountRpc } })
+    checkedAt: payload.checkedAt, observedAt: observedTime(payload), hadSession: payload.hadSession, haveAccountRpc: payload.haveAccountRpc } })
 }
 
 function saveQuickUsage(on) {
@@ -1085,6 +1085,22 @@ function go(route) {
   if (typeof host.navigate === 'function') host.navigate(route)
 }
 
+// The probe can answer from its own cache, so the oldest vendor observation,
+// not the time of this request, is when the shown numbers were checked.
+function probeObservedAt(snapshots, now) {
+  let oldest = now
+  for (const snap of snapshots || []) {
+    const at = Number(snap && snap.observed_at) * 1000
+    if (Number.isFinite(at) && at > 0 && at < oldest) oldest = at
+  }
+  return oldest
+}
+
+function observedTime(payload) {
+  if (!payload) return undefined
+  return Number.isFinite(payload.observedAt) ? payload.observedAt : payload.checkedAt
+}
+
 async function fetchLiveCards(sessionId, opts, connectionId, profile) {
   const cards = []
   const errors = []
@@ -1176,6 +1192,8 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
     if (extra.length) cards.push(...cardsFromAccountSnapshots(extra))
   }
+  const checkedAt = Date.now()
+  const observedAt = probeObservedAt(probed, checkedAt)
 
   // Claude often comes from Hermes /usage when the probe has Codex/etc. but
   // no Anthropic row. Only skip that fallback once Claude is already present.
@@ -1201,7 +1219,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     seen.add(card.id)
     unique.push(card)
   }
-  return { cards: arrangeProviderCards(unique, { disabled }), errors, hadSession: Boolean(sid), haveAccountRpc, checkedAt: Date.now() }
+  return { cards: arrangeProviderCards(unique, { disabled }), errors, hadSession: Boolean(sid), haveAccountRpc, checkedAt, observedAt }
 }
 
 function SmallButton({ onClick, children, active, title, disabled }) {
@@ -1812,8 +1830,8 @@ function PluginPageContent() {
               }),
               jsx('span', {
                 style: { fontSize: '0.6875rem', color: text.tertiary },
-                children: Number.isFinite(payload.checkedAt)
-                  ? t('page.gatewayChecked', gateway || 'idle', checkedTime(payload.checkedAt, nowMs))
+                children: Number.isFinite(observedTime(payload))
+                  ? t('page.gatewayChecked', gateway || 'idle', checkedTime(observedTime(payload), nowMs))
                   : t('page.gateway', gateway || 'idle')
               }),
               quickUsageSupported
@@ -2032,7 +2050,7 @@ function QuickUsage() {
   const coolingDown = useCoolingDown(live.cooldownUntil || 0)
   const lowest = lowestQuotaCard(cards)
   const lowestPercent = lowest ? quotaPercent(lowest, mode) : null
-  const checkedAt = live.data?.checkedAt
+  const checkedAt = observedTime(live.data)
   const stale = checkedAt && nowMs - checkedAt >= POLL_MS
   const label = t(mode === 'used' ? 'popup.used' : 'popup.remaining')
   return jsxs(Popover, { open, onOpenChange: value => $quickOpen.set(value), children: [
