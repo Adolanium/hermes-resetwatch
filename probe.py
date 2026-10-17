@@ -504,6 +504,10 @@ def _read_probe_result_cache(*, cli_only: bool, max_age: float = PROBE_MIN_INTER
     age = datetime.now(timezone.utc).timestamp() - float(fetched_at)
     if age < 0 or age > float(max_age):
         return None
+    # Caches written before observed_at existed were observed at fetched_at.
+    for snap in snapshots:
+        if isinstance(snap, dict):
+            snap.setdefault("observed_at", float(fetched_at))
     return snapshots
 
 
@@ -618,6 +622,7 @@ def _cached_anthropic_snapshot(*, scope: Optional[str] = None, max_age: Optional
         "windows": list(payload.get("windows") or []),
     }
     if isinstance(fetched_at, (int, float)) and math.isfinite(fetched_at):
+        out["observed_at"] = float(fetched_at)
         try:
             stamp = datetime.fromtimestamp(float(fetched_at), tz=timezone.utc).astimezone()
             as_of = stamp.strftime("%b %d, %I:%M %p").lstrip("0")
@@ -2392,7 +2397,12 @@ def _pool_entries(provider: str) -> list[dict]:
     name = str(provider or "").strip()
     if not name:
         return []
-    for home in _hermes_homes():
+    homes = _hermes_homes()
+    # Hermes falls back per provider: a profile with no rows for a provider
+    # uses the base home's rows, even when it has an auth.json of its own.
+    if _profile_home is not None and _profile_home.parent.name == "profiles":
+        homes = [*homes, _profile_home.parent.parent]
+    for home in homes:
         store = _read_auth_store(home / "auth.json")
         if not store:
             continue
@@ -4151,6 +4161,11 @@ def _main_inner() -> int:
         cli_snaps, cli_complete = _collect_cli()
         for snap in cli_snaps:
             _keep_snapshot(snapshots, have, labelled, snap)
+    # When the vendor answered, so cached reads report the real check time.
+    observed_at = datetime.now(timezone.utc).timestamp()
+    for snap in snapshots:
+        if isinstance(snap, dict):
+            snap.setdefault("observed_at", observed_at)
     if cli_complete and snapshots:
         _store_probe_result_cache(snapshots, cli_only=cli_only)
     emit_page(snapshots)

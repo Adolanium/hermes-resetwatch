@@ -101,7 +101,7 @@ probe.main()
         for source, probe in probes():
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp, \
                  patch.object(probe, '_resetwatch_cache_dir', return_value=Path(tmp)):
-                first = [{'provider': 'cached-' + str(i)} for i in range(12)]
+                first = [{'provider': 'cached-' + str(i), 'observed_at': 1.0} for i in range(12)]
                 probe._store_probe_result_cache(first, cli_only=True)
                 cached_rows = probe._read_probe_result_cache(cli_only=True)
                 self.assertEqual(cached_rows, first)
@@ -111,9 +111,9 @@ probe.main()
                 cached['fetched_at'] -= 301
                 cache.write_text(json.dumps(cached))
                 self.assertIsNone(probe._read_probe_result_cache(cli_only=True))
-                probe._store_probe_result_cache([{'provider': 'replacement'}], cli_only=True)
+                probe._store_probe_result_cache([{'provider': 'replacement', 'observed_at': 2.0}], cli_only=True)
                 self.assertEqual(probe._read_pinned_snapshots(token), first)
-                self.assertEqual(probe._read_probe_result_cache(cli_only=True), [{'provider': 'replacement'}])
+                self.assertEqual(probe._read_probe_result_cache(cli_only=True), [{'provider': 'replacement', 'observed_at': 2.0}])
 
     def test_expired_pin_is_not_replaced_by_shared_cache(self):
         for source, probe in probes():

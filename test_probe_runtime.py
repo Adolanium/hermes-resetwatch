@@ -65,7 +65,7 @@ class ProbeRuntimeTests(unittest.TestCase):
                             self.assertFalse(cache.exists())
 
     def test_vendor_error_caches_still_work(self):
-        snapshots = [{"provider": "anthropic", "details": ["HTTP 429"]}]
+        snapshots = [{"provider": "anthropic", "details": ["HTTP 429"], "observed_at": 1.0}]
         for source, probe in probes():
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
                 with patch.object(probe, "_probe_result_cache_path", return_value=Path(tmp) / "cache.json"):

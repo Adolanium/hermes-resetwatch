@@ -60,7 +60,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
       if (!(index in states)) states[index] = value
       return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
     }, jsx, jsxs: jsx })
-  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, $quickOpen, $displayMode };', context)
+  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode };', context)
   context.plugin.register({ storage: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
     set: (key, value) => saved.set(key, value) }, onDispose: fn => disposers.push(fn),
     registerMany: rows => registered.push(...rows) })
@@ -366,4 +366,21 @@ test('older checks show their date, not just a time', () => {
   const later = api.checkedTime(checkedAt, checkedAt + 2 * 86400000)
   assert(sameDay && later.length > sameDay.length, `${later} should carry a date beyond ${sameDay}`)
   assert.equal(api.checkedTime(undefined, checkedAt), '')
+})
+test('probe cache hits report the vendor observation time, not the request time', () => {
+  const { api } = load()
+  const now = Date.parse('2030-01-01T12:10:00Z')
+  const observed = Date.parse('2030-01-01T12:04:00Z')
+  assert.equal(api.probeObservedAt([{ observed_at: observed / 1000 }, { observed_at: now / 1000 }], now), observed)
+  for (const snaps of [null, [], [{}], [{ observed_at: 'bad' }], [{ observed_at: now / 1000 + 60 }]]) {
+    assert.equal(api.probeObservedAt(snaps, now), now)
+  }
+})
+test('the saved popup snapshot keeps its observation time', () => {
+  const { api, key, payload } = load()
+  const observedAt = payload.checkedAt - 240000
+  api.saveQuotaCache(key, { ...payload, observedAt })
+  const cached = api.readQuotaCache(key)
+  assert.equal(cached.observedAt, observedAt)
+  assert.equal(cached.checkedAt, payload.checkedAt)
 })
