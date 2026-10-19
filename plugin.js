@@ -159,6 +159,8 @@ const EN = {
     noHttpx: 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.',
     noProbe: 'probe.py not found in the standalone or combined-package installation on this Gateway',
     noPython: 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)',
+    shellRefused: reason => `shell.exec refused: ${reason}`,
+    shellNeedsSession: 'shell.exec refused: this Hermes runs probe.py only for a focused local session. Open a chat, then refresh.',
     probeRun: 'Could not run probe.py',
     probeNoPython: 'Could not run probe.py (no working Hermes Python)'
   }
@@ -945,6 +947,29 @@ async function profileRequester(connectionId, profile) {
   }
 }
 
+// Hermes main serves the session-scoped shell.exec ({ session_id, command }).
+// Older backends serve the sidecar variant, whose closed params refuse a
+// session_id, so retry bare once when the scoped call is refused.
+// A refusal is the same for every interpreter and path, so it is tagged and
+// ends the candidate search instead of being retried.
+async function shellExec(request, sid, command) {
+  const reason = error => String((error && error.message) || error || '')
+  const refused = message => Object.assign(new Error(message), { refused: true })
+  if (sid) {
+    try {
+      return await request('shell.exec', { command, session_id: sid })
+    } catch (error) {
+      if (!/invalid_params|extra_forbidden/i.test(reason(error))) throw refused(tr('errors.shellRefused', reason(error)))
+    }
+  }
+  try {
+    return await request('shell.exec', { command })
+  } catch (error) {
+    if (!sid && /invalid_params/i.test(reason(error))) throw refused(tr('errors.shellNeedsSession'))
+    throw refused(tr('errors.shellRefused', reason(error)))
+  }
+}
+
 // shell.exec returns only the last 4000 characters of stdout. Each probe
 // invocation requests at most eight snapshots and probe.py also caps bytes.
 const PROBE_SLICE = 8
@@ -969,10 +994,9 @@ function pinnedPage(text, expectedToken) {
   return parsed
 }
 
-async function probeNextSlice(request, python, probe, flags, token, offset) {
-  const result = await request('shell.exec', {
-    command: `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --snapshot-token=${token} --slice=${offset}:${PROBE_SLICE}`
-  })
+async function probeNextSlice(request, sid, python, probe, flags, token, offset) {
+  const result = await shellExec(request, sid,
+    `${quoteShell(python)} ${quoteShell(probe)}${flags.replace(' --fresh', '')} --snapshot-token=${token} --slice=${offset}:${PROBE_SLICE}`)
   if (!result || result.code) {
     throw new Error((result && String(result.stderr || '').trim()) || (result ? `probe exit ${result.code}` : 'probe returned nothing'))
   }
@@ -1022,9 +1046,8 @@ async function probeStockAccountUsage(request, opts) {
           const probe = `${home}/${relativePath}`
           if (deadProbes.has(probe)) continue
           try {
-            const result = await request('shell.exec', {
-              command: `${quoteShell(python)} ${quoteShell(probe)}${flags} --pin-snapshot --slice=0:${PROBE_SLICE}`
-            })
+            const result = await shellExec(request, opts && opts.sessionId,
+              `${quoteShell(python)} ${quoteShell(probe)}${flags} --pin-snapshot --slice=0:${PROBE_SLICE}`)
             if (!result || result.code) {
               const err = result && result.stderr ? String(result.stderr).trim() : ''
               const kind = probeFailureKind(result)
@@ -1054,7 +1077,7 @@ async function probeStockAccountUsage(request, opts) {
               let offset = all.length
               // A short page can mean byte-budget exhaustion, not end of list.
               for (let page = 0; offset && page < 256; page++) {
-                const next = await probeNextSlice(request, python, probe, flags, first.snapshot_token, offset)
+                const next = await probeNextSlice(request, opts && opts.sessionId, python, probe, flags, first.snapshot_token, offset)
                 if (!next.length) break
                 all.push(...next)
                 offset += next.length
@@ -1067,6 +1090,7 @@ async function probeStockAccountUsage(request, opts) {
               return { snapshots: null, error: errorMessage(error, 'probe snapshot failed') }
             }
           } catch (error) {
+            if (error && error.refused) return { snapshots: null, error: error.message }
             failures.push({ kind: 'failed', message: errorMessage(error, 'probe failed') })
           }
         }
@@ -1161,7 +1185,7 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
 
   const probeResult = disabled.filter(key => key !== 'nous').length === LIVE_PROVIDERS.length - 1
     ? { snapshots: [], error: null }
-    : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled })
+    : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
