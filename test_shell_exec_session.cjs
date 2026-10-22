@@ -18,8 +18,8 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
       assert.equal(method, 'shell.exec')
       calls.push({ ...params })
       const scoped = 'session_id' in params
-      if (backend === 'canonical' && !scoped) throw new Error('invalid_params')
-      if (backend === 'sidecar' && scoped) throw new Error('invalid_params')
+      if (backend === 'canonical' && !scoped) throw new Error('invalid params')
+      if (backend === 'sidecar' && scoped) throw new Error('Extra inputs are not permitted')
       if (backend === 'denied') throw new Error('permission_denied')
       return { code: 0, stdout: JSON.stringify([{ provider: 'vendor' }]) }
     }
