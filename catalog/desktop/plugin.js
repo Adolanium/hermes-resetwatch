@@ -952,8 +952,6 @@ async function profileRequester(connectionId, profile) {
 // session_id, so retry bare once when the scoped call is refused.
 // A refusal is the same for every interpreter and path, so it is tagged and
 // ends the candidate search instead of being retried.
-// Accept underscore-style names and prose validation errors, including
-// responses that spell parameter names with spaces.
 async function shellExec(request, sid, command) {
   const reason = error => String((error && error.message) || error || '')
   const refused = message => Object.assign(new Error(message), { refused: true })
