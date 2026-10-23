@@ -10,7 +10,11 @@ fall back to Hermes env. DeepSeek (DEEPSEEK_API_KEY), OpenCode Go
 (MINIMAX_API_KEY), Novita (NOVITA_API_KEY), DeepInfra
 (DEEPINFRA_API_KEY), and Vercel AI Gateway (AI_GATEWAY_API_KEY) always
 use Hermes env. Command Code uses COMMANDCODE_API_KEY from Hermes env,
-or the `cmd` CLI login in ~/.commandcode/auth.json.
+or the `cmd` CLI login in ~/.commandcode/auth.json. GitHub Copilot asks
+Hermes get_secret when that helper imports, otherwise the process
+environment, then the Copilot editor's apps.json / hosts.json, then
+`gh auth token`. It does not open Hermes .env or auth.json, and it does
+not refresh or store tokens.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
 those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
@@ -125,7 +129,7 @@ _profile_inherits_env = True
 LIVE_PROVIDERS = (
     "nous", "anthropic", "openai-codex", "openrouter", "cursor", "kimi", "grok",
     "glm", "deepseek", "opencode-go", "ollama", "minimax", "novita", "deepinfra",
-    "ai-gateway", "commandcode",
+    "ai-gateway", "commandcode", "copilot",
 )
 _disabled_providers: set[str] = set()
 _slice_args: Optional[tuple[int, int]] = None
@@ -195,6 +199,17 @@ NOVITA_BALANCE_URL = "https://api.novita.ai/openapi/v1/billing/balance/detail"
 DEEPINFRA_CHECKLIST_URL = "https://api.deepinfra.com/payment/checklist"
 AI_GATEWAY_CREDITS_URL = "https://ai-gateway.vercel.sh/v1/credits"
 COMMANDCODE_DEFAULT_BASE_URL = "https://api.commandcode.ai"
+
+# Private Copilot usage call. Not part of GitHub's published REST docs.
+COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
+COPILOT_CLIENT_HEADERS = {
+    "Accept": "application/json",
+    "Editor-Version": "vscode/1.96.2",
+    "Editor-Plugin-Version": "copilot-chat/0.26.7",
+    "User-Agent": "GitHubCopilotChat/0.26.7",
+    "X-Github-Api-Version": "2025-04-01",
+}
+_COPILOT_SECRET_NAMES = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Official GLM Coding Plan peak window: Mon-Fri 14:00-18:00 Singapore (UTC+8).
 # Off-peak credits cost 50%. Fixed +08:00 works the same on Mac and Windows.
@@ -337,6 +352,8 @@ def _provider_key(name: Any) -> str:
         return "deepinfra"
     if key in {"ai-gateway", "vercel", "vercel-ai-gateway"}:
         return "ai-gateway"
+    if key in {"github-copilot", "github"}:
+        return "copilot"
     return key
 
 
@@ -3701,6 +3718,415 @@ def _fetch_commandcode_account_usage() -> Optional[dict]:
     return _commandcode_snapshot(account, credits, subscription, summary)
 
 
+_COPILOT_SKU_PLANS = {
+    "monthly_subscriber_quota": "Pro",
+    "plus_monthly_subscriber_quota": "Pro+",
+    "copilot_standalone_seat_quota": "Business",
+    "copilot_business_seat": "Business",
+    "copilot_for_business_seat_quota": "Business",
+    "copilot_enterprise_seat": "Enterprise",
+    "copilot_enterprise_seat_quota": "Enterprise",
+    "free_limited_copilot": "Free",
+    "free_educational_quota": "Student",
+}
+_COPILOT_PAID_SKUS = {
+    "monthly_subscriber_quota",
+    "plus_monthly_subscriber_quota",
+    "copilot_standalone_seat_quota",
+    "copilot_business_seat",
+    "copilot_for_business_seat_quota",
+    "copilot_enterprise_seat",
+    "copilot_enterprise_seat_quota",
+}
+_COPILOT_FREE_SKUS = {"free_limited_copilot", "free_educational_quota"}
+_COPILOT_PAID_PLANS = {
+    "individual_pro", "individual_max", "business", "enterprise", "pro", "pro_plus", "plus",
+}
+_COPILOT_FREE_PLANS = {"individual", "free", "individual_edu"}
+_COPILOT_SEAT_SKUS = {
+    "copilot_standalone_seat_quota",
+    "copilot_business_seat",
+    "copilot_for_business_seat_quota",
+    "copilot_enterprise_seat",
+    "copilot_enterprise_seat_quota",
+}
+
+
+def _copilot_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _copilot_whole(value: float) -> str:
+    return str(int(round(value)))
+
+
+def _copilot_process_value(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _copilot_named_secret(name: str) -> Optional[str]:
+    """Read one GitHub login without opening Hermes credential files.
+
+    get_secret is used when Hermes provides it. A value it returns, including
+    a miss, is final so a different profile's process environment is not
+    substituted. If the helper cannot be imported, or it cannot answer in
+    this process, the process environment is the fallback.
+    """
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
+        return _copilot_process_value(name)
+    try:
+        value = get_secret(name)
+    except Exception:
+        return _copilot_process_value(name)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _copilot_editor_dirs() -> list[Path]:
+    if _is_windows():
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if not local:
+            return []
+        return [Path(local) / "github-copilot"]
+    return [_user_home() / ".config" / "github-copilot"]
+
+
+def _copilot_editor_tokens() -> list[str]:
+    tokens: list[str] = []
+    for folder in _copilot_editor_dirs():
+        for name in ("apps.json", "hosts.json"):
+            payload = _read_json_file(folder / name)
+            if not isinstance(payload, dict):
+                continue
+            for key, value in payload.items():
+                if not str(key).startswith("github.com") or not isinstance(value, dict):
+                    continue
+                token = value.get("oauth_token")
+                if isinstance(token, str) and token.strip():
+                    tokens.append(token.strip())
+    return tokens
+
+
+def _copilot_gh_auth_token() -> Optional[str]:
+    """Ask the gh CLI for its current token. This does not refresh or write it."""
+    env = os.environ.copy()
+    for name in _COPILOT_SECRET_NAMES:
+        env.pop(name, None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = ""
+    for item in (result.stdout or "").splitlines():
+        if item.strip():
+            line = item.strip()
+            break
+    if not line or line.startswith("ghp_") or any(char.isspace() for char in line):
+        return None
+    return line
+
+
+def _copilot_token_candidates():
+    """GitHub logins to try, one at a time, without reading Hermes .env or auth.json."""
+    seen: set[str] = set()
+
+    def emit(token: Optional[str]) -> Optional[str]:
+        if not isinstance(token, str):
+            return None
+        text = token.strip()
+        if not text or text.startswith("ghp_") or text in seen:
+            return None
+        seen.add(text)
+        return text
+
+    for name in _COPILOT_SECRET_NAMES:
+        token = emit(_copilot_named_secret(name))
+        if token:
+            yield token
+    for token in _copilot_editor_tokens():
+        accepted = emit(token)
+        if accepted:
+            yield accepted
+    token = emit(_copilot_gh_auth_token())
+    if token:
+        yield token
+
+
+def _copilot_plan_name(payload: dict) -> Optional[str]:
+    sku = str(payload.get("access_type_sku") or "").strip()
+    if sku in _COPILOT_SKU_PLANS:
+        return _COPILOT_SKU_PLANS[sku]
+    plan = payload.get("copilot_plan")
+    if isinstance(plan, str) and plan.strip():
+        return _title_case_slug(plan.strip())
+    return None
+
+
+def _copilot_is_paid(payload: dict) -> bool:
+    sku = str(payload.get("access_type_sku") or "").strip()
+    if sku in _COPILOT_PAID_SKUS:
+        return True
+    if sku in _COPILOT_FREE_SKUS:
+        return False
+    plan = str(payload.get("copilot_plan") or "").strip().lower()
+    if plan in _COPILOT_PAID_PLANS:
+        return True
+    if plan in _COPILOT_FREE_PLANS:
+        return False
+    return False
+
+
+def _copilot_is_org_seat(payload: dict) -> bool:
+    sku = str(payload.get("access_type_sku") or "").strip()
+    if sku in _COPILOT_SEAT_SKUS:
+        return True
+    plan = str(payload.get("copilot_plan") or "").strip().lower()
+    if plan in {"business", "enterprise"}:
+        return True
+    if payload.get("token_based_billing") is True and sku not in _COPILOT_FREE_SKUS and plan not in _COPILOT_FREE_PLANS:
+        return True
+    return False
+
+
+def _copilot_reset(payload: dict) -> tuple[Optional[datetime], bool]:
+    for key in ("quota_reset_date_utc", "quota_reset_date", "limited_user_reset_date"):
+        parsed = _parse_dt(payload.get(key))
+        if parsed is not None:
+            return parsed, False
+    snapshots = payload.get("quota_snapshots")
+    buckets: list[dict] = []
+    if isinstance(snapshots, dict):
+        premium = snapshots.get("premium_interactions")
+        if isinstance(premium, dict):
+            buckets.append(premium)
+        buckets.extend(
+            bucket for key, bucket in snapshots.items()
+            if key != "premium_interactions" and isinstance(bucket, dict)
+        )
+    for bucket in buckets:
+        stamp = _copilot_number(bucket.get("quota_reset_at"))
+        if stamp is not None and stamp > 0:
+            parsed = _parse_dt(stamp)
+            if parsed is not None:
+                return parsed, False
+    if _copilot_is_paid(payload):
+        now = _utc_now()
+        year = now.year + (1 if now.month == 12 else 0)
+        month = 1 if now.month == 12 else now.month + 1
+        return datetime(year, month, 1, tzinfo=timezone.utc), True
+    return None, False
+
+
+def _copilot_billing_flag(payload: dict, premium: Any) -> Optional[bool]:
+    flag = payload.get("token_based_billing")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(premium, dict):
+        flag = premium.get("token_based_billing")
+        if isinstance(flag, bool):
+            return flag
+    return None
+
+
+def _copilot_unit(flag: Optional[bool]) -> str:
+    if flag is True:
+        return "AI credits"
+    return "Premium requests"
+
+
+def _copilot_metered(bucket: Any) -> bool:
+    if not isinstance(bucket, dict) or bucket.get("unlimited") is True:
+        return False
+    entitlement = _copilot_number(bucket.get("entitlement"))
+    if entitlement is None or entitlement <= 0:
+        return False
+    remaining = _copilot_number(bucket.get("remaining"))
+    if remaining is not None and remaining < 0:
+        return False
+    return True
+
+
+def _copilot_used_percent(bucket: dict, entitlement: float) -> Optional[float]:
+    percent = _copilot_number(bucket.get("percent_remaining"))
+    if percent is not None:
+        return max(0.0, min(100.0, 100.0 - percent))
+    remaining = _copilot_number(bucket.get("quota_remaining"))
+    if remaining is None:
+        remaining = _copilot_number(bucket.get("remaining"))
+    if remaining is None or entitlement <= 0:
+        return None
+    return max(0.0, min(100.0, (1.0 - (remaining / entitlement)) * 100.0))
+
+
+def _copilot_used_amount(bucket: dict, entitlement: float) -> Optional[float]:
+    remaining = _copilot_number(bucket.get("quota_remaining"))
+    if remaining is None:
+        remaining = _copilot_number(bucket.get("remaining"))
+    if remaining is not None:
+        return max(0.0, entitlement - remaining)
+    percent = _copilot_number(bucket.get("percent_remaining"))
+    if percent is None:
+        return None
+    return max(0.0, entitlement * ((100.0 - percent) / 100.0))
+
+
+def _copilot_meter_window(bucket: dict, label: str, reset_at: Optional[datetime], unit: Optional[str]) -> dict:
+    entitlement = _copilot_number(bucket.get("entitlement")) or 0.0
+    used_percent = _copilot_used_percent(bucket, entitlement)
+    if used_percent is None:
+        raise ValueError("Copilot usage response had no quota data")
+    amount = _copilot_used_amount(bucket, entitlement)
+    if amount is None:
+        detail = None
+    elif unit:
+        detail = f"{_copilot_whole(amount)} of {_copilot_whole(entitlement)} {unit} used"
+    else:
+        detail = f"{_copilot_whole(amount)} of {_copilot_whole(entitlement)} used"
+    return _win(label, used_percent, reset_at, detail)
+
+
+def _copilot_overage_window(bucket: Any, unit: str, reset_at: Optional[datetime]) -> Optional[dict]:
+    if not isinstance(bucket, dict) or bucket.get("overage_permitted") is not True:
+        return None
+    count = _copilot_number(bucket.get("overage_count"))
+    if count is None or count <= 0:
+        return None
+    shown = _copilot_whole(count) if abs(count - round(count)) < 1e-9 else f"{count:g}"
+    return _win("Additional usage", None, reset_at, f"{shown} {unit} beyond included")
+
+
+def _copilot_legacy_windows(payload: dict, reset_at: Optional[datetime]) -> list[dict]:
+    limited = payload.get("limited_user_quotas")
+    monthly = payload.get("monthly_quotas")
+    if not isinstance(limited, dict) or not isinstance(monthly, dict):
+        return []
+    windows: list[dict] = []
+    for key, label in (("chat", "Chat"), ("completions", "Completions")):
+        total = _copilot_number(monthly.get(key))
+        remaining = _copilot_number(limited.get(key))
+        if total is None or total <= 0 or remaining is None:
+            continue
+        used = max(0.0, total - remaining)
+        percent = max(0.0, min(100.0, used / total * 100.0))
+        windows.append(_win(label, percent, reset_at, f"{_copilot_whole(used)} of {_copilot_whole(total)} used"))
+    return windows
+
+
+def _copilot_snapshot_from_payload(payload: dict) -> dict:
+    """Turn a copilot_internal/user body into a card. Raises when it has no quota."""
+    if not isinstance(payload, dict):
+        raise ValueError("Copilot usage response had no quota data")
+    plan = _copilot_plan_name(payload)
+    reset_at, inferred = _copilot_reset(payload)
+    snapshots = payload.get("quota_snapshots") if isinstance(payload.get("quota_snapshots"), dict) else {}
+    premium = snapshots.get("premium_interactions") if isinstance(snapshots.get("premium_interactions"), dict) else {}
+    unit = _copilot_unit(_copilot_billing_flag(payload, premium))
+    windows: list[dict] = []
+    if _copilot_metered(premium):
+        windows.append(_copilot_meter_window(premium, unit, reset_at, unit))
+        extra = _copilot_overage_window(premium, unit, reset_at)
+        if extra:
+            windows.append(extra)
+    for key, label in (("chat", "Chat"), ("completions", "Completions")):
+        bucket = snapshots.get(key)
+        if _copilot_metered(bucket):
+            windows.append(_copilot_meter_window(bucket, label, reset_at, None))
+    if not windows and not isinstance(payload.get("quota_snapshots"), dict):
+        windows.extend(_copilot_legacy_windows(payload, reset_at))
+    details: list[str] = []
+    if not windows:
+        credits = _copilot_number(premium.get("credits_used")) if premium else None
+        if credits is not None and credits > 0:
+            shown = _copilot_whole(credits) if abs(credits - round(credits)) < 1e-9 else f"{credits:g}"
+            windows.append(_win(
+                "AI credits used",
+                None,
+                reset_at,
+                f"{shown} credits this month (allowance managed by your organization)",
+            ))
+            extra = _copilot_overage_window(premium, unit, reset_at)
+            if extra:
+                windows.append(extra)
+        elif _copilot_is_org_seat(payload) or payload.get("token_based_billing") is True or (
+            isinstance(premium, dict) and premium.get("token_based_billing") is True
+        ):
+            details.append("Allowance managed by your organization")
+        else:
+            raise ValueError("Copilot usage response had no quota data")
+    if inferred:
+        details.append("Resets on the 1st at 00:00 UTC")
+    login = payload.get("login")
+    account = login.strip() if isinstance(login, str) and login.strip() else None
+    return _snapshot("copilot", plan, windows, details, account_label=account)
+
+
+def _fetch_copilot_account_usage() -> Optional[dict]:
+    """Copilot included usage from GET copilot_internal/user. Read-only."""
+    tokens = iter(_copilot_token_candidates())
+    try:
+        token = next(tokens)
+    except StopIteration:
+        return None
+    import httpx
+
+    last_status = 401
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        while True:
+            headers = dict(COPILOT_CLIENT_HEADERS)
+            headers["Authorization"] = "token " + token
+            response = client.get(COPILOT_USER_URL, headers=headers)
+            if response.status_code in (401, 403, 404):
+                last_status = response.status_code
+                try:
+                    token = next(tokens)
+                except StopIteration:
+                    break
+                continue
+            if response.status_code == 429:
+                retry = str(response.headers.get("Retry-After") or "").strip()
+                message = "GitHub rate limited Copilot usage"
+                if retry:
+                    message += f" (retry after {retry}s)"
+                raise RuntimeError(message)
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except Exception:
+                raise ValueError("Copilot usage response was not JSON") from None
+            if not isinstance(payload, dict):
+                raise ValueError("Copilot usage response was not an object")
+            return _copilot_snapshot_from_payload(payload)
+    raise RuntimeError(
+        "GitHub token rejected (HTTP "
+        + str(last_status)
+        + "). Sign in with `gh auth login`, the Copilot editor, or set COPILOT_GITHUB_TOKEN."
+    )
+
+
 @contextlib.contextmanager
 def _hermes_usage_env():
     """Give upstream usage helpers the selected profile's keys and endpoints.
@@ -3828,6 +4254,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
             ("deepinfra", None, None, _fetch_deepinfra_account_usage),
             ("ai-gateway", None, None, _fetch_ai_gateway_account_usage),
             ("commandcode", None, None, _fetch_commandcode_account_usage),
+            ("copilot", None, None, _fetch_copilot_account_usage),
         )
     )
     fetchers = [item for item in fetchers if item[0] not in _disabled_providers]
