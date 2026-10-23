@@ -1,7 +1,7 @@
 {
   "name": "hermes-resetwatch",
-  "version": "0.2.25",
-  "description": "Track subscription quotas and reset times in Hermes Desktop.",
+  "version": "0.2.26",
+  "description": "Track subscription quotas and reset times in Hermes Desktop. Renew asks Hermes to refresh one Codex login after you confirm.",
   "updater": "shared",
   "companions": [
     "probe.py"

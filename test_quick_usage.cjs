@@ -60,7 +60,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
       if (!(index in states)) states[index] = value
       return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
     }, jsx, jsxs: jsx })
-  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode, LimitCard, accountStateLine, resetHasPassed };', context)
+  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode, LimitCard, accountStateLine, resetHasPassed, codexRenewActionsFor, scrubRenewHint, renewNote, CodexRenewButton };', context)
   context.plugin.register({ storage: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
     set: (key, value) => saved.set(key, value) }, onDispose: fn => disposers.push(fn),
     registerMany: rows => registered.push(...rows) })
@@ -166,6 +166,38 @@ test('Codex state rows name availability, sign-in, expiry, and the check age', (
     assert.ok(text.includes(phrase), text)
     assert.equal(text.includes('hermes auth add openai-codex --type oauth'), hint, text)
   }
+})
+
+test('Codex renew runs only from a click, with the Hermes auth argv', async () => {
+  const { api, context } = load()
+  const calls = []
+  const live = { refetch: () => calls.push('refetch') }
+  context.sdk.host.request = async (method, params) => {
+    calls.push({ method, params })
+    return { code: 0, output: 'eyJhbGciOiJIUzI1NiJ9.payload.sig', hint: 'done' }
+  }
+  const card = { stateKind: 'sign_in', entryId: 'entry-9', label: 'ad**@example.com' }
+  assert.equal(api.codexRenewActionsFor(live)({ stateKind: 'available', entryId: 'entry-9', label: 'ad**@example.com' }), null)
+  assert.equal(api.codexRenewActionsFor(live)({ stateKind: 'sign_in', entryId: 'bad id', label: 'ad**@example.com' }), null)
+  const node = api.codexRenewActionsFor(live)(card)
+  const button = node.type(node.props).props.children[0]
+  context.confirm = () => false
+  await button.props.onClick()
+  assert.deepEqual(calls, [])
+  context.confirm = message => {
+    calls.push(message)
+    return true
+  }
+  await button.props.onClick()
+  assert.equal(calls[0].includes('ad**@example.com'), true)
+  assert.equal(calls[0].includes('signed out'), true)
+  assert.equal(JSON.stringify(calls[1]), JSON.stringify({ method: 'cli.exec', params: { argv: ['auth', 'refresh', 'openai-codex', 'entry-9'] } }))
+  assert.deepEqual(calls.slice(2), ['refetch'])
+  assert.equal(api.renewNote({ code: 0, output: 'eyJhbGciOiJIUzI1NiJ9.payload.sig' }), 'Sign-in renewed. Checking usage.')
+  assert.equal(api.renewNote({ code: 1, hint: 'login rejected' }), 'login rejected')
+  assert.equal(api.renewNote({ code: 1, output: 'eyJhbGciOiJIUzI1NiJ9.payload.sig' }), 'Could not renew this sign-in.')
+  const block = source.slice(source.indexOf('// BEGIN CODEX RENEW ACTION'), source.indexOf('// END CODEX RENEW ACTION'))
+  assert.equal(block.includes('setInterval'), false)
 })
 
 test('a passed reset hides the stale bar until the next check', () => {

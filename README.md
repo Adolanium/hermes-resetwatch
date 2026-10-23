@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.25</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.26</sub>
 
   <br /><br />
 
@@ -126,7 +126,7 @@ Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs th
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
 - **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`). Command Code uses Hermes env first, then `~/.commandcode/auth.json`.
 - **GitHub Copilot.** Included usage and the reset time come from GitHub's Copilot account call, `copilot_internal/user`. That endpoint is not in GitHub's published REST docs, so the numbers are best-effort and can change. The probe does not read Hermes `.env` or `auth.json` for this login. [How the login is found](docs/copilot.md).
-- **Codex status.** Each Codex account shows Available, Limit reached, Sign in again, Expired not checked, or Unknown, and how long ago that check ran. When a reset time has already passed, the row says the reset passed and is waiting for the next check. [How the check works](docs/codex-status.md).
+- **Codex status.** Each Codex account shows Available, Limit reached, Sign in again, Expired not checked, or Unknown, and how long ago that check ran. When a reset time has already passed, the row says the reset passed and is waiting for the next check. Sign in again and Expired rows can renew that one login after you confirm the masked name. [How the check works](docs/codex-status.md).
 - **Last resort.** Older `/usage` output is still parsed when a session is focused.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
@@ -326,6 +326,6 @@ continue to use the existing root files.
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.25` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.26` and are not marked as the latest standalone release.
 
-The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort.
+The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort. The page can renew one Codex login when you click Renew and confirm the masked name. That click runs Hermes `hermes auth refresh openai-codex` for that login only. Hermes saves the new login. A Codex CLI session using the same login can be signed out. The probe never does this, and nothing renews a login on a timer.
