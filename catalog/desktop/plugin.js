@@ -19,7 +19,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PLUGIN_ID = 'resetwatch'
 const PLUGIN_NAME = 'Resetwatch'
 const ROUTE = '/resetwatch'
-const VERSION = '0.2.21'
+const VERSION = '0.2.22'
 const POLL_MS = 5 * 60 * 1000
 // Manual Refresh floor. probe.py enforces the same 60s on --fresh, so a
 // click inside this window would only replay the cache anyway.
@@ -74,7 +74,7 @@ const EN = {
     refreshing: 'Refreshing…',
     refreshWait: 'Wait a minute between refreshes',
     refreshHint: 'Skip the cache and ask every vendor again',
-    intro: 'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, and Command Code when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. Click a section name to fold it up.',
+    intro: 'Live rows are plans already signed in on this machine: Hermes OAuth first, then Claude Code, Codex, Cursor, Kimi, Grok, GLM, DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, AI Gateway, Command Code, and GitHub Copilot when those CLIs, apps, or API keys are logged in. Kimi and GLM can also use Hermes Coding Plan API keys. Command Code uses COMMANDCODE_API_KEY or the cmd CLI login. GitHub Copilot uses a GitHub login already on this machine. Click a section name to fold it up.',
     automatic: 'Automatic',
     allOff: 'All providers are off. Enable a provider in Providers and order to see live usage.',
     noWindows: 'No quota windows yet. Check Providers and order, sign into an enabled provider, then refresh.'
@@ -465,6 +465,7 @@ function providerKey(name) {
   if (key === 'novita-ai' || key === 'novitaai') return 'novita'
   if (key === 'deep-infra') return 'deepinfra'
   if (key === 'ai-gateway' || key === 'vercel' || key === 'vercel-ai-gateway') return 'ai-gateway'
+  if (key === 'github-copilot' || key === 'github') return 'copilot'
   return key
 }
 
@@ -517,13 +518,16 @@ const PROVIDER_LABELS = {
   vercel: 'AI Gateway',
   'vercel-ai-gateway': 'AI Gateway',
   commandcode: 'Command Code',
+  copilot: 'GitHub Copilot',
+  'github-copilot': 'GitHub Copilot',
+  github: 'GitHub Copilot',
   nous: 'Nous'
 }
 
 const LIVE_PROVIDERS = [
   'nous', 'anthropic', 'openai-codex', 'openrouter', 'cursor', 'kimi', 'grok',
   'glm', 'deepseek', 'opencode-go', 'ollama', 'minimax', 'novita', 'deepinfra',
-  'ai-gateway', 'commandcode'
+  'ai-gateway', 'commandcode', 'copilot'
 ]
 
 function normalizeProviderPreferences(raw) {

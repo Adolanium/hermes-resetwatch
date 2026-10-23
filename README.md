@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.19</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.22</sub>
 
   <br /><br />
 
@@ -90,6 +90,7 @@ Live cards fill on their own when that login is already on the machine:
 - **DeepInfra:** `DEEPINFRA_API_KEY` in Hermes env (prepaid balance)
 - **AI Gateway:** `AI_GATEWAY_API_KEY` in Hermes env (Vercel credits)
 - **Command Code:** `COMMANDCODE_API_KEY` in Hermes env, or the `cmd` CLI login (credits, 5-hour / weekly windows, plan, and this period's spend)
+- **GitHub Copilot:** a GitHub login already on this machine. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` in the process environment, the Copilot editor, or `gh auth login`. The card shows the plan, how much of the included allowance is used, and when it resets. Included usage is labeled AI credits on current plans and premium requests on older ones. Extra paid usage, when there is any, is its own row. A seat managed by an organization shows the credits you used, or that the allowance is managed there. A classic `ghp_` token is not used.
 
 Gemini, Perplexity, and anything else can be a manual clock. Type the percent left and the reset time.
 
@@ -124,6 +125,7 @@ Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs th
 - **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also read every `anthropic` / `openai-codex` row in `$HERMES_HOME/auth.json` (read only) and show one labelled card set per account.
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
 - **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`). Command Code uses Hermes env first, then `~/.commandcode/auth.json`.
+- **GitHub Copilot.** Included usage and the reset time come from GitHub's Copilot account call, `copilot_internal/user`. That endpoint is not in GitHub's published REST docs, so the numbers are best-effort and can change. The probe does not read Hermes `.env` or `auth.json` for this login. [How the login is found](docs/copilot.md).
 - **Last resort.** Older `/usage` output is still parsed when a session is focused.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
@@ -323,6 +325,6 @@ continue to use the existing root files.
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.21` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.22` and are not marked as the latest standalone release.
 
 The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort.
