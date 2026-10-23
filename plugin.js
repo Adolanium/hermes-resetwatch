@@ -959,13 +959,13 @@ async function shellExec(request, sid, command) {
     try {
       return await request('shell.exec', { command, session_id: sid })
     } catch (error) {
-      if (!/invalid_params|extra_forbidden/i.test(reason(error))) throw refused(tr('errors.shellRefused', reason(error)))
+      if (!/invalid[ _]params|extra[ _]forbidden|extra inputs/i.test(reason(error))) throw refused(tr('errors.shellRefused', reason(error)))
     }
   }
   try {
     return await request('shell.exec', { command })
   } catch (error) {
-    if (!sid && /invalid_params/i.test(reason(error))) throw refused(tr('errors.shellNeedsSession'))
+    if (!sid && /invalid[ _]params|extra inputs/i.test(reason(error))) throw refused(tr('errors.shellNeedsSession'))
     throw refused(tr('errors.shellRefused', reason(error)))
   }
 }

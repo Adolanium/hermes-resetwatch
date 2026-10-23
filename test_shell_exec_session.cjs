@@ -19,7 +19,10 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
       calls.push({ ...params })
       const scoped = 'session_id' in params
       if (backend === 'canonical' && !scoped) throw new Error('invalid_params')
+      if (backend === 'canonical-prose' && !scoped) throw new Error('invalid params')
       if (backend === 'sidecar' && scoped) throw new Error('invalid_params')
+      if (backend === 'sidecar-prose' && scoped) throw new Error('Extra inputs are not permitted')
+      if (backend === 'scoped-prose' && scoped) throw new Error('invalid params')
       if (backend === 'denied') throw new Error('permission_denied')
       return { code: 0, stdout: JSON.stringify([{ provider: 'vendor' }]) }
     }
@@ -49,5 +52,23 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
     const result = await runner.run({ sessionId: 'sess-1' })
     assert.equal(result.error, 'shell.exec refused: permission_denied')
     assert.equal(runner.calls.length, 1)
+  })
+  test(`${file}: sidecar prose refusal still falls back to the bare call`, async () => {
+    const runner = setup('sidecar-prose')
+    const result = await runner.run({ sessionId: 'sess-1' })
+    assert.equal(result.error, null)
+    assert.deepEqual(runner.calls.map(call => 'session_id' in call), [true, false])
+  })
+  test(`${file}: scoped prose invalid params retries without session_id`, async () => {
+    const runner = setup('scoped-prose')
+    const result = await runner.run({ sessionId: 'sess-1' })
+    assert.equal(result.error, null)
+    assert.deepEqual(runner.calls.map(call => 'session_id' in call), [true, false])
+  })
+  test(`${file}: canonical prose refusal without a session names the cause`, async () => {
+    const runner = setup('canonical-prose')
+    const result = await runner.run({})
+    assert.match(result.error, /focused local session/)
+    assert.equal(runner.calls.length, 1, 'a refusal must not be retried for every interpreter')
   })
 }
