@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import probe
+from test_credential_helpers import CredentialHelperTests  # noqa: F401  CI runs this module
 
 
 def write_pool(home: Path, pool: dict) -> None:
