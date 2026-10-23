@@ -62,10 +62,14 @@ const EN = {
     remaining: 'Remaining %',
     used: 'Used %'
   },
+  chip: {
+    least: 'Least remaining'
+  },
   page: {
     subtitleLeft: 'How much is left, and when it comes back',
     subtitleUsed: 'How much is used, and when it resets',
     displayMode: 'Quota display mode',
+    chipWindow: 'Status bar window',
     gateway: state => `gateway ${state}`,
     gatewayChecked: (state, time) => `gateway ${state} · checked ${time}`,
     statusBar: 'Status bar',
@@ -117,7 +121,7 @@ const EN = {
   },
   popup: {
     open: 'Open usage and reset clocks',
-    lowest: (name, percent) => `${PLUGIN_NAME}: lowest is ${name}, ${percent}% left`,
+    lowest: (name, percent) => `${PLUGIN_NAME}: ${name}, ${percent}% left`,
     idle: `${PLUGIN_NAME}: usage and reset clocks`,
     label: `${PLUGIN_NAME} usage`,
     usage: 'Usage',
@@ -224,6 +228,7 @@ const $now = atom(Date.now())
 const $missingState = atom(null)
 const $providerPreferences = atom({ disabled: [], order: [] })
 const $displayMode = atom('remaining')
+const $chipWindow = atom('')
 const $refreshUntil = atom({})
 const $freshRequests = atom({})
 const $refreshErrors = atom({})
@@ -387,6 +392,37 @@ function saveDisplayMode(value) {
   const mode = normalizeDisplayMode(value)
   $displayMode.set(mode)
   remember('display_mode', mode)
+}
+
+// Empty means the chip keeps today's rule: the window with the least left.
+function normalizeChipWindow(value) {
+  if (typeof value !== 'string') return ''
+  const label = value.trim()
+  if (!label || label.length > 80) return ''
+  return label
+}
+
+function saveChipWindow(value) {
+  const label = normalizeChipWindow(value)
+  $chipWindow.set(label)
+  remember('chip_window', label)
+}
+
+function chipWindowChoices(cards, selected) {
+  const choices = []
+  const seen = new Set()
+  for (const card of cards || []) {
+    if (!card || card.error) continue
+    const label = String(card.label || '').trim()
+    const key = label.toLowerCase()
+    if (!label || seen.has(key)) continue
+    seen.add(key)
+    choices.push(label)
+  }
+  const current = normalizeChipWindow(selected)
+  if (current && !seen.has(current.toLowerCase())) choices.push(current)
+  const value = choices.find(label => label.toLowerCase() === current.toLowerCase()) || ''
+  return { choices, value }
 }
 
 function quotaPercent(card, mode) {
@@ -1778,6 +1814,7 @@ function PluginPageContent() {
   const nowMs = useValue($now)
   const clocks = useValue($clocks)
   const displayMode = useValue($displayMode)
+  const chipWindow = useValue($chipWindow)
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [liveOpen, toggleLive] = useSectionOpen('live')
@@ -1786,10 +1823,15 @@ function PluginPageContent() {
   const [cooldownUntil, setCooldownUntil] = useState(0)
   const coolingDown = useCoolingDown(Math.max(cooldownUntil, live.cooldownUntil || 0))
   const payload = live.data || { cards: [], errors: [], hadSession: false }
-  const groups = useMemo(
-    () => groupLiveCards(arrangeProviderCards(payload.cards, preferences)).filter(group => group.cards.length),
+  const cards = useMemo(
+    () => arrangeProviderCards(payload.cards, preferences),
     [payload.cards, preferences]
   )
+  const groups = useMemo(
+    () => groupLiveCards(cards).filter(group => group.cards.length),
+    [cards]
+  )
+  const chipChoices = chipWindowChoices(cards, chipWindow)
 
   useEffect(() => {
     $now.set(Date.now())
@@ -1850,6 +1892,23 @@ function PluginPageContent() {
                 children: [
                   jsx('option', { value: 'remaining', children: t('mode.remaining') }),
                   jsx('option', { value: 'used', children: t('mode.used') })
+                ]
+              }),
+              jsxs('select', {
+                'aria-label': t('page.chipWindow'),
+                value: chipChoices.value,
+                onChange: event => saveChipWindow(event.target.value),
+                style: {
+                  fontSize: '0.75rem',
+                  color: text.primary,
+                  background: 'var(--ui-bg-primary)',
+                  border: '1px solid var(--ui-stroke-secondary)',
+                  borderRadius: 4,
+                  padding: '2px 6px'
+                },
+                children: [
+                  jsx('option', { value: '', children: t('chip.least') }),
+                  ...chipChoices.choices.map(label => jsx('option', { value: label, children: label }, label))
                 ]
               }),
               jsx('span', {
@@ -2054,8 +2113,20 @@ function QuotaRing({ card, mode, size = 64, showValue = true }) {
 
 // The chip shows whichever window has the least left.
 function lowestQuotaCard(cards) {
-  return cards.filter(card => !card.error && quotaPercent(card, 'remaining') !== null)
+  return (cards || []).filter(card => !card.error && quotaPercent(card, 'remaining') !== null)
     .reduce((low, card) => !low || quotaPercent(card, 'remaining') < quotaPercent(low, 'remaining') ? card : low, null)
+}
+
+// A saved label pins the chip. No match, or a match with no percentage,
+// falls back to the least left.
+function chipQuotaCard(cards, windowLabel) {
+  const wanted = normalizeChipWindow(windowLabel).toLowerCase()
+  if (wanted) {
+    const matched = lowestQuotaCard((cards || []).filter(card =>
+      String(card.label || '').trim().toLowerCase() === wanted))
+    if (matched) return matched
+  }
+  return lowestQuotaCard(cards)
 }
 
 function QuickUsageSlot() {
@@ -2069,10 +2140,11 @@ function QuickUsage() {
   const { gateway, profile, preferences, live } = useFocusedLiveCards(open)
   const nowMs = useValue($now)
   const mode = useValue($displayMode)
+  const chipWindow = useValue($chipWindow)
   const cards = arrangeProviderCards(live.data?.cards || [], preferences)
   const groups = groupLiveCards(cards)
   const coolingDown = useCoolingDown(live.cooldownUntil || 0)
-  const lowest = lowestQuotaCard(cards)
+  const lowest = chipQuotaCard(cards, chipWindow)
   const lowestPercent = lowest ? quotaPercent(lowest, mode) : null
   const checkedAt = observedTime(live.data)
   const stale = checkedAt && nowMs - checkedAt >= POLL_MS
@@ -2159,6 +2231,7 @@ export default {
     loadClocks()
     $providerPreferences.set(normalizeProviderPreferences(stored('providers', {})))
     $displayMode.set(normalizeDisplayMode(stored('display_mode', 'remaining')))
+    $chipWindow.set(normalizeChipWindow(stored('chip_window', '')))
     $quickUsage.set(stored('quick_usage', false) === true)
     pruneQuotaCache()
     $now.set(Date.now())

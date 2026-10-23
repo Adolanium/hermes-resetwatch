@@ -129,6 +129,66 @@ test('quota mode persists through registration and updates the header without fe
   assert.equal(findSelector(reloaded.renderPage()).props.value, 'remaining')
 })
 
+test('status bar window persists and lists the labels on screen', () => {
+  const saved = new Map()
+  const register = app => {
+    app.context.ctx = {
+      storage: { get: (key, fallback) => saved.get(key) ?? fallback, set: (key, value) => saved.set(key, value) },
+      registerMany: () => {}, onDispose: () => {}
+    }
+    vm.runInContext('plugin.register(ctx)', app.context)
+  }
+  const findChipWindow = tree => {
+    if (!tree || typeof tree !== 'object') return null
+    if (tree.props?.['aria-label'] === 'Status bar window') return tree
+    for (const child of [tree.props?.children].flat(Infinity)) {
+      const match = findChipWindow(child)
+      if (match) return match
+    }
+    return null
+  }
+  const cards = {
+    cards: [
+      { id: 'account:opencode-go:0:5h', provider: 'OpenCode Go', group: 'OpenCode Go', label: '5h', remaining: 98, used: 2 },
+      { id: 'account:opencode-go:1:Monthly', provider: 'OpenCode Go', group: 'OpenCode Go', label: 'Monthly', remaining: 87, used: 13 },
+      { id: 'account:opencode-go:2:5Hdup', provider: 'OpenCode Go', group: 'OpenCode Go', label: '5H', remaining: 91, used: 9 }
+    ],
+    errors: []
+  }
+  const app = load()
+  register(app)
+  app.queryResult.data = cards
+  const selector = () => findChipWindow(app.renderPage())
+  const node = selector()
+  assert.ok(node, 'status bar window select')
+  assert.equal(node.props.value, '')
+  const values = () => [selector().props.children].flat().map(option => option.props.value)
+  assert.deepEqual(values(), ['', '5h', 'Monthly'])
+  assert.equal([selector().props.children].flat()[0].props.children, 'Least remaining')
+  selector().props.onChange({ target: { value: '5h' } })
+  assert.equal(saved.get('chip_window'), '5h')
+  assert.equal(selector().props.value, '5h')
+  assert.equal(app.calls.length, 0, 'the status bar window must not issue gateway requests')
+  vm.runInContext("saveProviderPreferences({ disabled: ['opencode-go'], order: [] })", app.context)
+  assert.deepEqual(values(), ['', '5h'], 'hidden providers leave the menu, and the saved label stays')
+  vm.runInContext('saveProviderPreferences({ disabled: [], order: [] })', app.context)
+  const reloaded = load()
+  register(reloaded)
+  reloaded.queryResult.data = cards
+  assert.equal(findChipWindow(reloaded.renderPage()).props.value, '5h')
+  saved.set('chip_window', 'monthly')
+  register(reloaded)
+  assert.equal(findChipWindow(reloaded.renderPage()).props.value, 'Monthly')
+  saved.set('chip_window', 'Weekly')
+  register(reloaded)
+  const pinned = findChipWindow(reloaded.renderPage())
+  assert.equal(pinned.props.value, 'Weekly')
+  assert.ok([pinned.props.children].flat().some(option => option.props.value === 'Weekly'))
+  saved.set('chip_window', '   ')
+  register(reloaded)
+  assert.equal(findChipWindow(reloaded.renderPage()).props.value, '')
+})
+
 test('live and manual quota labels and meters agree in both modes without changing warning meaning', () => {
   const app = load()
   for (const source of ['account', 'manual']) {
