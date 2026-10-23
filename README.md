@@ -61,7 +61,7 @@ Want another live row? Open an issue. We can add it if that app or CLI already h
 
 ## Quick usage without leaving chat
 
-Choose **Status bar** in the page header to add a small chip to the bottom-right status bar. It shows the window with the least left. Click it for a popup with a meter per window, in **Remaining %** or **Used %**, with the same countdowns and local reset times as the page. Provider controls and manual clocks stay on the page.
+Choose **Status bar** in the page header to add a small chip to the bottom-right status bar. It shows the window with the least left. The **Status bar window** menu next to it can pin one window name instead, such as 5h or Weekly. If that window is not on screen, the chip goes back to the one with the least left. Click the chip for a popup with a meter per window, in **Remaining %** or **Used %**, with the same countdowns and local reset times as the page. Provider controls and manual clocks stay on the page.
 
 - It is off by default. Turning it off removes the chip and deletes its saved snapshot.
 - While the popup is closed, the chip shows the last check and calls no vendor. While it is open, it refreshes every 5 minutes, like the page.
