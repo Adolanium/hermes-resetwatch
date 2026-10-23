@@ -17,8 +17,9 @@ environment, then the Copilot editor's apps.json / hosts.json, then
 not refresh or store tokens.
 
 Read-only for Claude and Codex credentials: the probe never exchanges
-those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Codex
-and Claude pool cards come from reading $HERMES_HOME/auth.json. Kimi and Grok may
+those refresh tokens or writes ~/.claude / ~/.codex / auth.json. Pooled
+logins come from Hermes read_credential_pool when that helper imports,
+and from the saved pool file only when it cannot. Kimi and Grok may
 refresh on 401 and write back only that vendor's file. Before writing,
 the probe re-reads the file and merges token fields into that fresh
 record so concurrent CLI edits to other keys are not reverted. That is
@@ -2251,6 +2252,119 @@ def _codex_account_id_from_token(token: str) -> Optional[str]:
     return account_id or None
 
 
+def _codex_identity_from_token(token: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Account id, JWT subject, and residency. Subject keeps workspace members apart."""
+    claims = _jwt_claims(token)
+    auth = claims.get("https://api.openai.com/auth")
+    auth = auth if isinstance(auth, dict) else {}
+    residency = None
+    for source in (auth, claims):
+        for key in ("chatgpt_data_residency", "chatgpt_compute_residency"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                residency = value.strip()
+                break
+        if residency:
+            break
+    subject = str(claims.get("sub") or "").strip() or None
+    return _codex_account_id_from_token(token), subject, residency
+
+
+def _codex_route_host(base_url: Optional[str]) -> str:
+    raw = str(base_url or "").strip() or CODEX_DEFAULT_BASE_URL
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    host = raw.split("/", 1)[0].strip().lower()
+    if host.endswith(":443"):
+        host = host[:-4]
+    return host or "chatgpt.com"
+
+
+_CODEX_REASON_CODES = frozenset({
+    "token_invalidated",
+    "token_revoked",
+    "invalid_token",
+    "invalid_grant",
+    "unauthorized_client",
+    "refresh_token_reused",
+})
+
+
+def _codex_reason_code(response) -> Optional[str]:
+    """Allow-listed code from a rejected usage response. The body is not stored."""
+    payload = None
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    found: list[str] = []
+
+    def walk(node, depth: int = 0) -> None:
+        if depth > 5 or len(found) > 12:
+            return
+        if isinstance(node, dict):
+            for key in ("code", "error", "type", "reason"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    found.append(value.strip())
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:8]:
+                walk(item, depth + 1)
+
+    if payload is not None:
+        walk(payload)
+    else:
+        try:
+            text = str(response.text or "").strip()
+        except Exception:
+            text = ""
+        if text and len(text) <= 64:
+            found.append(text)
+    for item in found:
+        code = item.strip().lower().replace("-", "_")
+        if code in _CODEX_REASON_CODES:
+            return code
+    return None
+
+
+def _codex_quota_state(payload: dict) -> str:
+    rate = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+    reached = rate.get("limit_reached")
+    if not isinstance(reached, bool):
+        reached = payload.get("limit_reached") if isinstance(payload.get("limit_reached"), bool) else None
+    allowed = rate.get("allowed")
+    if not isinstance(allowed, bool):
+        allowed = payload.get("allowed") if isinstance(payload.get("allowed"), bool) else None
+    kind = rate.get("rate_limit_reached_type")
+    if not isinstance(kind, str) or not kind.strip():
+        kind = payload.get("rate_limit_reached_type")
+    named = isinstance(kind, str) and bool(kind.strip())
+    if reached is True or allowed is False or named:
+        return "limited"
+    return "available"
+
+
+def _codex_stamp(snap: dict, *, auth_state: str, quota_state: Optional[str] = None,
+                 reason_code: Optional[str] = None, when: Optional[float] = None) -> dict:
+    snap["auth_state"] = auth_state
+    if quota_state:
+        snap["quota_state"] = quota_state
+    if reason_code:
+        snap["reason_code"] = reason_code
+    stamp = float(when if when is not None else datetime.now(timezone.utc).timestamp())
+    snap["last_attempt_at"] = stamp
+    snap["observed_at"] = stamp
+    return snap
+
+
+def _codex_can_try_another() -> bool:
+    """A sibling request has to finish inside the existing probe budget."""
+    return _seconds_left() > HTTP_TIMEOUT + 1
+
+
 def _mask_email_label(label: str) -> str:
     text = str(label or "").strip()
     at = text.find("@")
@@ -2348,22 +2462,55 @@ def _fetch_codex_usage(
         return None
     import httpx
 
+    account_from_token, _subject, residency = _codex_identity_from_token(access)
     headers = {
         # Private Codex usage API. Best-effort; OpenAI may change or reject this.
         "Authorization": f"Bearer {access}",
         "Accept": "application/json",
         "User-Agent": "codex-cli",
     }
-    chatgpt_account = str(account_id or "").strip()
+    chatgpt_account = str(account_id or "").strip() or str(account_from_token or "")
     if chatgpt_account:
         headers["ChatGPT-Account-Id"] = chatgpt_account
+    if residency and re.fullmatch(r"[A-Za-z0-9._-]{1,32}", residency):
+        headers["x-openai-internal-codex-residency"] = residency
+    attempted = datetime.now(timezone.utc).timestamp()
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         response = client.get(_codex_usage_url(base_url or CODEX_DEFAULT_BASE_URL), headers=headers)
-        response.raise_for_status()
+    status = response.status_code
+    if status in (401, 403):
+        reason = _codex_reason_code(response)
+        auth_state = "sign_in" if reason else "expired"
+        message = "This login was rejected." if auth_state == "sign_in" else "This access token was not checked."
+        snap = _error_snapshot(
+            "openai-codex", message, account_label=account_label, account_key=account_key,
+        )
+        return _codex_stamp(snap, auth_state=auth_state, reason_code=reason, when=attempted)
+    if status >= 400:
+        if status == 429:
+            message = "The usage service rate limited this check."
+        elif status >= 500:
+            message = "The usage service failed this check."
+        else:
+            message = "The usage service rejected this check."
+        snap = _error_snapshot(
+            "openai-codex", message, account_label=account_label, account_key=account_key,
+        )
+        return _codex_stamp(snap, auth_state="unknown", quota_state="unknown", when=attempted)
+    try:
         payload = response.json() or {}
+    except Exception:
+        payload = None
     if not isinstance(payload, dict):
-        return None
+        snap = _error_snapshot(
+            "openai-codex",
+            "The usage service returned an unreadable response.",
+            account_label=account_label,
+            account_key=account_key,
+        )
+        return _codex_stamp(snap, auth_state="unknown", quota_state="unknown", when=attempted)
     windows = _codex_windows_from_payload(payload)
+    quota_state = _codex_quota_state(payload)
     details: list[str] = []
     reset_credits = payload.get("rate_limit_reset_credits") if isinstance(payload.get("rate_limit_reset_credits"), dict) else {}
     banked = reset_credits.get("available_count")
@@ -2378,10 +2525,12 @@ def _fetch_codex_usage(
             details.append(f"Credits balance: ${float(balance):.2f}")
         elif credits.get("unlimited"):
             details.append("Credits balance: unlimited")
+    if quota_state == "limited" and not windows and not details:
+        details.append("Usage limit reached")
     if not windows and not details:
         return None
     plan = _title_case_slug(payload.get("plan_type"))
-    return _snapshot(
+    snap = _snapshot(
         "openai-codex",
         plan,
         windows,
@@ -2389,6 +2538,7 @@ def _fetch_codex_usage(
         account_label=account_label,
         account_key=account_key,
     )
+    return _codex_stamp(snap, auth_state="ok", quota_state=quota_state, when=attempted)
 
 
 def _fetch_codex_cli_account_usage() -> Optional[dict]:
@@ -2409,14 +2559,36 @@ def _read_auth_store(path: Path) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def _pool_entries(provider: str) -> list[dict]:
-    """Read credential_pool rows from auth.json. Never writes the file."""
-    name = str(provider or "").strip()
-    if not name:
+def _pool_rows_from_helper(provider: str) -> Optional[list]:
+    """Rows from Hermes's pool reader.
+
+    None means the helper could not be imported or it raised. An empty
+    list is an answer, and the saved file is not opened after that.
+    The reader does not refresh or write tokens.
+    """
+    try:
+        from hermes_cli.auth import read_credential_pool
+    except Exception:
+        return None
+    try:
+        rows = read_credential_pool(provider)
+    except Exception:
+        return None
+    if isinstance(rows, dict):
+        rows = rows.get(provider)
+    if not isinstance(rows, list):
         return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _pool_rows_from_saved_store(provider: str) -> list[dict]:
+    """Read credential_pool rows from the saved store. Never writes the file.
+
+    Used only when read_credential_pool cannot be reached. A profile with
+    no rows for a provider uses the base home's rows, even when it has a
+    store of its own.
+    """
     homes = _hermes_homes()
-    # Hermes falls back per provider: a profile with no rows for a provider
-    # uses the base home's rows, even when it has an auth.json of its own.
     if _profile_home is not None and _profile_home.parent.name == "profiles":
         homes = [*homes, _profile_home.parent.parent]
     for home in homes:
@@ -2426,10 +2598,21 @@ def _pool_entries(provider: str) -> list[dict]:
         pool = store.get("credential_pool")
         if not isinstance(pool, dict):
             continue
-        rows = pool.get(name)
+        rows = pool.get(provider)
         if isinstance(rows, list) and rows:
             return [row for row in rows if isinstance(row, dict)]
     return []
+
+
+def _pool_entries(provider: str) -> list[dict]:
+    """Credential pool rows for one provider. Never writes the store."""
+    name = str(provider or "").strip()
+    if not name:
+        return []
+    rows = _pool_rows_from_helper(name)
+    if rows is not None:
+        return rows
+    return _pool_rows_from_saved_store(name)
 
 
 CODEX_DEAD_LOGIN = "Hermes reports this login is no longer valid. Sign in to Codex again in Hermes."
@@ -2444,76 +2627,100 @@ def _codex_pool_entries() -> list[dict]:
 
 
 def _codex_pool_accounts() -> list[dict]:
-    accounts: list[dict] = []
+    """One row per host + account id + subject. Healthy logins hide dead siblings."""
+    groups: list[dict] = []
+    index: dict = {}
     seen_tokens: set[str] = set()
-    seen_accounts: set[str] = set()
-    unusable: list[tuple[dict, str, str]] = []
     for entry in _codex_pool_entries():
         token = str(entry.get("access_token") or "").strip()
         if not token or token in seen_tokens:
             continue
+        seen_tokens.add(token)
+        account_id, _subject, _residency = _codex_identity_from_token(token)
+        host = _codex_route_host(entry.get("base_url"))
+        # Unknown identities stay separate. Labels and quota values are not identity.
+        group_key = ("account", host, account_id, _subject or "") if account_id else ("login", token)
+        group = index.get(group_key)
+        if group is None:
+            group = {"healthy": [], "unusable": []}
+            index[group_key] = group
+            groups.append(group)
+        candidate = {
+            "token": token,
+            "account_id": account_id,
+            "base_url": str(entry.get("base_url") or "").strip() or None,
+            "label": _codex_card_label(entry, token),
+            "key": str(entry.get("id") or "").strip(),
+        }
         if str(entry.get("last_status") or "").strip().lower() == "dead":
-            unusable.append((entry, token, CODEX_DEAD_LOGIN))
+            group["unusable"].append((candidate, CODEX_DEAD_LOGIN, "sign_in"))
+        elif _codex_token_expiring(token):
+            group["unusable"].append((candidate, CODEX_EXPIRED_LOGIN, "expired"))
+        else:
+            group["healthy"].append(candidate)
+    accounts: list[dict] = []
+    for group in groups:
+        healthy = group["healthy"]
+        if healthy:
+            accounts.append({**healthy[0], "candidates": healthy})
             continue
-        if _codex_token_expiring(token):
-            unusable.append((entry, token, CODEX_EXPIRED_LOGIN))
+        unusable = group["unusable"]
+        if not unusable:
             continue
-        seen_tokens.add(token)
-        account_id = _codex_account_id_from_token(token)
-        # Separate OAuth logins can belong to the same subscription. Unknown
-        # identities remain separate; labels and quota values are not identity.
-        if account_id:
-            if account_id in seen_accounts:
-                continue
-            seen_accounts.add(account_id)
-        accounts.append(
-            {
-                "token": token,
-                "account_id": account_id,
-                "base_url": str(entry.get("base_url") or "").strip() or None,
-                "label": _codex_card_label(entry, token),
-                "key": str(entry.get("id") or "").strip(),
-            }
-        )
-    # A login that cannot be checked read-only still gets a card saying why,
-    # unless another login for the same account already has numbers.
-    for entry, token, status in unusable:
-        if token in seen_tokens:
-            continue
-        seen_tokens.add(token)
-        account_id = _codex_account_id_from_token(token)
-        if account_id:
-            if account_id in seen_accounts:
-                continue
-            seen_accounts.add(account_id)
-        accounts.append(
-            {
-                "token": token,
-                "account_id": account_id,
-                "label": _codex_card_label(entry, token),
-                "key": str(entry.get("id") or "").strip(),
-                "status": status,
-            }
-        )
+        chosen = next((item for item in unusable if item[2] == "sign_in"), unusable[0])
+        candidate, status, auth_state = chosen
+        accounts.append({
+            **candidate,
+            "status": status,
+            "auth_state": auth_state,
+            "candidates": [],
+        })
     return accounts
 
 
 def _codex_pool_fetcher(account: dict):
     def fetch() -> Optional[dict]:
-        if account.get("status"):
-            return _error_snapshot(
+        candidates = [
+            item for item in (account.get("candidates") or [])
+            if isinstance(item, dict) and item.get("token")
+        ]
+        if account.get("status") and not candidates:
+            snap = _error_snapshot(
                 "openai-codex",
                 account["status"],
                 account_label=account.get("label"),
                 account_key=account.get("key"),
             )
-        return _fetch_codex_usage(
-            account.get("token") or "",
-            account.get("account_id"),
-            account.get("base_url"),
-            account_label=account.get("label"),
-            account_key=account.get("key"),
-        )
+            return _codex_stamp(snap, auth_state=str(account.get("auth_state") or "unknown"))
+        if not candidates:
+            candidates = [account]
+        last = None
+        for index, candidate in enumerate(candidates):
+            # 401/403 may try one later login. 429, 5xx, and other failures stop.
+            if index and not _codex_can_try_another():
+                break
+            label = candidate.get("label") or account.get("label")
+            key = candidate.get("key") or account.get("key")
+            try:
+                snap = _fetch_codex_usage(
+                    candidate.get("token") or "",
+                    candidate.get("account_id"),
+                    candidate.get("base_url"),
+                    account_label=label,
+                    account_key=key,
+                )
+            except Exception as exc:
+                failed = _error_snapshot(
+                    "openai-codex", _error_text(exc), account_label=label, account_key=key,
+                )
+                return _codex_stamp(failed, auth_state="unknown", quota_state="unknown")
+            if not isinstance(snap, dict):
+                return snap
+            if snap.get("auth_state") in ("sign_in", "expired"):
+                last = snap
+                continue
+            return snap
+        return last
 
     return fetch
 
@@ -2830,6 +3037,49 @@ def _read_env_file_value(path: Path, name: str) -> Optional[str]:
     return None
 
 
+def _hermes_dotenv_value(home: Path, name: str) -> Optional[str]:
+    """One profile secret.
+
+    get_secret alone sees the process environment, because this probe is a
+    separate process and has no profile scope installed. When secret_scope
+    imports, its reader loads the profile file and get_secret answers from
+    that scope. The local parser runs only when that module cannot be
+    imported or the read raises.
+    """
+    try:
+        from agent.secret_scope import get_secret, load_env_file, reset_secret_scope, set_secret_scope
+    except Exception:
+        return _read_env_file_value(home / ".env", name)
+    try:
+        payload = load_env_file(home / ".env")
+    except Exception:
+        return _read_env_file_value(home / ".env", name)
+    if not isinstance(payload, dict):
+        return None
+    scope = {
+        key: value for key, value in payload.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    if name not in scope:
+        return None
+    token = None
+    try:
+        token = set_secret_scope(scope, profile_home=str(home))
+        value = get_secret(name)
+    except Exception:
+        value = scope.get(name)
+    finally:
+        if token is not None:
+            try:
+                reset_secret_scope(token)
+            except Exception:
+                pass
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
 def _hermes_env_value(name: str) -> Optional[str]:
     # A gateway serving a sibling profile still has its own API keys in env.
     direct = (os.environ.get(name) or "").strip() if _profile_inherits_env else ""
@@ -2839,7 +3089,7 @@ def _hermes_env_value(name: str) -> Optional[str]:
     if value:
         return value
     for home in _hermes_homes():
-        value = _read_env_file_value(home / ".env", name)
+        value = _hermes_dotenv_value(home, name)
         if value:
             return value
     return _container_env_file_value(name)
@@ -2886,7 +3136,7 @@ def _secret_source_env_value(name: str) -> Optional[str]:
         return None
     if not math.isfinite(ttl) or ttl <= 0:
         return None
-    existing = _read_env_file_value(home / ".env", name)
+    existing = _hermes_dotenv_value(home, name)
     preserve = sources.get("preserve_existing")
     if existing and (not cfg.get("override_existing", False) or
                      (isinstance(preserve, list) and name in preserve)):
@@ -2895,7 +3145,7 @@ def _secret_source_env_value(name: str) -> Optional[str]:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", session_name):
         return None
     session = (os.environ.get(session_name) or "").strip() if _profile_inherits_env else ""
-    session = session or _read_env_file_value(home / ".env", session_name) or _container_env_file_value(session_name)
+    session = session or _hermes_dotenv_value(home, session_name) or _container_env_file_value(session_name)
     item = str(cfg.get("item_name") or "").strip()
     if not session or not item or name == session_name:
         return None
@@ -4226,7 +4476,16 @@ def _collect_cli() -> tuple[list[dict], bool]:
             )
             for account in pool_accounts
         )
-        pool_tokens = {str(account.get("token") or "") for account in pool_accounts}
+        pool_tokens: set[str] = set()
+        for account in pool_accounts:
+            token = str(account.get("token") or "")
+            if token:
+                pool_tokens.add(token)
+            for candidate in account.get("candidates") or ():
+                if isinstance(candidate, dict):
+                    sibling = str(candidate.get("token") or "")
+                    if sibling:
+                        pool_tokens.add(sibling)
         if cli_token and cli_token not in pool_tokens:
             fetchers.append(("openai-codex", None, None, _fetch_codex_cli_account_usage))
     else:
