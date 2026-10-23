@@ -22,4 +22,4 @@ The probe asks Hermes for credentials through Hermes's own helpers. It does not 
 
 Logins that live in a vendor app's own directory are not Hermes `auth.json`, `.anthropic_oauth.json`, or `.env`. Those reads stay as they are. Copilot already uses `get_secret` and does not open Hermes `.env` or `auth.json`.
 
-The probe does not refresh or write tokens while it checks status.
+The probe does not refresh or write tokens while it checks status. Renew is a separate button in the page. It asks Hermes to refresh one Codex login, and the probe is not involved.

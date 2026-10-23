@@ -2,7 +2,10 @@
 import json
 import unittest
 from pathlib import Path
-from scripts.catalog_policy import strip_updater
+import os
+import subprocess
+import tempfile
+from scripts.catalog_policy import strip_codex_renew, strip_updater
 
 ROOT = Path(__file__).resolve().parent
 
@@ -15,6 +18,29 @@ class CatalogPolicyTests(unittest.TestCase):
                 self.assertNotIn(symbol, source)
         self.assertIn("export default", source)
         self.assertIn("register(ctx)", source)
+
+    def test_codex_renew_stays_in_the_package_until_it_is_removed_on_purpose(self):
+        root = (ROOT / "plugin.js").read_text(encoding="utf-8")
+        packaged = (ROOT / "catalog/desktop/plugin.js").read_text(encoding="utf-8")
+        build = (ROOT / "scripts/build_catalog.py").read_text(encoding="utf-8")
+        self.assertIn("// BEGIN CODEX RENEW ACTION", packaged)
+        self.assertIn("['auth', 'refresh', 'openai-codex', id]", packaged)
+        self.assertNotIn("strip_codex_renew", build)
+        stripped = strip_codex_renew(root)
+        self.assertNotIn("CODEX RENEW", stripped)
+        self.assertNotIn("codexRenewActionsFor", stripped)
+        self.assertNotIn("['auth', 'refresh', 'openai-codex', id]", stripped)
+        self.assertIn("export default", stripped)
+        probe = (ROOT / "catalog/desktop/probe.py").read_text(encoding="utf-8")
+        self.assertNotIn("cli.exec", probe)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(stripped)
+            stripped_path = handle.name
+        try:
+            syntax = subprocess.run(["node", "--check", stripped_path], capture_output=True, text=True)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        finally:
+            os.unlink(stripped_path)
 
     def test_unknown_updater_layout_cannot_silently_ship(self):
         config = json.loads((ROOT / "catalog-package.json").read_text())
