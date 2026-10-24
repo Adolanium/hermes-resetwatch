@@ -122,10 +122,11 @@ Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs th
 
 - **Nous.** Dollars and renewal time come from the gateway (`usage.bars`, then `subscription.state` if needed).
 - **Gateway accounts.** If Hermes has `account.usage`, that RPC fills Claude, Codex, OpenRouter, and any other providers it already knows.
-- **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also read every `anthropic` / `openai-codex` row in `$HERMES_HOME/auth.json` (read only) and show one labelled card set per account.
+- **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also use the saved Hermes logins (read only) and show one labelled card set per account. [How those logins are read](docs/credentials.md).
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
 - **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`). Command Code uses Hermes env first, then `~/.commandcode/auth.json`.
 - **GitHub Copilot.** Included usage and the reset time come from GitHub's Copilot account call, `copilot_internal/user`. That endpoint is not in GitHub's published REST docs, so the numbers are best-effort and can change. The probe does not read Hermes `.env` or `auth.json` for this login. [How the login is found](docs/copilot.md).
+- **Codex status.** Each Codex account shows Available, Limit reached, Sign in again, Expired not checked, or Unknown, and how long ago that check ran. When a reset time has already passed, the row says the reset passed and is waiting for the next check. [How the check works](docs/codex-status.md).
 - **Last resort.** Older `/usage` output is still parsed when a session is focused.
 
 Manual clocks are whatever you typed. They do not refresh themselves.

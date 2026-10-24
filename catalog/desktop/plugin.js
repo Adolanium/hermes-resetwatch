@@ -103,6 +103,22 @@ const EN = {
     at: when => `Resets ${when}`,
     unknown: 'Reset time unavailable'
   },
+  status: {
+    available: age => age ? `Available · ${age}` : 'Available',
+    limitReached: (when, age) => {
+      const line = when ? `Limit reached, resets at ${when}` : 'Limit reached'
+      return age ? `${line} · ${age}` : line
+    },
+    signIn: age => age ? `Sign in again · ${age}` : 'Sign in again',
+    expired: age => age ? `Expired, not checked · ${age}` : 'Expired, not checked',
+    unknown: age => age ? `Unknown · ${age}` : 'Unknown',
+    checkedNow: 'checked just now',
+    checkedMinutes: minutes => `checked ${minutes}m ago`,
+    checkedHours: hours => `checked ${hours}h ago`,
+    checkedDays: days => `checked ${days}d ago`,
+    resetPassed: 'Reset passed, awaiting check',
+    signInHint: 'hermes auth add openai-codex --type oauth'
+  },
   clocks: {
     title: 'Manual clocks',
     add: 'Add clock',
@@ -275,6 +291,9 @@ function validQuotaCacheCard(card) {
   if (textFields.some(field => card[field] != null && typeof card[field] !== 'string')) return false
   if (['remaining', 'used'].some(field => card[field] != null &&
     (typeof card[field] !== 'number' || !Number.isFinite(card[field]) || card[field] < 0 || card[field] > 100))) return false
+  if (card.stateKind != null && typeof card.stateKind !== 'string') return false
+  if (card.entryId != null && typeof card.entryId !== 'string') return false
+  if (card.observedAt != null && (typeof card.observedAt !== 'number' || !Number.isFinite(card.observedAt))) return false
   if (card.resetAt != null && card.resetAt !== '' &&
     ((typeof card.resetAt !== 'string' && typeof card.resetAt !== 'number') ||
       !Number.isFinite(new Date(card.resetAt).getTime()))) return false
@@ -301,11 +320,17 @@ function saveQuotaCache(key, payload) {
   if (!successful.length && (payload.cards.length || payload.errors?.length)) return
   if (!successful.every(validQuotaCacheCard)) return
   // Persist only usage fields, never raw RPC/probe responses or errors.
-  const cards = successful.map(card => ({
-    id: card.id, source: card.source, provider: card.provider, group: card.group,
-    account: card.account, label: card.label, remaining: card.remaining,
-    used: card.used, resetAt: card.resetAt, resetText: card.resetText, detail: card.detail
-  }))
+  const cards = successful.map(card => {
+    const saved = {
+      id: card.id, source: card.source, provider: card.provider, group: card.group,
+      account: card.account, label: card.label, remaining: card.remaining,
+      used: card.used, resetAt: card.resetAt, resetText: card.resetText, detail: card.detail
+    }
+    if (card.stateKind) saved.stateKind = card.stateKind
+    if (card.entryId) saved.entryId = card.entryId
+    if (Number.isFinite(card.observedAt)) saved.observedAt = card.observedAt
+    return saved
+  })
   remember(QUOTA_CACHE_KEY, { ...freshQuotaCacheEntries(), [JSON.stringify(key)]: { cards, errors: [],
     checkedAt: payload.checkedAt, observedAt: observedTime(payload), hadSession: payload.hadSession, haveAccountRpc: payload.haveAccountRpc } })
 }
@@ -444,20 +469,65 @@ function toneColor(tone) {
   return text.secondary
 }
 
-function formatReset(resetAt, resetText, nowMs) {
-  if (resetText) return resetText
+function resetClock(resetAt) {
   if (!resetAt) return ''
   const date = new Date(resetAt)
   if (Number.isNaN(date.getTime())) return String(resetAt)
-  const delta = date.getTime() - (nowMs || Date.now())
-  const local = date.toLocaleString(undefined, {
+  return date.toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
     hour: 'numeric',
     minute: '2-digit'
   })
-  if (delta <= 0) return tr('reset.now', local)
+}
+
+function observedMillis(value) {
+  const at = Number(value)
+  if (!Number.isFinite(at) || at <= 0) return null
+  return at > 1e12 ? at : at * 1000
+}
+
+function resetHasPassed(card, nowMs) {
+  const at = Date.parse(card && card.resetAt || '')
+  const observed = Number(card && card.observedAt)
+  const now = nowMs || Date.now()
+  return Number.isFinite(at) && at <= now && Number.isFinite(observed) && observed > 0 && observed < at
+}
+
+function checkedAge(observedAt, nowMs) {
+  if (!Number.isFinite(observedAt) || observedAt <= 0) return ''
+  const minutes = Math.max(0, Math.round(((nowMs || Date.now()) - observedAt) / 60000))
+  if (minutes < 1) return tr('status.checkedNow')
+  if (minutes < 60) return tr('status.checkedMinutes', minutes)
+  const hours = Math.round(minutes / 60)
+  if (hours < 48) return tr('status.checkedHours', hours)
+  return tr('status.checkedDays', Math.max(1, Math.round(hours / 24)))
+}
+
+function accountStateLine(card, nowMs) {
+  const kind = card && card.stateKind
+  if (!kind) return ''
+  const age = checkedAge(card.observedAt, nowMs)
+  if (kind === 'limited' && resetHasPassed(card, nowMs)) return tr('status.resetPassed')
+  if (kind === 'available') return tr('status.available', age)
+  if (kind === 'limited') return tr('status.limitReached', resetClock(card.resetAt), age)
+  if (kind === 'sign_in') return tr('status.signIn', age)
+  if (kind === 'expired') return tr('status.expired', age)
+  return tr('status.unknown', age)
+}
+
+function formatReset(resetAt, resetText, nowMs, observedAt) {
+  if (resetText) return resetText
+  if (!resetAt) return ''
+  const date = new Date(resetAt)
+  if (Number.isNaN(date.getTime())) return String(resetAt)
+  const delta = date.getTime() - (nowMs || Date.now())
+  const local = resetClock(resetAt)
+  if (delta <= 0) {
+    if (Number.isFinite(observedAt) && observedAt > 0 && observedAt < date.getTime()) return tr('status.resetPassed')
+    return tr('reset.now', local)
+  }
   const minutes = Math.round(delta / 60000)
   if (minutes < 1) return tr('reset.now', local)
   if (minutes < 60) return tr('reset.minutes', minutes, local)
@@ -798,6 +868,30 @@ function accountCardProvider(id) {
   return providerKey(provider)
 }
 
+function codexStateKind(snap) {
+  if (providerKey(snap && snap.provider) !== 'openai-codex') return ''
+  const auth = String((snap && snap.auth_state) || '')
+  const quota = String((snap && snap.quota_state) || '')
+  if (auth === 'sign_in') return 'sign_in'
+  if (auth === 'expired') return 'expired'
+  if (quota === 'limited') return 'limited'
+  if (quota === 'available' || auth === 'ok') return 'available'
+  if (auth || quota) return 'unknown'
+  return ''
+}
+
+function blockingReset(windows) {
+  const times = []
+  for (const window of windows || []) {
+    const at = Date.parse(window && window.reset_at || '')
+    if (!Number.isFinite(at)) continue
+    times.push({ at, raw: window.reset_at, exhausted: Number(window.used_percent) >= 100 })
+  }
+  const pool = times.filter(item => item.exhausted)
+  const chosen = (pool.length ? pool : times).sort((a, b) => a.at - b.at)[0]
+  return chosen ? chosen.raw : null
+}
+
 function cardsFromAccountSnapshots(snapshots) {
   const cards = []
   for (const snap of snapshots || []) {
@@ -808,7 +902,27 @@ function cardsFromAccountSnapshots(snapshots) {
     const extra = (snap.details || []).join(' · ')
     const windows = snap.windows || []
     const failed = Boolean(snap.error)
-    if (failed) {
+    const stateKind = codexStateKind(snap)
+    const observedAt = observedMillis(snap && snap.observed_at)
+    if (stateKind) {
+      cards.push({
+        id: `account:${snap.provider}${accountTag}:state`,
+        source: 'live',
+        provider,
+        group,
+        account: '',
+        label: accountLabel || provider,
+        remaining: null,
+        used: null,
+        resetAt: stateKind === 'limited' ? blockingReset(windows) : null,
+        resetText: '',
+        detail: '',
+        stateKind,
+        observedAt,
+        entryId: String(snap && snap.account_key ? snap.account_key : '').trim()
+      })
+    }
+    if (failed && !stateKind) {
       // probe.py found a login but the fetch failed. Show why instead of
       // silently dropping the vendor from the page.
       cards.push({
@@ -827,22 +941,24 @@ function cardsFromAccountSnapshots(snapshots) {
       })
       continue
     }
+    if (failed) continue
     windows.forEach((window, index) => {
       cards.push({
         id: `account:${snap.provider}${accountTag}:${index}:${window.label}`,
         source: 'live',
         provider,
         group,
-        account: index === 0 ? accountLabel : '',
+        account: stateKind || index !== 0 ? '' : accountLabel,
         label: window.label,
         remaining: clampPercent(window.remaining_percent) ?? remainingFromUsed(window.used_percent),
         used: clampPercent(window.used_percent),
         resetAt: window.reset_at || null,
         resetText: '',
-        detail: [window.detail, index === windows.length - 1 ? extra : ''].filter(Boolean).join(' · ')
+        detail: [window.detail, index === windows.length - 1 ? extra : ''].filter(Boolean).join(' · '),
+        observedAt
       })
     })
-    if (!windows.length && extra) {
+    if (!windows.length && extra && !stateKind) {
       cards.push({
         id: `account:${snap.provider}${accountTag}:note`,
         source: 'live',
@@ -1394,9 +1510,12 @@ function LimitCard({ card, nowMs, actions }) {
   const remaining = quotaPercent(card, 'remaining')
   const percent = quotaPercent(card, displayMode)
   const tone = toneForRemaining(remaining)
-  const reset = formatReset(card.resetAt, card.resetText, nowMs)
+  const stateLine = accountStateLine(card, nowMs)
+  const stale = resetHasPassed(card, nowMs)
+  const reset = stateLine || formatReset(card.resetAt, card.resetText, nowMs, card.observedAt)
   const percentLabel = t(displayMode === 'used' ? 'card.used' : 'card.left', percent)
   const detail = displayDetail(card)
+  const hideMeter = Boolean(card.stateKind) || stale
   return jsxs('div', {
     style: {
       display: 'flex',
@@ -1427,6 +1546,12 @@ function LimitCard({ card, nowMs, actions }) {
                 children: isBareReset(card) && !reset.startsWith('Reset') ? t('reset.at', reset) : reset
               })
             : null,
+          ...(card.stateKind === 'sign_in'
+            ? [jsx('div', {
+                style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
+                children: t('status.signInHint')
+              })]
+            : []),
           detail
             ? jsx('div', {
                 style: { fontSize: '0.75rem', color: text.tertiary, marginTop: 2 },
@@ -1441,7 +1566,7 @@ function LimitCard({ card, nowMs, actions }) {
             style: { fontSize: '0.75rem', color: text.quaternary, flexShrink: 0 },
             children: t('card.unavailable')
           })
-        : percent === null
+        : hideMeter || percent === null
           ? null
           : jsxs('div', {
               style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 },
@@ -2117,7 +2242,7 @@ function QuotaRing({ card, mode, size = 64, showValue = true }) {
 
 // The chip shows whichever window has the least left.
 function lowestQuotaCard(cards) {
-  return (cards || []).filter(card => !card.error && quotaPercent(card, 'remaining') !== null)
+  return (cards || []).filter(card => !card.error && !card.stateKind && !resetHasPassed(card) && quotaPercent(card, 'remaining') !== null)
     .reduce((low, card) => !low || quotaPercent(card, 'remaining') < quotaPercent(low, 'remaining') ? card : low, null)
 }
 
@@ -2183,18 +2308,25 @@ function QuickUsage() {
         jsx('div', { style: { maxHeight: 'min(480px, 65vh)', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }, children:
           groups.length ? groups.map(group => jsxs('section', { children: [
             jsx('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 7 }, children: group.title }),
-            ...group.cards.map(card => jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '7px 0',
+            ...group.cards.map(card => {
+              const stateLine = accountStateLine(card, nowMs)
+              const stale = Boolean(card.stateKind) || resetHasPassed(card, nowMs)
+              const ringCard = stale ? { ...card, remaining: null, used: null, error: true } : card
+              return jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '7px 0',
               borderBottom: '1px solid var(--ui-stroke-secondary)' }, children: [
-              jsx(QuotaRing, { card, mode }),
+              jsx(QuotaRing, { card: ringCard, mode }),
               jsxs('div', { style: { minWidth: 0, flex: 1 }, children: [
                 jsx('div', { style: { fontSize: 12, fontWeight: 500 }, children: card.label }),
                 card.account ? jsx('div', { style: { fontSize: 11, color: text.tertiary }, children: card.account }) : null,
                 jsx('div', { style: { fontSize: 11, color: text.secondary, marginTop: 3 },
-                  children: formatReset(card.resetAt, card.resetText, nowMs) || t('reset.unknown') }),
-                card.error || quotaPercent(card, mode) === null ? jsx('div', { style: { fontSize: 11, color: text.tertiary, overflowWrap: 'anywhere' },
+                  children: stateLine || formatReset(card.resetAt, card.resetText, nowMs, card.observedAt) || t('reset.unknown') }),
+                card.stateKind === 'sign_in' ? jsx('div', { style: { fontSize: 11, color: text.tertiary, overflowWrap: 'anywhere' },
+                  children: t('status.signInHint') }) : null,
+                !card.stateKind && (card.error || quotaPercent(card, mode) === null) ? jsx('div', { style: { fontSize: 11, color: text.tertiary, overflowWrap: 'anywhere' },
                   children: card.detail || t('popup.noPercent') }) : null
               ] })
-            ] }, card.id))
+            ] }, card.id)
+            })
           ] }, group.title)) : jsx('div', { style: { padding: '20px 0', fontSize: 12, color: text.secondary },
             children: t(live.isFetching ? 'popup.firstRead' : 'popup.empty') }) }),
         live.data?.errors?.length ? jsx('div', { role: 'status', style: { fontSize: 11, color: text.yellow, marginTop: 8, overflowWrap: 'anywhere' },

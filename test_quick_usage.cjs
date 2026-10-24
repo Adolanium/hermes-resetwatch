@@ -60,7 +60,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
       if (!(index in states)) states[index] = value
       return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
     }, jsx, jsxs: jsx })
-  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode };', context)
+  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode, LimitCard, accountStateLine, resetHasPassed };', context)
   context.plugin.register({ storage: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
     set: (key, value) => saved.set(key, value) }, onDispose: fn => disposers.push(fn),
     registerMany: rows => registered.push(...rows) })
@@ -123,6 +123,68 @@ test('reset display includes countdown and absolute local date', () => {
   const { api, cards } = load()
   assert.match(api.formatReset(cards[0].resetAt, '', Date.parse('2030-01-01T10:00:00Z')), /Resets in 2h.*\u00b7/)
   assert.equal(api.formatReset(null, '', Date.now()), '')
+})
+
+function shownText(tree, out = []) {
+  if (typeof tree === 'string' || typeof tree === 'number') out.push(String(tree))
+  else if (Array.isArray(tree)) tree.forEach(item => shownText(item, out))
+  else if (tree && tree.props) shownText(tree.props.children, out)
+  return out
+}
+
+function hasMeter(tree) {
+  if (!tree || typeof tree !== 'object') return false
+  if (tree.props && tree.props.role === 'meter') return true
+  const children = tree.props && tree.props.children
+  if (Array.isArray(children)) return children.some(hasMeter)
+  return hasMeter(children)
+}
+
+const STATUS_NOW = Date.UTC(2026, 0, 1, 12)
+
+test('Codex state rows name availability, sign-in, expiry, and the check age', () => {
+  const { api } = load()
+  const observed = STATUS_NOW / 1000 - 180
+  const cases = [
+    [{ provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-1', auth_state: 'ok', quota_state: 'available', observed_at: observed,
+      windows: [{ label: 'Session', used_percent: 10, remaining_percent: 90, reset_at: '2030-01-01T12:00:00Z' }] }, 'Available', false],
+    [{ provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-2', auth_state: 'ok', quota_state: 'limited', observed_at: observed,
+      windows: [{ label: 'Session', used_percent: 100, remaining_percent: 0, reset_at: '2030-01-01T18:00:00Z' }] }, 'Limit reached, resets at', false],
+    [{ provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-3', auth_state: 'sign_in', reason_code: 'token_revoked', observed_at: observed, error: 'rejected', windows: [] }, 'Sign in again', true],
+    [{ provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-4', auth_state: 'expired', observed_at: observed, error: 'unauthorized', windows: [] }, 'Expired, not checked', false],
+    [{ provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-5', auth_state: 'unknown', observed_at: observed, error: 'failed', windows: [] }, 'Unknown', false]
+  ]
+  for (const [snap, phrase, hint] of cases) {
+    const cards = api.cardsFromAccountSnapshots([snap])
+    const state = cards.find(card => card.stateKind)
+    assert.ok(state, phrase)
+    const line = api.accountStateLine(state, STATUS_NOW)
+    assert.ok(line.includes(phrase), line)
+    assert.ok(line.includes('checked 3m ago'), line)
+    const tree = api.LimitCard({ card: state, nowMs: STATUS_NOW })
+    const text = shownText(tree).join('\n')
+    assert.ok(text.includes(phrase), text)
+    assert.equal(text.includes('hermes auth add openai-codex --type oauth'), hint, text)
+  }
+})
+
+test('a passed reset hides the stale bar until the next check', () => {
+  const { api } = load()
+  const resetAt = new Date(STATUS_NOW - 60000).toISOString()
+  const observed = (STATUS_NOW - 120000) / 1000
+  const cards = api.cardsFromAccountSnapshots([{
+    provider: 'openai-codex', account_label: 'ada@example.com', account_key: 'entry-6',
+    auth_state: 'ok', quota_state: 'limited', observed_at: observed,
+    windows: [{ label: 'Session', used_percent: 100, remaining_percent: 0, reset_at: resetAt }]
+  }])
+  const windowCard = cards.find(card => card.label === 'Session')
+  assert.equal(api.formatReset(windowCard.resetAt, '', STATUS_NOW, windowCard.observedAt), 'Reset passed, awaiting check')
+  assert.equal(api.resetHasPassed(windowCard, STATUS_NOW), true)
+  const tree = api.LimitCard({ card: windowCard, nowMs: STATUS_NOW })
+  const text = shownText(tree).join('\n')
+  assert.ok(text.includes('Reset passed, awaiting check'), text)
+  assert.equal(hasMeter(tree), false)
+  assert.equal(text.includes('% left'), false)
 })
 test('cache reads synchronously and stores only display fields', () => {
   const { api, key, payload, saved } = load()
