@@ -10,7 +10,7 @@
 
   Resetwatch is a Hermes Desktop plugin for remaining quota. Live bars for the plans you already signed into. A clock for when each one comes back. No chat has to be open.
 
-  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.26</sub>
+  <sub>POWERED BY <a href="https://github.com/NousResearch/hermes-agent">HERMES AGENT</a> &nbsp;·&nbsp; COMMUNITY PLUGIN &nbsp;·&nbsp; VERSION 0.2.22</sub>
 
   <br /><br />
 
@@ -326,6 +326,6 @@ continue to use the existing root files.
 For development, edit the root files, then run `python scripts/build_catalog.py`.
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.2.26` and are not marked as the latest standalone release.
+releases use `catalog-v0.2.22` and are not marked as the latest standalone release.
 
 The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort. The page can renew one Codex login when you click Renew and confirm the masked name. That click runs Hermes `hermes auth refresh openai-codex` for that login only. Hermes saves the new login. A Codex CLI session using the same login can be signed out. The probe never does this, and nothing renews a login on a timer.

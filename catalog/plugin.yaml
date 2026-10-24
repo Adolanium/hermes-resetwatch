@@ -1,6 +1,6 @@
 {
   "name": "hermes-resetwatch",
-  "version": "0.2.26",
+  "version": "0.2.22",
   "description": "Track subscription quotas and reset times in Hermes Desktop. Renew asks Hermes to refresh one Codex login after you confirm.",
   "author": "Adolanium",
   "manifest_version": 1,
