@@ -549,3 +549,22 @@ test('an old poll cannot unblock or replace a new profile request', async () => 
   await settle()
   assert.equal(app.renderPolled('open', 'same-session', 'one', 'beta').isFetching, false)
 })
+
+test('probe commands never hand the backend shell an expandable path', async () => {
+  const app = load({ configHome: '/srv/$(touch pwned)/hermes', shellExec: () => ({ code: 127, stderr: 'not found' }) })
+  const result = await app.context.probeStockAccountUsage(app.host.request, { profile: 'default' })
+  assert.ok(app.calls.every(call => call.method !== 'shell.exec'), 'no command is built from the unsafe home')
+  assert.match(result.error, /would expand/)
+  for (const unsafe of ['/srv/a"b', '/srv/`id`', 'C:/100%HOME%', 'C:/x!PATH!', '/srv/$HOME']) {
+    assert.throws(() => app.context.quoteShell(unsafe), /would expand/, unsafe)
+  }
+  const windowsPython = String.raw`C:\Users\me\hermes-agent\.venv\Scripts\python.exe`
+  assert.equal(app.context.quoteShell(windowsPython), `"${windowsPython}"`)
+})
+
+test('Hermes runtime interpreter tokens still reach the shell for expansion', async () => {
+  const commands = []
+  const app = load({ shellExec: command => { commands.push(command); return { code: 127, stderr: 'not found' } } })
+  await app.context.probeStockAccountUsage(app.host.request, { profile: 'default' })
+  assert.ok(commands.some(command => command.startsWith('"$HERMES_PYTHON" "/srv/hermes/')))
+})
