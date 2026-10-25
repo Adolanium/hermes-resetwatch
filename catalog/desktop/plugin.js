@@ -176,6 +176,7 @@ const EN = {
     noRoute: profile => `No Desktop route for ${profile}`,
     noHome: 'Could not find Hermes home for probe.py',
     badProfile: 'Invalid Hermes profile name',
+    unsafeShellArg: path => `Cannot run probe.py from ${path}: the path contains a character the backend shell would expand ($, %, !, a backtick or a quote)`,
     noHttpx: 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.',
     noProbe: 'probe.py not found in the standalone or combined-package installation on this Gateway',
     noPython: 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)',
@@ -1010,9 +1011,22 @@ function hermesHomeCandidates(fromConfig) {
   return out
 }
 
-function quoteShell(path) {
-  // shell.exec takes a single command string (no argv). Quote for spaces.
-  return `"${String(path).replace(/"/g, '\\"')}"`
+// The backend shell expands these on purpose: they name Hermes' own interpreter.
+const SHELL_RUNTIME_PYTHONS = new Set(['$HERMES_PYTHON', '%HERMES_PYTHON%'])
+
+// shell.exec takes one command string, run by sh on POSIX and cmd.exe on
+// Windows. Double quotes are the only quoting both understand, and inside
+// them sh still expands $ and backticks while cmd expands %VAR% and !VAR!.
+// No escape works in both shells, so any other value carrying one of those
+// characters is refused instead of quoted.
+function shellSafe(value) {
+  const text = String(value)
+  return SHELL_RUNTIME_PYTHONS.has(text) || !/["$`%!\r\n]/.test(text)
+}
+
+function quoteShell(value) {
+  if (!shellSafe(value)) throw new Error(tr('errors.unsafeShellArg', String(value)))
+  return `"${String(value)}"`
 }
 
 function probePythonCandidates(home) {
@@ -1163,8 +1177,10 @@ async function probeNextSlice(request, sid, python, probe, flags, token, offset)
 async function probeStockAccountUsage(request, opts) {
   try {
     const shown = await request('config.show', {})
-    const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
-    if (!homes.length) return { snapshots: null, error: tr('errors.noHome') }
+    const found = hermesHomeCandidates(hermesHomeFromConfig(shown))
+    if (!found.length) return { snapshots: null, error: tr('errors.noHome') }
+    const homes = found.filter(shellSafe)
+    if (!homes.length) return { snapshots: null, error: tr('errors.unsafeShellArg', found[0]) }
     const profileArg = String((opts && opts.profile) || '').trim()
     if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
       return { snapshots: null, error: tr('errors.badProfile') }
