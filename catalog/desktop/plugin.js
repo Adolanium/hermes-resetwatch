@@ -117,7 +117,14 @@ const EN = {
     checkedHours: hours => `checked ${hours}h ago`,
     checkedDays: days => `checked ${days}d ago`,
     resetPassed: 'Reset passed, awaiting check',
-    signInHint: 'hermes auth add openai-codex --type oauth'
+    signInHint: 'hermes auth add openai-codex --type oauth',
+    // BEGIN CODEX RENEW COPY
+    renew: 'Renew sign-in',
+    renewBusy: 'Renewing sign-in',
+    renewConfirm: label => `Renew the sign-in for ${label}? A Codex CLI session that uses this same login can be signed out.`,
+    renewOk: 'Sign-in renewed. Checking usage.',
+    renewFailed: 'Could not renew this sign-in.'
+    // END CODEX RENEW COPY
   },
   clocks: {
     title: 'Manual clocks',
@@ -1953,6 +1960,79 @@ function useFocusedLiveCards(active = true) {
   return { gateway, profile, preferences, live }
 }
 
+// BEGIN CODEX RENEW ACTION
+function scrubRenewHint(result) {
+  const parts = result && typeof result === 'object'
+    ? [result.hint, result.output, result.stderr, result.stdout]
+    : []
+  const text = parts.filter(part => typeof part === 'string').join(' ').replace(/\s+/g, ' ').trim()
+  if (!text || text.length > 180) return ''
+  if (/eyJ|bearer\s+|sk-|refresh_token|access_token|api[_-]?key/i.test(text)) return ''
+  return text
+}
+
+function renewNote(result) {
+  if (result && result.code === 0) return tr('status.renewOk')
+  return scrubRenewHint(result) || tr('status.renewFailed')
+}
+
+async function codexRenewRequest() {
+  const ownerState = host.state.focusedSessionOwner
+  const owner = ownerState && ownerState.get ? ownerState.get() : null
+  const connectionId = owner && owner.connectionId
+  const profile = owner && owner.profile
+  if (connectionId && profile && typeof host.requestProfile === 'function' && typeof host.profileRoutes === 'function') {
+    const routed = await profileRequester(connectionId, profile)
+    return routed.request
+  }
+  return (method, params) => host.request(method, params)
+}
+
+function CodexRenewButton({ card, live }) {
+  const t = useTr()
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState('')
+  const id = String(card && card.entryId || '').trim()
+  const label = String(card && card.label || 'Codex')
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 },
+    children: [
+      jsx(SmallButton, {
+        disabled: busy,
+        onClick: async () => {
+          if (busy || !id || /\s/.test(id)) return
+          if (!confirm(t('status.renewConfirm', label))) return
+          setBusy(true)
+          try {
+            const request = await codexRenewRequest()
+            const result = await request('cli.exec', { argv: ['auth', 'refresh', 'openai-codex', id] })
+            setNote(renewNote(result))
+          } catch (error) {
+            setNote(renewNote({ code: 1, hint: String(error && error.message || '') }))
+          } finally {
+            setBusy(false)
+            if (live && typeof live.refetch === 'function') live.refetch()
+          }
+        },
+        children: busy ? t('status.renewBusy') : t('status.renew')
+      }),
+      note
+        ? jsx('div', { style: { fontSize: '0.6875rem', color: text.tertiary, maxWidth: 180, textAlign: 'right' }, children: note })
+        : null
+    ]
+  })
+}
+
+function codexRenewActionsFor(live) {
+  return card => {
+    if (!card || (card.stateKind !== 'sign_in' && card.stateKind !== 'expired')) return null
+    const id = String(card.entryId || '').trim()
+    if (!id || /\s/.test(id)) return null
+    return jsx(CodexRenewButton, { card, live })
+  }
+}
+// END CODEX RENEW ACTION
+
 function PluginPageContent() {
   const t = useTr()
   const { gateway, preferences, live } = useFocusedLiveCards()
@@ -2127,7 +2207,7 @@ function PluginPageContent() {
                               alignItems: 'start'
                             },
                             children: groups.map(group =>
-                              jsx(ProviderBlock, { title: group.title, cards: group.cards, nowMs }, group.title)
+                              jsx(ProviderBlock, { title: group.title, cards: group.cards, nowMs, actionsFor: codexRenewActionsFor(live) }, group.title)
                             )
                           })
                         : jsx('div', {

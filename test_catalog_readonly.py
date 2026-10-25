@@ -56,6 +56,9 @@ class CatalogReadOnlyTests(unittest.TestCase):
             self.assertIsNone(probe._hermes_anthropic_oauth_token())
         for name in ("_write_secret_json", "_kimi_code_refresh_tokens", "_grok_refresh_entry"):
             self.assertFalse(hasattr(probe, name))
+        text = Path(__file__).resolve().parent.joinpath("catalog/desktop/probe.py").read_text(encoding="utf-8")
+        self.assertNotIn("cli.exec", text)
+        self.assertNotIn("auth refresh", text)
 
 
 if __name__ == "__main__":

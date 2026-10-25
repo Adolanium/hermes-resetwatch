@@ -35,3 +35,7 @@ One line per account:
 When the reset time is already past and the check is older than that reset, the row says "Reset passed, awaiting check" and the percent bar stays hidden until a newer check arrives.
 
 The probe does not refresh Codex tokens.
+
+## Renew
+
+Sign in again and Expired rows that have a login id show Renew on the full page. It runs only after a click. The confirm dialog names that login with the masked label and warns that a Codex CLI session using the same login can be signed out. The click then runs Hermes through `cli.exec` with argv `auth`, `refresh`, `openai-codex`, and that login id. Success is the exit code. Short output can be shown as a hint. Text that looks like a token is not shown. After the command returns, the page runs one read-only usage check. Nothing calls Renew on a timer. The probe does not run this command.
