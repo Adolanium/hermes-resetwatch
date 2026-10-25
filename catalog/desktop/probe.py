@@ -31,7 +31,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
@@ -1179,6 +1179,29 @@ def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[st
     return None
 
 
+def _grok_proxy_base() -> str:
+    """GROK_CLI_CHAT_PROXY_BASE_URL, but only while it stays on Grok's own hosts.
+
+    The Grok CLI token is sent to this base, so an override that is not https
+    on grok.com or x.ai (or their subdomains) is ignored and the default proxy
+    is used instead.
+    """
+    raw = (os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or parts.username or parts.password or port not in (None, 443):
+        return ""
+    if host in ("grok.com", "x.ai") or host.endswith((".grok.com", ".x.ai")):
+        return raw
+    return ""
+
+
 def _grok_proxy_headers(token: str, user_id: str) -> dict[str, str]:
     # Private Grok CLI billing API. Best-effort; xAI may change or reject this.
     return {
@@ -1232,7 +1255,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         return None
     token, user_id = context
     headers = _grok_proxy_headers(token, user_id)
-    base = (os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL") or "").strip().rstrip("/")
+    base = _grok_proxy_base()
     billing_url = f"{base}/billing?format=credits" if base else GROK_BILLING_URL
     settings_url = f"{base}/settings" if base else GROK_SETTINGS_URL
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
