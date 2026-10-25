@@ -58,6 +58,44 @@ class GrokUsageTests(unittest.TestCase):
              patch.object(module, "_grok_access_context", return_value=context):
             return module._fetch_grok_account_usage()
 
+    def hosts_contacted(self, module, override):
+        hosts = []
+
+        def respond(request):
+            hosts.append(request.url.host)
+            return httpx.Response(200, json={})
+
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        self.addCleanup(client.close)
+        env = {"GROK_CLI_CHAT_PROXY_BASE_URL": override}
+        with patch.dict("os.environ", env), patch.object(httpx, "Client", return_value=client), \
+             patch.object(module, "_grok_access_context", return_value=("test-token", "test-user")):
+            module._fetch_grok_account_usage()
+        return set(hosts)
+
+    def test_proxy_override_cannot_send_the_token_off_grok_hosts(self):
+        rejected = [
+            "https://attacker.example/v1",
+            "http://cli-chat-proxy.grok.com/v1",
+            "https://grok.com.attacker.example/v1",
+            "https://evilgrok.com/v1",
+            "https://user:pw@cli-chat-proxy.grok.com/v1",
+            "https://cli-chat-proxy.grok.com:8443/v1",
+            "https://[::1/v1",
+        ]
+        for module in (probe, catalog_probe):
+            for override in rejected:
+                with self.subTest(module=module.__name__, override=override):
+                    self.assertEqual(self.hosts_contacted(module, override), {"cli-chat-proxy.grok.com"})
+
+    def test_proxy_override_on_grok_hosts_is_honoured(self):
+        for module in (probe, catalog_probe):
+            for override, host in (("https://staging.grok.com/v1/", "staging.grok.com"),
+                                   ("https://proxy.x.ai/v1", "proxy.x.ai"),
+                                   ("https://x.ai:443/v1", "x.ai")):
+                with self.subTest(module=module.__name__, override=override):
+                    self.assertEqual(self.hosts_contacted(module, override), {host})
+
     def test_parse_helper_keeps_unified_billing_usage_unknown(self):
         for module in (probe, catalog_probe):
             with self.subTest(module=module.__name__):
