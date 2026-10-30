@@ -718,6 +718,14 @@ function parseUsageOutput(text) {
       current = null
       continue
     }
+    // Usage-window layout: the block opens on the plan name ("Hermes Plus") instead of a
+    // fixed header, and each window is a gauge line ("This week  [|   ]  8% used  ·  resets in 6d").
+    if (/^(?:nous(?: portal)?|hermes (?:free|plus|pro|max|team|business)|insider)$/i.test(line)) {
+      inLimits = true
+      current = { provider: 'Nous Portal', windows: [], details: [] }
+      groups.push(current)
+      continue
+    }
     if (/^(session (token )?usage|session info|rate limits)\b/i.test(line)) {
       inLimits = false
       current = null
@@ -746,6 +754,29 @@ function parseUsageOutput(text) {
         label: windowMatch[1].trim(),
         remaining: Number(windowMatch[2]),
         used: Number(windowMatch[3]),
+        resetText,
+        detail
+      })
+      continue
+    }
+    // Gauge line of the usage-window layout: "This month  [|    ]  <1% used  ·  resets in 4d 5h".
+    const gaugeMatch = line.match(
+      /^(.+?)\s*\[[^\]]*\]\s*(<?)\s*(\d+(?:\.\d+)?)%\s+used(?:\s*[·•]\s*(.+))?$/i
+    )
+    if (gaugeMatch) {
+      if (!current) {
+        current = { provider: 'Account', windows: [], details: [] }
+        groups.push(current)
+      }
+      const suffix = (gaugeMatch[4] || '').trim()
+      const resetText = /^resets\s+/i.test(suffix) ? suffix.replace(/^resets\s+/i, '') : ''
+      const detail = resetText ? '' : suffix
+      // "<1% used" is a rounding floor, not a measurement: read it as zero used.
+      const used = gaugeMatch[2] ? 0 : Number(gaugeMatch[3])
+      current.windows.push({
+        label: gaugeMatch[1].trim(),
+        remaining: clampPercent(100 - used),
+        used: clampPercent(used),
         resetText,
         detail
       })
