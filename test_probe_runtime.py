@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 
@@ -220,7 +220,10 @@ class ProbeRuntimeTests(unittest.TestCase):
             release = threading.Event()
             started_ago = probe.SHELL_EXEC_TIMEOUT_SECONDS - probe.EXIT_RESERVE_SECONDS - 0.3
             others = set(probe.LIVE_PROVIDERS) - {"anthropic"}
+            # The vendor fetcher is faked, so httpx only has to import. A stub
+            # keeps this test valid on a Python without httpx installed.
             with self.subTest(source=source), \
+                 patch.dict("sys.modules", {"httpx": ModuleType("httpx")}), \
                  patch.object(probe, "_STARTED_AT", time.time() - started_ago, create=True), \
                  patch.object(probe, "_disabled_providers", others), \
                  patch.object(probe, "_fetch_claude_accounts_usage", side_effect=lambda: release.wait(10)):
