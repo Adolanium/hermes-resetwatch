@@ -165,6 +165,7 @@ class ProbeRuntimeTests(unittest.TestCase):
                      patch.object(probe.sys, "argv", flags), \
                      patch.dict("sys.modules", {"httpx": None}), \
                      patch.object(probe.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as check, \
+                     patch.object(probe.sys, "platform", "linux"), \
                      patch.object(probe.os, "execv", side_effect=ReplacedProcess) as replace:
                     with self.assertRaises(ReplacedProcess):
                         probe._use_gateway_python()
@@ -183,11 +184,34 @@ class ProbeRuntimeTests(unittest.TestCase):
                 with patch.object(probe, "_gateway_python_candidates", return_value=["/missing", "/slow", "/no-deps", "/custom/venv/bin/python3"]), \
                      patch.object(probe.sys, "argv", flags), \
                      patch.object(probe.subprocess, "run", side_effect=[OSError(), subprocess.TimeoutExpired("python", 3), SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as check, \
+                     patch.object(probe.sys, "platform", "linux"), \
                      patch.object(probe.os, "execv", side_effect=ReplacedProcess) as replace:
                     with self.assertRaises(ReplacedProcess):
                         probe._use_gateway_python()
                     replace.assert_called_once_with("/custom/venv/bin/python3", ["/custom/venv/bin/python3", str(Path(probe.__file__).absolute()), *flags[1:]])
                     self.assertTrue(all(call.kwargs["timeout"] <= 3 for call in check.call_args_list))
+
+    def test_windows_reexec_runs_a_child_so_spaced_interpreter_paths_survive(self):
+        # os.execv does not quote argv on Windows, so an interpreter under
+        # "Program Files" was split at the space and the child printed nothing.
+        class ExitedProcess(BaseException):
+            pass
+
+        spaced = r"D:\Program Files\Hermes\venv\Scripts\python.exe"
+        for source, probe in probes():
+            with self.subTest(source=source):
+                flags = [source, "--profile", "worker", "--slice=0:8"]
+                with patch.object(probe, "_gateway_python_candidates", return_value=[spaced]), \
+                     patch.object(probe.sys, "platform", "win32"), \
+                     patch.object(probe.sys, "argv", flags), \
+                     patch.object(probe.subprocess, "run", side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(returncode=3)]) as run, \
+                     patch.object(probe.os, "execv") as replace, \
+                     patch.object(probe.os, "_exit", side_effect=ExitedProcess) as leave:
+                    with self.assertRaises(ExitedProcess):
+                        probe._use_gateway_python()
+                    replace.assert_not_called()
+                    self.assertEqual(run.call_args.args[0], [spaced, str(Path(probe.__file__).absolute()), *flags[1:]])
+                    leave.assert_called_once_with(3)
 
     def test_vendor_wait_ends_before_the_gateway_shell_limit(self):
         # shell.exec kills the probe at 30 s and returns no output, so a slow
@@ -220,6 +244,7 @@ class ProbeRuntimeTests(unittest.TestCase):
                  patch.object(probe, "_STARTED_AT", time.time() - 6, create=True), \
                  patch.object(probe, "_gateway_python_candidates", return_value=["/gateway/python"]), \
                  patch.object(probe.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(probe.sys, "platform", "linux"), \
                  patch.object(probe.os, "execv", side_effect=ReplacedProcess):
                 with self.assertRaises(ReplacedProcess):
                     probe._use_gateway_python()
