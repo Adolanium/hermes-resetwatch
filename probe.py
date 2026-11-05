@@ -4795,7 +4795,7 @@ def _use_gateway_python() -> None:
             if checked.returncode == 0:
                 os.environ[_STARTED_AT_ENV] = repr(_STARTED_AT)
                 reexec_argv = [str(Path(__file__).absolute()), *sys.argv[1:]]
-                if os.name == "nt":
+                if sys.platform == "win32":
                     # Windows CreateProcess splits an unquoted argv[0] at the first
                     # space, so os.execv cannot start an interpreter installed under
                     # "Program Files": the child dies with an empty stdout and exit
