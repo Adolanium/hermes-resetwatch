@@ -47,7 +47,7 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
         if (JSON.stringify([...page, row]).length > pageBudget) break
         page.push(row)
       }
-      const stdout = JSON.stringify({ snapshot_token: token, snapshots: page })
+      const stdout = JSON.stringify({ snapshot_pin: token, snapshots: page })
       return { code: 0, stdout: stdout.slice(-4000) }
     }
     return { commands, run: () => vm.runInContext(`probeStockAccountUsage(request, ${JSON.stringify({ fresh })})`, context) }

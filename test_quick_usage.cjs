@@ -38,7 +38,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
     if (method === 'account.usage') return { snapshots }
     if (method === 'subscription.state') return {}
     if (method === 'config.show') return { sections: [{ rows: [['Config File', '/fixture/hermes/config.yaml']] }] }
-    if (method === 'shell.exec') return { code: 0, stdout: JSON.stringify({ snapshot_token: 'a'.repeat(32), snapshots: [] }) }
+    if (method === 'shell.exec') return { code: 0, stdout: JSON.stringify({ snapshot_pin: 'a'.repeat(32), snapshots: [] }) }
     throw new Error('Unexpected method: ' + method)
   } }
   const sdk = { host, atom, useValue: store => store.get(), useQuery: options => {

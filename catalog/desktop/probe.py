@@ -4511,13 +4511,13 @@ def _main_inner() -> int:
     if tokens:
         # Never consult the shared cache or vendors for a continuation.
         token = tokens[0]
-        _emit_json({"snapshot_token": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
+        _emit_json({"snapshot_pin": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
         os._exit(0)
 
     def emit_page(snapshots: list) -> None:
         if pin:
             token = _pin_probe_snapshots(snapshots)
-            _emit_json({"snapshot_token": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
+            _emit_json({"snapshot_pin": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
         else:
             _emit_json(_apply_slice(snapshots), real_stdout)
 
