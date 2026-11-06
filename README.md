@@ -159,7 +159,7 @@ When a profile is selected, its Hermes credentials and cache stay separate from 
 
 Contributions are welcome. Open an issue first for anything bigger than a small fix so we can agree on the shape before you spend time on it.
 
-Thanks to everyone who has sent fixes, including @jorisquintano (the Hermes Plus usage-window layout, #56) and @Iversondwx (gateway interpreters installed under paths with spaces on Windows, #57).
+Thanks to everyone who has sent fixes, including @jorisquintano (the Hermes Plus usage-window layout, #56), @Iversondwx (gateway interpreters installed under paths with spaces on Windows, #57) and @enochmessi2 (snapshot pins masked by gateway redaction, #59).
 
 Run the profile tests with Python and Node.js. No packages need to be installed:
 
