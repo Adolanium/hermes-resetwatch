@@ -1188,11 +1188,13 @@ function pinnedPage(text, expectedToken) {
     const crash = parsed.find(snap => snap && snap.provider === 'resetwatch')
     throw new Error((crash && String((crash.details || [])[0] || '')) || 'probe returned invalid snapshot pin')
   }
-  const token = parsed && parsed.snapshot_pin
+  // Older probes send snapshot_token. Gateways that redact JSON keys
+  // naming a credential mask that value, so it then fails the check below.
+  const token = parsed && (parsed.snapshot_pin ?? parsed.snapshot_token)
   if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
     throw new Error('probe returned invalid snapshot pin')
   }
-  return parsed
+  return { snapshot_pin: token, snapshots: parsed.snapshots }
 }
 
 async function probeNextSlice(request, sid, python, probe, flags, token, offset) {
