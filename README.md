@@ -141,7 +141,7 @@ Live data goes through the desktop plugin SDK (`host.request` JSON-RPC), plus `p
 
 It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached in the shared 5-minute result cache. Desktop paging writes a separate private, immutable snapshot for each invocation (including incomplete results). These page pins expire after 15 minutes and old pins are removed when a new one is made.
 
-The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop starts with `probe.py --pin-snapshot --slice=0:8`, receiving a random `snapshot_token` and up to eight rows / 3500 JSON characters. Every later page uses `--snapshot-token=TOKEN --slice=OFFSET:8`; pages only read that frozen result, never the shared cache or vendors. A missing, invalid, or expired pin fails that refresh instead of mixing in another result. A short page can mean the byte budget was reached, so Desktop advances by rows actually returned and stops on an empty page. The first page may use `--fresh`; later pages do not. A single oversized row becomes a visible error card with its account identity. Direct calls without `--slice` retain the original full-list output. Update the Desktop plugin and gateway probe together; an older probe does not speak the pin protocol.
+The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop starts with `probe.py --pin-snapshot --slice=0:8`, receiving a random `snapshot_pin` and up to eight rows / 3500 JSON characters. Every later page uses `--snapshot-token=TOKEN --slice=OFFSET:8`; pages only read that frozen result, never the shared cache or vendors. A missing, invalid, or expired pin fails that refresh instead of mixing in another result. A short page can mean the byte budget was reached, so Desktop advances by rows actually returned and stops on an empty page. The first page may use `--fresh`; later pages do not. A single oversized row becomes a visible error card with its account identity. Direct calls without `--slice` retain the original full-list output. Update the Desktop plugin and gateway probe together; an older probe does not speak the pin protocol.
 
 ## Compatibility
 
@@ -159,7 +159,7 @@ When a profile is selected, its Hermes credentials and cache stay separate from 
 
 Contributions are welcome. Open an issue first for anything bigger than a small fix so we can agree on the shape before you spend time on it.
 
-Thanks to everyone who has sent fixes, including @jorisquintano (the Hermes Plus usage-window layout, #56) and @Iversondwx (gateway interpreters installed under paths with spaces on Windows, #57).
+Thanks to everyone who has sent fixes, including @jorisquintano (the Hermes Plus usage-window layout, #56), @Iversondwx (gateway interpreters installed under paths with spaces on Windows, #57) and @enochmessi2 (snapshot pins masked by gateway redaction, #59).
 
 Run the profile tests with Python and Node.js. No packages need to be installed:
 

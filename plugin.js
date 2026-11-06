@@ -1184,15 +1184,17 @@ function pinnedPage(text, expectedToken) {
   }
   // probe.py main() reports a crash as a bare card list, even when paging.
   if (Array.isArray(parsed)) {
-    if (!expectedToken) return { snapshot_token: null, snapshots: parsed }
+    if (!expectedToken) return { snapshot_pin: null, snapshots: parsed }
     const crash = parsed.find(snap => snap && snap.provider === 'resetwatch')
     throw new Error((crash && String((crash.details || [])[0] || '')) || 'probe returned invalid snapshot pin')
   }
-  const token = parsed && parsed.snapshot_token
+  // Older probes send snapshot_token. Gateways that redact JSON keys
+  // naming a credential mask that value, so it then fails the check below.
+  const token = parsed && (parsed.snapshot_pin ?? parsed.snapshot_token)
   if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
     throw new Error('probe returned invalid snapshot pin')
   }
-  return parsed
+  return { snapshot_pin: token, snapshots: parsed.snapshots }
 }
 
 async function probeNextSlice(request, sid, python, probe, flags, token, offset) {
@@ -1274,13 +1276,13 @@ async function probeStockAccountUsage(request, opts) {
               deadPythons.add(python)
               break
             }
-            if (!first.snapshot_token) return { snapshots: first.snapshots, error: null }
+            if (!first.snapshot_pin) return { snapshots: first.snapshots, error: null }
             try {
               const all = [...first.snapshots]
               let offset = all.length
               // A short page can mean byte-budget exhaustion, not end of list.
               for (let page = 0; offset && page < 256; page++) {
-                const next = await probeNextSlice(request, opts && opts.sessionId, python, probe, flags, first.snapshot_token, offset)
+                const next = await probeNextSlice(request, opts && opts.sessionId, python, probe, flags, first.snapshot_pin, offset)
                 if (!next.length) break
                 all.push(...next)
                 offset += next.length
