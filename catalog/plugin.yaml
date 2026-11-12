@@ -1,5 +1,5 @@
 name: "hermes-resetwatch"
-version: "0.2.22"
+version: "0.2.29"
 description: "Track subscription quotas and reset times in Hermes Desktop."
 author: "Adolanium"
 manifest_version: 1
