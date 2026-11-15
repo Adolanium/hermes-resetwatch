@@ -46,8 +46,24 @@ class CatalogReadOnlyTests(unittest.TestCase):
                     self.assertEqual(credentials.read_bytes(), before)
                     self.assertEqual(list(Path(tmp).iterdir()), [credentials])
 
+    def test_catalog_resolver_list_tracks_source(self):
+        """Catalog installs must keep every Hermes-resolved provider except Codex."""
+        import ast
+
+        source = (Path(__file__).parent / "probe.py").read_text(encoding="utf-8")
+        expected = None
+        for node in ast.parse(source).body:
+            targets = getattr(node, "targets", []) if isinstance(node, ast.Assign) else []
+            if any(getattr(target, "id", "") == "HERMES_PROVIDERS" for target in targets):
+                expected = tuple(
+                    provider for provider in ast.literal_eval(node.value) if provider != "openai-codex"
+                )
+        self.assertIsNotNone(expected, "HERMES_PROVIDERS missing from the source probe")
+        self.assertEqual(probe.HERMES_PROVIDERS, expected)
+        self.assertIn("nous", probe.HERMES_PROVIDERS)
+        self.assertNotIn("openai-codex", probe.HERMES_PROVIDERS)
+
     def test_indirect_credential_refresh_paths_are_excluded(self):
-        self.assertEqual(probe.HERMES_PROVIDERS, ("openrouter",))
         with patch.object(probe.subprocess, "run", side_effect=AssertionError("CLI executed")):
             self.assertIsNone(probe._cursor_cli_json(["status", "--json"]))
         # Resolver imports must not be attempted, even when a Hermes install exists.

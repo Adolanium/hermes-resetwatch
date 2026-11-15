@@ -94,7 +94,7 @@ _slice_args: Optional[tuple[int, int]] = None
 
 
 # Codex is read directly below; the Hermes resolver can refresh OAuth.
-HERMES_PROVIDERS = ("openrouter",)
+HERMES_PROVIDERS = ('nous', 'openrouter')
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
 # honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
@@ -4096,7 +4096,54 @@ def _collect_hermes() -> list[dict]:
         return _collect_hermes_usage()
 
 
+def _hermes_agent_root() -> Optional[Path]:
+    """The Hermes Agent install that owns agent/account_usage.py.
+
+    probe.py runs as a script, so Python puts only the script's own directory on
+    sys.path; agent.* is not importable and every Hermes-resolver fetch raises
+    ImportError into a bare `except: continue`. Locate the install so the
+    HERMES_PROVIDERS loop can use it.
+    """
+    candidates: list[Path] = []
+    explicit = (os.environ.get("HERMES_AGENT_ROOT") or "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    for home in _hermes_homes():
+        candidates.append(home / "hermes-agent")
+    for candidate in candidates:
+        try:
+            if (candidate / "agent" / "account_usage.py").is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _nous_usage_snapshot():
+    """Nous portal usage as percent windows (Today / This week / This month).
+
+    Hermes resolves Nous through a percent-window account, and its dollar usage
+    model reports such an account as unavailable, so usage.bars never carries a
+    Nous card. build_nous_credits_snapshot is the reader behind /usage, so the
+    desktop card and the CLI agree. Returns None when not logged in.
+    """
+    root = _hermes_agent_root()
+    if root is not None and str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from agent.account_usage import _fetch_portal_account, build_nous_credits_snapshot
+    except Exception:
+        return None
+    try:
+        return build_nous_credits_snapshot(_fetch_portal_account(8.0))
+    except Exception:
+        return None
+
+
 def _collect_hermes_usage() -> list[dict]:
+    root = _hermes_agent_root()
+    if root is not None and str(root) not in sys.path:
+        sys.path.insert(0, str(root))
     try:
         from agent.account_usage import fetch_account_usage
     except Exception:
@@ -4106,7 +4153,7 @@ def _collect_hermes_usage() -> list[dict]:
         if _provider_key(provider) in _disabled_providers:
             continue
         try:
-            snap = fetch_account_usage(provider)
+            snap = _nous_usage_snapshot() if provider == "nous" else fetch_account_usage(provider)
             if not snap or not getattr(snap, "available", False):
                 continue
             snapshots.append(

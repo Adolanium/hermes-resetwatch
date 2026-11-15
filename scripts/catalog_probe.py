@@ -56,7 +56,20 @@ def readonly_probe(source):
             if names & constants:
                 replacement = ""
             elif "HERMES_PROVIDERS" in names:
-                replacement = '# Codex is read directly below; the Hermes resolver can refresh OAuth.\nHERMES_PROVIDERS = ("openrouter",)\n'
+                # Keep the shipped resolver list in step with source, minus Codex
+                # (read directly below). Hardcoding it here silently dropped every
+                # other Hermes-resolved provider from catalog installs.
+                try:
+                    kept = tuple(
+                        provider for provider in ast.literal_eval(node.value)
+                        if provider != "openai-codex"
+                    )
+                except Exception:
+                    kept = ("openrouter",)
+                replacement = (
+                    '# Codex is read directly below; the Hermes resolver can refresh OAuth.\n'
+                    f'HERMES_PROVIDERS = {kept!r}\n'
+                )
         if replacement is not None:
             edits.append((node.lineno - 1, node.end_lineno, replacement))
     if found != removed:
