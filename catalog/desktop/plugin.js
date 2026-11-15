@@ -1388,7 +1388,10 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
   }
 
-  const probeResult = disabled.filter(key => key !== 'nous').length === LIVE_PROVIDERS.length - 1
+  // The probe is the only source that can carry Nous (usage.bars is a dollar
+  // model and reports a usage-window plan as unavailable), so it must run for a
+  // Nous-only setup too. Skip it only when every provider is switched off.
+  const probeResult = LIVE_PROVIDERS.every(key => disabled.includes(key))
     ? { snapshots: [], error: null }
     : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
   const probed = probeResult && probeResult.snapshots
