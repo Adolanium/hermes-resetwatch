@@ -11,6 +11,20 @@ def cut(source, start, end, keep_end=True):
     return source[:first] + source[last if keep_end else last + len(end):]
 
 
+def strip_codex_renew(source):
+    """Drop the Codex renew button. The catalog build calls this."""
+    # Each locale marks its own copy.
+    for locale in ("", " zh", " zh-hant"):
+        source = cut(source, f"    // BEGIN CODEX RENEW COPY{locale}\n", f"    // END CODEX RENEW COPY{locale}\n", False)
+    source = cut(source, "// BEGIN CODEX RENEW ACTION", "// END CODEX RENEW ACTION\n", False)
+    source, count = re.subn(r", actionsFor: codexRenewActionsFor\(live\)", "", source, count=1)
+    if count != 1:
+        raise ValueError("Codex renew wiring changed; review catalog packaging")
+    if "CODEX RENEW" in source or "codexRenewActionsFor" in source or "CodexRenewButton" in source:
+        raise ValueError("Codex renew code remains after removal")
+    return source
+
+
 def strip_updater(source, mode):
     if mode == "shared":
         source = cut(source, "// BEGIN SIGNED DESKTOP UPDATER", "// END SIGNED DESKTOP UPDATER", False)

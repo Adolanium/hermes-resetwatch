@@ -117,7 +117,7 @@ const EN = {
     checkedHours: hours => `checked ${hours}h ago`,
     checkedDays: days => `checked ${days}d ago`,
     resetPassed: 'Reset passed, awaiting check',
-    signInHint: 'hermes auth add openai-codex --type oauth'
+    signInHint: 'hermes auth add openai-codex --type oauth',
   },
   clocks: {
     title: 'Manual clocks',
@@ -255,7 +255,7 @@ const ZH = {
     checkedMinutes: minutes => `${minutes} 分钟前检查`,
     checkedHours: hours => `${hours} 小时前检查`,
     checkedDays: days => `${days} 天前检查`,
-    resetPassed: '已过重置时间，等待检查'
+    resetPassed: '已过重置时间，等待检查',
   },
   clocks: {
     title: '手动计时',
@@ -393,7 +393,7 @@ const ZH_HANT = {
     checkedMinutes: minutes => `${minutes} 分鐘前檢查`,
     checkedHours: hours => `${hours} 小時前檢查`,
     checkedDays: days => `${days} 天前檢查`,
-    resetPassed: '已過重置時間，等待檢查'
+    resetPassed: '已過重置時間，等待檢查',
   },
   clocks: {
     title: '手動計時',
@@ -2263,6 +2263,7 @@ function useFocusedLiveCards(active = true) {
   const live = useLiveCards(gateway, sessionId, connectionId, profile, preferences.disabled, active)
   return { gateway, profile, preferences, live }
 }
+
 
 function PluginPageContent() {
   const t = useTr()

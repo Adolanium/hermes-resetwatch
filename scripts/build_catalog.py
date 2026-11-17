@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from catalog_policy import strip_updater
+from catalog_policy import strip_codex_renew, strip_updater
 from catalog_probe import readonly_probe
 
 
@@ -36,6 +36,9 @@ def build(check=False):
     config = json.loads((ROOT / "catalog-package.json").read_text())
     name = config["name"]
     source = strip_updater((ROOT / "plugin.js").read_text(encoding="utf-8"), config["updater"])
+    # Catalog installs keep the Sign in again and Expired rows without the Renew button: the
+    # catalog build ships no path that starts a token refresh, even through Hermes's own CLI.
+    source = strip_codex_renew(source)
 
     manifest = {
         "name": name, "version": config["version"],
