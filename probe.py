@@ -169,7 +169,7 @@ def _wait_for_credential_writes(timeout: float = CREDENTIAL_WRITE_GRACE_SECONDS)
         time.sleep(0.05)
 
 
-HERMES_PROVIDERS = ("openai-codex", "openrouter")
+HERMES_PROVIDERS = ("nous", "openai-codex", "openrouter")
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
 # honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
@@ -4433,6 +4433,28 @@ def _collect_hermes() -> list[dict]:
         return _collect_hermes_usage()
 
 
+def _nous_usage_snapshot():
+    """Nous usage-window plans (Hermes Plus): Today / This week / This month.
+
+    usage.bars is a dollar model and reports a usage-window account as
+    unavailable, so only this path can show one. Read-only: the portal account
+    is read with the stored Nous token as it is (stored_token_account_info),
+    never through the refreshing reader behind /usage on a Nous route. A token
+    about to expire, or a Hermes without that reader, gives no card. Dollar
+    plans return None here because usage.bars already carries them.
+    """
+    try:
+        from hermes_cli.nous_account import stored_token_account_info
+        from agent.account_usage import build_nous_credits_snapshot
+    except Exception:
+        return None
+    try:
+        snap = build_nous_credits_snapshot(stored_token_account_info(), cta=False)
+    except Exception:
+        return None
+    return snap if snap is not None and getattr(snap, "usage_window", False) else None
+
+
 def _collect_hermes_usage() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -4443,7 +4465,7 @@ def _collect_hermes_usage() -> list[dict]:
         if _provider_key(provider) in _disabled_providers:
             continue
         try:
-            snap = fetch_account_usage(provider)
+            snap = _nous_usage_snapshot() if provider == "nous" else fetch_account_usage(provider)
             if not snap or not getattr(snap, "available", False):
                 continue
             snapshots.append(
