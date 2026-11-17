@@ -12,7 +12,7 @@ function atom(value) {
   return { get: () => value, set: next => { value = next }, listen: () => () => {} }
 }
 
-function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker', shellExec } = {}) {
+function load({ legacy = false, route, owner, profile = 'default', connectionId = 'local', probeHome = '/srv/hermes', probeLayout = 'desktop-plugins/resetwatch/probe.py', python, configHome = '/srv/hermes/profiles/backend-worker', shellExec, slashOutput } = {}) {
   const calls = []
   const queries = []
   const cacheWrites = []
@@ -34,6 +34,7 @@ function load({ legacy = false, route, owner, profile = 'default', connectionId 
       return { code: 0, stdout: JSON.stringify({ snapshot_pin: 'a'.repeat(32), snapshots: [] }) }
     }
     if (method === 'account.usage') throw new Error('unknown method')
+    if (method === 'slash.exec' && slashOutput) return { output: slashOutput }
     return {}
   }
   const host = {
@@ -287,7 +288,7 @@ test('provider controls persist toggles and order, filter cached cards, and rout
   assert.deepEqual(Array.from(arranged, card => card.id), ['account:anthropic:b:0', 'account:anthropic:c:0', 'account:openai-codex:a:0'])
 })
 
-test('all providers disabled performs no gateway requests; Nous-only does not launch the probe', async () => {
+test('all providers disabled performs no gateway requests; Nous-only still launches the probe for usage-window plans', async () => {
   const app = load()
   vm.runInContext('saveProviderPreferences({ disabled: LIVE_PROVIDERS })', app.context)
   app.renderPage()
@@ -297,7 +298,26 @@ test('all providers disabled performs no gateway requests; Nous-only does not la
   vm.runInContext('saveProviderPreferences({ disabled: LIVE_PROVIDERS.filter(key => key !== "nous") })', app.context)
   app.renderPage()
   await app.queries.at(-1).queryFn()
-  assert.deepEqual(app.calls.map(call => call.method), ['usage.bars', 'subscription.state'])
+  assert.deepEqual(app.calls.map(call => call.method).slice(0, 2), ['usage.bars', 'subscription.state'])
+  const commands = app.calls.filter(call => call.method === 'shell.exec').map(call => call.params.command)
+  assert.ok(commands.length)
+  assert.ok(commands.every(command => !/--disabled-providers=[^ ]*\bnous\b/.test(command)))
+})
+
+test('a probed Nous usage-window card is not repeated from /usage', async () => {
+  const snapshot = { provider: 'nous', plan: 'Hermes Plus', details: [],
+    windows: [{ label: 'Today', used_percent: 64, remaining_percent: 36, reset_at: '2026-11-16T04:36:07Z' }] }
+  const app = load({
+    shellExec: command => ({ code: 0, stdout: JSON.stringify({ snapshot_pin: 'a'.repeat(32),
+      snapshots: command.includes('--pin-snapshot') ? [snapshot] : [] }) }),
+    slashOutput: 'Hermes Plus\nToday  [||||    ]  64% used  ·  resets in 4h'
+  })
+  app.renderPage()
+  const result = await app.queries.at(-1).queryFn()
+  assert.ok(app.calls.some(call => call.method === 'slash.exec'))
+  const today = result.cards.filter(card => card.label === 'Today')
+  assert.equal(today.length, 1, JSON.stringify(result.cards.map(card => card.id)))
+  assert.ok(String(today[0].id).startsWith('account:nous'))
 })
 
 test('disabling Nous skips its RPCs and refresh keeps the provider selection', async () => {

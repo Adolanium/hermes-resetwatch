@@ -1388,12 +1388,10 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
   }
 
-  // The probe is the only source that can carry Nous (usage.bars is a dollar
-  // model and reports a usage-window plan as unavailable), so it must run for a
-  // Nous-only setup too. Skip it only when every provider is switched off.
-  const probeResult = LIVE_PROVIDERS.every(key => disabled.includes(key))
-    ? { snapshots: [], error: null }
-    : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
+  // The probe is the only source that can carry a Nous usage-window plan
+  // (usage.bars is a dollar model and reports one as unavailable), so it runs
+  // for a Nous-only setup too. All-disabled already returned above.
+  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -1434,7 +1432,8 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     try {
       const result = await request('slash.exec', { command: 'usage', session_id: sid })
       const output = result && typeof result.output === 'string' ? result.output : ''
-      const skipNous = cards.some(card => String(card.id).startsWith('nous:'))
+      // usage.bars cards are nous:*, a probed usage-window plan is account:nous*.
+      const skipNous = cards.some(card => String(card.id).startsWith('nous:') || accountCardProvider(card.id) === 'nous')
       cards.push(...cardsFromUsageGroups(parseUsageOutput(output), skipNous))
     } catch (error) {
       const message = error && error.message ? error.message : ''

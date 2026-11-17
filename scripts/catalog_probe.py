@@ -6,6 +6,9 @@ OAuth resolvers. Usage HTTP requests and the separate result cache remain.
 import ast
 import re
 
+# Hermes-resolved providers whose catalog read path never refreshes a token.
+CATALOG_RESOLVER_PROVIDERS = ("nous", "openrouter")
+
 
 def readonly_probe(source):
     tree = ast.parse(source)
@@ -56,16 +59,11 @@ def readonly_probe(source):
             if names & constants:
                 replacement = ""
             elif "HERMES_PROVIDERS" in names:
-                # Keep the shipped resolver list in step with source, minus Codex
-                # (read directly below). Hardcoding it here silently dropped every
-                # other Hermes-resolved provider from catalog installs.
-                try:
-                    kept = tuple(
-                        provider for provider in ast.literal_eval(node.value)
-                        if provider != "openai-codex"
-                    )
-                except Exception:
-                    kept = ("openrouter",)
+                # Allowlist, not "source minus Codex": a provider reaches catalog
+                # installs only after its resolver is reviewed as read-only.
+                # Codex is read directly; its Hermes resolver can refresh OAuth.
+                kept = tuple(provider for provider in ast.literal_eval(node.value)
+                             if provider in CATALOG_RESOLVER_PROVIDERS)
                 replacement = (
                     '# Codex is read directly below; the Hermes resolver can refresh OAuth.\n'
                     f'HERMES_PROVIDERS = {kept!r}\n'
@@ -94,7 +92,8 @@ under $HERMES_HOME/cache/resetwatch may be written. No tokens on stdout.
 
 Private vendor APIs are best-effort and may change without notice.
 """''' + result[end:]
-    for forbidden in (*removed, *constants, 'allow_refresh', 'resolve_anthropic_token', 'grant_type'):
+    for forbidden in (*removed, *constants, 'allow_refresh', 'resolve_anthropic_token', 'grant_type',
+                      '_fetch_portal_account', 'get_nous_portal_account_info', 'resolve_nous_access_token'):
         if forbidden in result:
             raise ValueError("Read-only probe contains refresh code: " + forbidden)
     ast.parse(result)

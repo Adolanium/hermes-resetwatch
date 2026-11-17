@@ -120,7 +120,7 @@ Copy both files. Live rows need `probe.py` for CLI and app logins Hermes does no
 Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs those apps already call
 ```
 
-- **Nous.** Dollars and renewal time come from the gateway (`usage.bars`, then `subscription.state` if needed).
+- **Nous.** Dollars and renewal time come from the gateway (`usage.bars`, then `subscription.state` if needed). A plan with usage windows (Hermes Plus) has no dollar bars, so `probe.py` reads its windows through Hermes's own `stored_token_account_info` and `build_nous_credits_snapshot`, the reader behind `/usage`. It uses the saved Nous token as is and never refreshes it.
 - **Gateway accounts.** If Hermes has `account.usage`, that RPC fills Claude, Codex, OpenRouter, and any other providers it already knows.
 - **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also use the saved Hermes logins (read only) and show one labelled card set per account. [How those logins are read](docs/credentials.md).
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
