@@ -180,7 +180,7 @@ The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` and
 
 ### Translations
 
-The page, the status-bar popup, and the sidebar, palette, and shortcut labels read their text from the `EN` bundle near the top of `plugin.js`. To add a language, add a bundle to `LOCALES` under its Desktop locale, such as `zh` or `zh-hant`. A bundle only needs the keys it translates; Desktop shows English for the rest. Entries written as functions, such as `card.left`, take the values to insert, so their translations are functions too:
+The page, the status-bar popup, and the sidebar, palette, and shortcut labels read their text from the `EN` bundle near the top of `plugin.js`. Simplified (`zh`) and Traditional Chinese (`zh-hant`) are included as a first pass; corrections are welcome. To add a language, add a bundle to `LOCALES` under its Desktop locale, such as `zh` or `zh-hant`. A bundle only needs the keys it translates; Desktop shows English for the rest. Entries written as functions, such as `card.left`, take the values to insert, so their translations are functions too:
 
 ```js
 const LOCALES = {
