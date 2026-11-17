@@ -46,8 +46,43 @@ class CatalogReadOnlyTests(unittest.TestCase):
                     self.assertEqual(credentials.read_bytes(), before)
                     self.assertEqual(list(Path(tmp).iterdir()), [credentials])
 
+    def test_catalog_resolver_list_is_the_reviewed_allowlist(self):
+        self.assertEqual(probe.HERMES_PROVIDERS, ("nous", "openrouter"))
+
+    def test_nous_reads_the_stored_token_and_never_refreshes(self):
+        import sys
+        import types
+
+        calls = []
+        account = types.SimpleNamespace(logged_in=True)
+        nous_account = types.ModuleType("hermes_cli.nous_account")
+        nous_account.stored_token_account_info = lambda: calls.append("stored") or account
+
+        def refreshing(*args, **kwargs):
+            raise AssertionError("refreshing Nous reader called")
+
+        nous_account.get_nous_portal_account_info = refreshing
+        account_usage = types.ModuleType("agent.account_usage")
+        account_usage._fetch_portal_account = refreshing
+
+        def build(info, *, cta=True):
+            self.assertIs(info, account)
+            self.assertFalse(cta)
+            return types.SimpleNamespace(provider="nous", plan="Hermes Plus", details=(), windows=(),
+                                         available=True, usage_window=window)
+
+        account_usage.build_nous_credits_snapshot = build
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.nous_account": nous_account,
+                   "agent": types.ModuleType("agent"), "agent.account_usage": account_usage}
+        with patch.dict(sys.modules, modules):
+            window = True
+            self.assertEqual(probe._nous_usage_snapshot().plan, "Hermes Plus")
+            # Dollar plans come from usage.bars; a second card would duplicate them.
+            window = False
+            self.assertIsNone(probe._nous_usage_snapshot())
+        self.assertEqual(calls, ["stored", "stored"])
+
     def test_indirect_credential_refresh_paths_are_excluded(self):
-        self.assertEqual(probe.HERMES_PROVIDERS, ("openrouter",))
         with patch.object(probe.subprocess, "run", side_effect=AssertionError("CLI executed")):
             self.assertIsNone(probe._cursor_cli_json(["status", "--json"]))
         # Resolver imports must not be attempted, even when a Hermes install exists.

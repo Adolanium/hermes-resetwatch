@@ -31,7 +31,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 
 # Cap how often probe hits vendor APIs (success or empty). Claude 429 may
@@ -94,7 +94,7 @@ _slice_args: Optional[tuple[int, int]] = None
 
 
 # Codex is read directly below; the Hermes resolver can refresh OAuth.
-HERMES_PROVIDERS = ("openrouter",)
+HERMES_PROVIDERS = ('nous', 'openrouter')
 # Anthropic/Claude is owned by _fetch_claude_cli_account_usage so we can
 # honor 429 Retry-After and reuse a local cache instead of hammering OAuth usage.
 USER_AGENT = "resetwatch"
@@ -1179,6 +1179,29 @@ def _grok_access_context(*, previous: Optional[str] = None) -> Optional[tuple[st
     return None
 
 
+def _grok_proxy_base() -> str:
+    """GROK_CLI_CHAT_PROXY_BASE_URL, but only while it stays on Grok's own hosts.
+
+    The Grok CLI token is sent to this base, so an override that is not https
+    on grok.com or x.ai (or their subdomains) is ignored and the default proxy
+    is used instead.
+    """
+    raw = (os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or parts.username or parts.password or port not in (None, 443):
+        return ""
+    if host in ("grok.com", "x.ai") or host.endswith((".grok.com", ".x.ai")):
+        return raw
+    return ""
+
+
 def _grok_proxy_headers(token: str, user_id: str) -> dict[str, str]:
     # Private Grok CLI billing API. Best-effort; xAI may change or reject this.
     return {
@@ -1232,7 +1255,7 @@ def _fetch_grok_account_usage() -> Optional[dict]:
         return None
     token, user_id = context
     headers = _grok_proxy_headers(token, user_id)
-    base = (os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL") or "").strip().rstrip("/")
+    base = _grok_proxy_base()
     billing_url = f"{base}/billing?format=credits" if base else GROK_BILLING_URL
     settings_url = f"{base}/settings" if base else GROK_SETTINGS_URL
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
@@ -4073,6 +4096,28 @@ def _collect_hermes() -> list[dict]:
         return _collect_hermes_usage()
 
 
+def _nous_usage_snapshot():
+    """Nous usage-window plans (Hermes Plus): Today / This week / This month.
+
+    usage.bars is a dollar model and reports a usage-window account as
+    unavailable, so only this path can show one. Read-only: the portal account
+    is read with the stored Nous token as it is (stored_token_account_info),
+    never through the refreshing reader behind /usage on a Nous route. A token
+    about to expire, or a Hermes without that reader, gives no card. Dollar
+    plans return None here because usage.bars already carries them.
+    """
+    try:
+        from hermes_cli.nous_account import stored_token_account_info
+        from agent.account_usage import build_nous_credits_snapshot
+    except Exception:
+        return None
+    try:
+        snap = build_nous_credits_snapshot(stored_token_account_info(), cta=False)
+    except Exception:
+        return None
+    return snap if snap is not None and getattr(snap, "usage_window", False) else None
+
+
 def _collect_hermes_usage() -> list[dict]:
     try:
         from agent.account_usage import fetch_account_usage
@@ -4083,7 +4128,7 @@ def _collect_hermes_usage() -> list[dict]:
         if _provider_key(provider) in _disabled_providers:
             continue
         try:
-            snap = fetch_account_usage(provider)
+            snap = _nous_usage_snapshot() if provider == "nous" else fetch_account_usage(provider)
             if not snap or not getattr(snap, "available", False):
                 continue
             snapshots.append(
@@ -4434,7 +4479,16 @@ def _use_gateway_python() -> None:
             )
             if checked.returncode == 0:
                 os.environ[_STARTED_AT_ENV] = repr(_STARTED_AT)
-                os.execv(executable, [executable, str(Path(__file__).absolute()), *sys.argv[1:]])
+                reexec_argv = [str(Path(__file__).absolute()), *sys.argv[1:]]
+                if sys.platform == "win32":
+                    # Windows CreateProcess splits an unquoted argv[0] at the first
+                    # space, so os.execv cannot start an interpreter installed under
+                    # "Program Files": the child dies with an empty stdout and exit
+                    # status 0, which Desktop renders as "probe returned non-JSON".
+                    # Re-exec as a child instead and forward its exit status.
+                    handoff = subprocess.run([executable, *reexec_argv])
+                    os._exit(handoff.returncode)
+                os.execv(executable, [executable, *reexec_argv])
         except (OSError, subprocess.TimeoutExpired):
             continue
 
@@ -4479,13 +4533,13 @@ def _main_inner() -> int:
     if tokens:
         # Never consult the shared cache or vendors for a continuation.
         token = tokens[0]
-        _emit_json({"snapshot_token": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
+        _emit_json({"snapshot_pin": token, "snapshots": _apply_slice(_read_pinned_snapshots(token))}, real_stdout)
         os._exit(0)
 
     def emit_page(snapshots: list) -> None:
         if pin:
             token = _pin_probe_snapshots(snapshots)
-            _emit_json({"snapshot_token": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
+            _emit_json({"snapshot_pin": token, "snapshots": _apply_slice(snapshots)}, real_stdout)
         else:
             _emit_json(_apply_slice(snapshots), real_stdout)
 

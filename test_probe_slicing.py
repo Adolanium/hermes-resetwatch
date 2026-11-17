@@ -85,16 +85,16 @@ probe.main()
                 second = call('other')
                 self.assertEqual([row['provider'] for row in first['snapshots']], ['new' + str(i) for i in range(8)])
                 self.assertEqual([row['provider'] for row in second['snapshots']], ['other' + str(i) for i in range(8)])
-                self.assertNotEqual(first['snapshot_token'], second['snapshot_token'])
+                self.assertNotEqual(first['snapshot_pin'], second['snapshot_pin'])
                 for first_page, name in ((first, 'new'), (second, 'other')):
-                    page = call('unused', first_page['snapshot_token'])
-                    self.assertEqual(page['snapshot_token'], first_page['snapshot_token'])
+                    page = call('unused', first_page['snapshot_pin'])
+                    self.assertEqual(page['snapshot_pin'], first_page['snapshot_pin'])
                     self.assertEqual([row['provider'] for row in page['snapshots']], [name + str(i) for i in range(8, 12)])
-                self.assertEqual(call('unused', first['snapshot_token'])['snapshots'][0]['provider'], 'new8')
+                self.assertEqual(call('unused', first['snapshot_pin'])['snapshots'][0]['provider'], 'new8')
                 # Malformed and nonexistent pins must never read an older cache or query vendors.
                 for bad in ('../../oops', 'f' * 32):
                     failed = call('unused', bad)
-                    self.assertNotIn('snapshot_token', failed)
+                    self.assertNotIn('snapshot_pin', failed)
                     self.assertIn('probe failed', str(failed))
 
     def test_shared_cache_expiry_and_replacement_do_not_mutate_pins(self):

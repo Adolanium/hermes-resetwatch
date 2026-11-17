@@ -12,8 +12,10 @@ def cut(source, start, end, keep_end=True):
 
 
 def strip_codex_renew(source):
-    """Drop the optional Codex renew button. The catalog build does not call this."""
-    source = cut(source, "    // BEGIN CODEX RENEW COPY", "    // END CODEX RENEW COPY\n", False)
+    """Drop the Codex renew button. The catalog build calls this."""
+    # Each locale marks its own copy.
+    for locale in ("", " zh", " zh-hant"):
+        source = cut(source, f"    // BEGIN CODEX RENEW COPY{locale}\n", f"    // END CODEX RENEW COPY{locale}\n", False)
     source = cut(source, "// BEGIN CODEX RENEW ACTION", "// END CODEX RENEW ACTION\n", False)
     source, count = re.subn(r", actionsFor: codexRenewActionsFor\(live\)", "", source, count=1)
     if count != 1:

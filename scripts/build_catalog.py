@@ -5,9 +5,29 @@ Hermes updates so their Desktop copy cannot bypass a reviewed commit pin.
 """
 import argparse
 import json
+import re
 from pathlib import Path
-from catalog_policy import strip_updater
+from catalog_policy import strip_codex_renew, strip_updater
 from catalog_probe import readonly_probe
+
+
+# Hermes Desktop reads a package's name from a `name:` line at the start of a line
+# (detectPluginComponents in apps/desktop/electron/desktop-plugin-install.ts). A JSON
+# manifest has no such line, so Desktop named the desktop half after the `catalog/`
+# folder, and every package built this way collided in `desktop-plugins/catalog`.
+DESKTOP_NAME = re.compile(r"""^name:\s*['"]?([^'"\n]+)['"]?\s*$""", re.M)
+
+
+def manifest_yaml(manifest):
+    """Block-style YAML with JSON scalars: dependency-free, and readable by Desktop."""
+    for key, value in manifest.items():
+        if isinstance(value, dict) or (isinstance(value, list) and any(isinstance(v, (dict, list)) for v in value)):
+            raise ValueError(f"manifest_yaml writes flat values only; {key} is nested")
+    text = "".join(f"{key}: {json.dumps(value)}\n" for key, value in manifest.items())
+    match = DESKTOP_NAME.search(text)
+    if not match or match.group(1).strip() != manifest["name"]:
+        raise ValueError("Hermes Desktop would not read the package name from catalog/plugin.yaml")
+    return text
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,6 +36,9 @@ def build(check=False):
     config = json.loads((ROOT / "catalog-package.json").read_text())
     name = config["name"]
     source = strip_updater((ROOT / "plugin.js").read_text(encoding="utf-8"), config["updater"])
+    # Catalog installs keep the Sign in again and Expired rows without the Renew button: the
+    # catalog build ships no path that starts a token refresh, even through Hermes's own CLI.
+    source = strip_codex_renew(source)
 
     manifest = {
         "name": name, "version": config["version"],
@@ -24,9 +47,8 @@ def build(check=False):
         "provides_tools": [], "provides_hooks": [],
         "provides_middleware": [], "requires_env": [],
     }
-    # JSON is valid YAML and keeps this build dependency-free.
     outputs = {
-        "catalog/plugin.yaml": json.dumps(manifest, indent=2) + "\n",
+        "catalog/plugin.yaml": manifest_yaml(manifest),
         "catalog/__init__.py": '"""Desktop package. Electron loads desktop/plugin.js."""\n\n\ndef register(ctx):\n    """No Agent tools or hooks; enable the Desktop component in Capabilities."""\n',
         "catalog/desktop/plugin.js": source,
     }

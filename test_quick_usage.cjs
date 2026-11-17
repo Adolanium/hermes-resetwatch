@@ -7,6 +7,9 @@ const { test } = require('node:test')
 const source = fs.readFileSync(path.join(__dirname, process.env.HERMES_TEST_CATALOG ? 'catalog/desktop/plugin.js' : 'plugin.js'), 'utf8')
   .replace(/^import .*$/gm, '')
   .replace('export default {', 'globalThis.plugin = {')
+// The catalog build strips the Codex renew button (scripts/catalog_policy.py).
+const hasRenew = source.includes('function CodexRenewButton')
+const renewExports = hasRenew ? ', codexRenewActionsFor, scrubRenewHint, renewNote, CodexRenewButton' : ''
 
 // Synthetic, credential-free fixtures. These are not live provider responses.
 const snapshots = [
@@ -38,7 +41,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
     if (method === 'account.usage') return { snapshots }
     if (method === 'subscription.state') return {}
     if (method === 'config.show') return { sections: [{ rows: [['Config File', '/fixture/hermes/config.yaml']] }] }
-    if (method === 'shell.exec') return { code: 0, stdout: JSON.stringify({ snapshot_token: 'a'.repeat(32), snapshots: [] }) }
+    if (method === 'shell.exec') return { code: 0, stdout: JSON.stringify({ snapshot_pin: 'a'.repeat(32), snapshots: [] }) }
     throw new Error('Unexpected method: ' + method)
   } }
   const sdk = { host, atom, useValue: store => store.get(), useQuery: options => {
@@ -60,7 +63,7 @@ function load({ modern = true, lifecycle = false, withQueryClient = true, quickU
       if (!(index in states)) states[index] = value
       return [states[index], next => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
     }, jsx, jsxs: jsx })
-  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode, LimitCard, accountStateLine, resetHasPassed, codexRenewActionsFor, scrubRenewHint, renewNote, CodexRenewButton };', context)
+  vm.runInContext(source + '\nglobalThis.api = { clampPercent, quotaPercent, parseUsageOutput, formatReset, cardsFromAccountSnapshots, liveQueryKey, readQuotaCache, saveQuotaCache, QuotaRing, fetchLiveCards, useLiveCardsQuery, QuickUsage, QuickUsageSlot, saveQuickUsage, checkedTime, probeObservedAt, $quickOpen, $displayMode, LimitCard, accountStateLine, resetHasPassed' + renewExports + ' };', context)
   context.plugin.register({ storage: { get: (key, fallback) => saved.has(key) ? saved.get(key) : fallback,
     set: (key, value) => saved.set(key, value) }, onDispose: fn => disposers.push(fn),
     registerMany: rows => registered.push(...rows) })
@@ -168,7 +171,12 @@ test('Codex state rows name availability, sign-in, expiry, and the check age', (
   }
 })
 
-test('Codex renew runs only from a click, with the Hermes auth argv', async () => {
+test('the catalog build has no Codex renew button', { skip: !process.env.HERMES_TEST_CATALOG }, () => {
+  assert.equal(hasRenew, false)
+  assert.ok(!source.includes("'refresh', 'openai-codex'"))
+})
+
+test('Codex renew runs only from a click, with the Hermes auth argv', { skip: !hasRenew }, async () => {
   const { api, context } = load()
   const calls = []
   const live = { refetch: () => calls.push('refetch') }
@@ -522,4 +530,41 @@ test('the saved popup snapshot keeps its observation time', () => {
   const cached = api.readQuotaCache(key)
   assert.equal(cached.observedAt, observedAt)
   assert.equal(cached.checkedAt, payload.checkedAt)
+})
+
+// Synthetic /usage texts. The window layout is what Hermes renders for an account metered by
+// usage windows (no monthly credit grant); the older block is the account-limits layout.
+const windowUsage = `Hermes Plus
+Today                   [|         ]  1% used  ·  resets in 23h
+This week               [|         ]  <1% used  ·  resets in 6d 23h
+This month              [|         ]  <1% used  ·  resets in 4d 5h
+Large models (monthly)  [          ]  0% used  ·  resets in 4d 5h
+Top-up credits: $24.27
+Renews: Nov 3, 2026`
+test('the usage-window layout yields Nous windows instead of nothing', () => {
+  const { api } = load()
+  const groups = api.parseUsageOutput(windowUsage)
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].provider, 'Nous Portal')
+  // Array.from keeps the comparison in this realm: the plugin's arrays come from the vm context.
+  assert.deepEqual(Array.from(groups[0].windows, window => window.label),
+    ['Today', 'This week', 'This month', 'Large models (monthly)'])
+  assert.deepEqual(Array.from(groups[0].windows, window => window.remaining), [99, 100, 100, 100])
+  assert.deepEqual(Array.from(groups[0].windows, window => window.used), [1, 0, 0, 0])
+  assert.equal(groups[0].windows[0].resetText, 'in 23h')
+  assert.equal(groups[0].windows[1].resetText, 'in 6d 23h')
+  assert(groups[0].details.includes('Top-up credits: $24.27'))
+  assert(groups[0].details.includes('Renews: Nov 3, 2026'))
+})
+test('the account-limits layout still parses as before', () => {
+  const { api } = load()
+  const groups = api.parseUsageOutput(`Account limits
+Provider: opencode-go
+5h: 100% remaining (0% used) · resets in 4h
+Weekly: 92% remaining (8% used) · resets in 3d`)
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].provider, 'opencode-go')
+  assert.deepEqual(Array.from(groups[0].windows,
+    window => [window.label, window.remaining, window.used, window.resetText]),
+  [['5h', 100, 0, 'in 4h'], ['Weekly', 92, 8, 'in 3d']])
 })

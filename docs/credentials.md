@@ -14,6 +14,10 @@ The probe asks Hermes for credentials through Hermes's own helpers. It does not 
 
 `.anthropic_oauth.json` stays a direct read. Hermes's resolver for that file can refresh the token, and the catalog build removes that resolver. No read-only helper returns this one file without a refresh. The probe does not refresh it. Pooled `anthropic` rows still go through `read_credential_pool`.
 
+## The Nous portal login
+
+A Nous plan with usage windows, such as Hermes Plus, reports no dollar bars, so the gateway's `usage.bars` can't show it. The probe calls `stored_token_account_info` from `hermes_cli.nous_account`, which sends the saved Nous token to the Nous portal as it is and never refreshes it, then turns the answer into windows with `build_nous_credits_snapshot` from `agent.account_usage`. A token that has expired gives no card until Hermes refreshes it on its own. Dollar plans keep coming from the gateway.
+
 ## model.options
 
 `host.request('model.options')` is reachable from the desktop page, not from `probe.py`. Its usage accounts are a cache, the labels are not masked, and the rows have no login id and no per-account check time. The page does not call it on the poll. Codex status stays on the probe.
@@ -22,4 +26,4 @@ The probe asks Hermes for credentials through Hermes's own helpers. It does not 
 
 Logins that live in a vendor app's own directory are not Hermes `auth.json`, `.anthropic_oauth.json`, or `.env`. Those reads stay as they are. Copilot already uses `get_secret` and does not open Hermes `.env` or `auth.json`.
 
-The probe does not refresh or write tokens while it checks status. Renew is a separate button in the page. It asks Hermes to refresh one Codex login, and the probe is not involved.
+The probe does not refresh or write tokens while it checks status. Renew is a separate button in the standalone page; the catalog build has none. It asks Hermes to refresh one Codex login, and the probe is not involved.

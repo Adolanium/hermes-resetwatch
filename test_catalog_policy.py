@@ -19,13 +19,16 @@ class CatalogPolicyTests(unittest.TestCase):
         self.assertIn("export default", source)
         self.assertIn("register(ctx)", source)
 
-    def test_codex_renew_stays_in_the_package_until_it_is_removed_on_purpose(self):
+    def test_the_catalog_package_has_no_codex_renew(self):
         root = (ROOT / "plugin.js").read_text(encoding="utf-8")
         packaged = (ROOT / "catalog/desktop/plugin.js").read_text(encoding="utf-8")
         build = (ROOT / "scripts/build_catalog.py").read_text(encoding="utf-8")
-        self.assertIn("// BEGIN CODEX RENEW ACTION", packaged)
-        self.assertIn("['auth', 'refresh', 'openai-codex', id]", packaged)
-        self.assertNotIn("strip_codex_renew", build)
+        self.assertIn("// BEGIN CODEX RENEW ACTION", root)
+        self.assertIn("['auth', 'refresh', 'openai-codex', id]", root)
+        self.assertIn("strip_codex_renew(source)", build)
+        for symbol in ("CODEX RENEW", "codexRenewActionsFor", "CodexRenewButton", "'refresh', 'openai-codex'"):
+            with self.subTest(symbol=symbol):
+                self.assertNotIn(symbol, packaged)
         stripped = strip_codex_renew(root)
         self.assertNotIn("CODEX RENEW", stripped)
         self.assertNotIn("codexRenewActionsFor", stripped)

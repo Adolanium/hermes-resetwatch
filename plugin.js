@@ -183,6 +183,7 @@ const EN = {
     noRoute: profile => `No Desktop route for ${profile}`,
     noHome: 'Could not find Hermes home for probe.py',
     badProfile: 'Invalid Hermes profile name',
+    unsafeShellArg: path => `Cannot run probe.py from ${path}: the path contains a character the backend shell would expand ($, %, !, a backtick or a quote)`,
     noHttpx: 'Found Python without httpx on this Gateway. Could not use the gateway runtime, backend HERMES_PYTHON/VIRTUAL_ENV, or home/PATH interpreters.',
     noProbe: 'probe.py not found in the standalone or combined-package installation on this Gateway',
     noPython: 'No working Python found on this Gateway to start probe.py (checked backend HERMES_PYTHON and home/PATH interpreters)',
@@ -193,7 +194,297 @@ const EN = {
   }
 }
 
-const LOCALES = { en: EN }
+// Simplified Chinese. A first pass: corrections from native speakers welcome (#32).
+const ZH = {
+  open: {
+    palette: 'Resetwatch：打开',
+    keybind: '打开 Resetwatch'
+  },
+  common: {
+    refresh: '刷新',
+    cancel: '取消'
+  },
+  mode: {
+    remaining: '剩余 %',
+    used: '已用 %'
+  },
+  chip: {
+    least: '剩余最少'
+  },
+  page: {
+    subtitleLeft: '还剩多少，何时恢复',
+    subtitleUsed: '已用多少，何时重置',
+    displayMode: '额度显示方式',
+    chipWindow: '状态栏显示的窗口',
+    gateway: state => `网关 ${state}`,
+    gatewayChecked: (state, time) => `网关 ${state} · 检查于 ${time}`,
+    statusBar: '状态栏',
+    statusBarAdd: '在状态栏添加用量弹窗。仅在打开时刷新。',
+    statusBarRemove: '从状态栏移除用量弹窗',
+    refreshing: '正在刷新…',
+    refreshWait: '两次刷新之间请等待一分钟',
+    refreshHint: '跳过缓存，重新查询所有服务商',
+    intro: '实时条目来自本机已登录的套餐：先是 Hermes OAuth，然后是已登录的 Claude Code、Codex、Cursor、Kimi、Grok、GLM、DeepSeek、OpenCode Go、Ollama Cloud、MiniMax、Novita、DeepInfra、AI Gateway、Command Code 和 GitHub Copilot（CLI、应用或 API 密钥）。Kimi 和 GLM 也可以使用 Hermes Coding Plan 的 API 密钥。Command Code 使用 COMMANDCODE_API_KEY 或 cmd CLI 的登录。GitHub Copilot 使用本机已有的 GitHub 登录。点击分区名称可将其折叠。',
+    automatic: '自动',
+    allOff: '所有服务商都已关闭。请在“服务商与顺序”中启用一个服务商以查看实时用量。',
+    noWindows: '还没有额度窗口。请检查“服务商与顺序”，登录一个已启用的服务商，然后刷新。'
+  },
+  providers: {
+    title: '服务商与顺序',
+    hint: '选择要查询和显示的服务商。移动服务商以调整卡片顺序。设置保存在此 Desktop 安装中，对所有配置文件生效。正在进行的刷新可能会继续完成。',
+    moveUp: name => `上移 ${name}`,
+    moveDown: name => `下移 ${name}`,
+    reset: '重置服务商'
+  },
+  card: {
+    left: percent => `剩余 ${percent}%`,
+    used: percent => `已用 ${percent}%`,
+    unavailable: '不可用'
+  },
+  reset: {
+    now: when => `即将重置 · ${when}`,
+    minutes: (minutes, when) => `${minutes} 分钟后重置 · ${when}`,
+    hours: (hours, minutes, when) => `${hours} 小时 ${minutes} 分钟后重置 · ${when}`,
+    days: (days, hours, when) => `${days} 天 ${hours} 小时后重置 · ${when}`,
+    at: when => `重置于 ${when}`,
+    unknown: '重置时间未知'
+  },
+  status: {
+    available: age => age ? `可用 · ${age}` : '可用',
+    limitReached: (when, age) => {
+      const line = when ? `已达上限，${when} 重置` : '已达上限'
+      return age ? `${line} · ${age}` : line
+    },
+    signIn: age => age ? `需要重新登录 · ${age}` : '需要重新登录',
+    expired: age => age ? `已过期，未检查 · ${age}` : '已过期，未检查',
+    unknown: age => age ? `未知 · ${age}` : '未知',
+    checkedNow: '刚刚检查',
+    checkedMinutes: minutes => `${minutes} 分钟前检查`,
+    checkedHours: hours => `${hours} 小时前检查`,
+    checkedDays: days => `${days} 天前检查`,
+    resetPassed: '已过重置时间，等待检查',
+    // BEGIN CODEX RENEW COPY zh
+    renew: '重新验证登录',
+    renewBusy: '正在重新验证登录',
+    renewConfirm: label => `要为 ${label} 重新验证登录吗？使用同一登录的 Codex CLI 会话可能会被登出。`,
+    renewOk: '登录已重新验证。正在检查用量。',
+    renewFailed: '无法重新验证此登录。'
+    // END CODEX RENEW COPY zh
+  },
+  clocks: {
+    title: '手动计时',
+    add: '添加计时',
+    close: '关闭',
+    custom: '自定义',
+    name: '名称',
+    namePlaceholder: '套餐名称',
+    left: '剩余 %',
+    resets: '重置时间',
+    url: '控制台网址（可选）',
+    typed: '由你手动填写。服务商页面变化时请更新。',
+    open: '打开',
+    edit: '编辑',
+    remove: '删除',
+    save: '保存'
+  },
+  popup: {
+    open: '打开用量和重置计时',
+    lowest: (name, percent) => `${PLUGIN_NAME}：${name}，剩余 ${percent}%`,
+    idle: `${PLUGIN_NAME}：用量和重置计时`,
+    label: `${PLUGIN_NAME} 用量`,
+    usage: '用量',
+    title: '用量与重置',
+    displayMode: '快速额度显示方式',
+    updating: '正在更新',
+    refreshWait: '两次刷新之间请至少等待一分钟',
+    refreshHint: '刷新用量',
+    unknownProfile: '未知配置文件',
+    remaining: '剩余',
+    used: '已用',
+    offline: '离线，显示缓存数据',
+    showingLast: '更新期间显示上次的数据',
+    stale: '缓存已过期，等待刷新',
+    latest: '最近一次检查',
+    noPercent: '服务商未报告百分比',
+    firstRead: '首次读取用量。之后打开会立即显示上次的检查结果。',
+    empty: '还没有用量数据。打开完整页面以检查服务商。',
+    checked: time => `检查于 ${time} | 打开时每 5 分钟刷新`,
+    cadence: '打开时每 5 分钟刷新',
+    fullPage: '完整页面',
+    ringUnavailable: '用量不可用',
+    ringUsed: percent => `已用 ${percent}%`,
+    ringRemaining: percent => `剩余 ${percent}%`
+  },
+  errors: {
+    liveUsage: '无法读取实时用量',
+    refreshFailed: '刷新失败',
+    refreshFailedWith: message => `刷新失败：${message}`,
+    refreshUnavailable: '此 SDK 不支持刷新',
+    nousUsage: '无法读取 Nous 用量',
+    subscription: '无法读取订阅状态',
+    accountLimits: '无法读取已登录账户的额度',
+    usageCommand: '无法运行 /usage',
+    noOwner: '找不到当前会话所属的配置文件',
+    noRoute: profile => `没有 ${profile} 的 Desktop 路由`,
+    noHome: '找不到 probe.py 所需的 Hermes 主目录',
+    badProfile: 'Hermes 配置文件名称无效',
+    unsafeShellArg: path => `无法从 ${path} 运行 probe.py：路径中含有后端 shell 会展开的字符（$、%、!、反引号或引号）`,
+    noHttpx: '此网关上找到的 Python 没有安装 httpx。无法使用网关运行时、后端的 HERMES_PYTHON/VIRTUAL_ENV，或主目录/PATH 中的解释器。',
+    noProbe: '在此网关的独立安装或合并包安装中都找不到 probe.py',
+    noPython: '此网关上没有可用的 Python 来启动 probe.py（已检查后端 HERMES_PYTHON 和主目录/PATH 中的解释器）',
+    shellRefused: reason => `shell.exec 被拒绝：${reason}`,
+    shellNeedsSession: 'shell.exec 被拒绝：此 Hermes 只为当前聚焦的本地会话运行 probe.py。请打开一个对话，然后刷新。',
+    probeRun: '无法运行 probe.py',
+    probeNoPython: '无法运行 probe.py（没有可用的 Hermes Python）'
+  }
+}
+
+// Traditional Chinese, converted from the Simplified bundle. A first pass: corrections from native speakers welcome (#32).
+const ZH_HANT = {
+  open: {
+    palette: 'Resetwatch：開啟',
+    keybind: '開啟 Resetwatch'
+  },
+  common: {
+    refresh: '重新整理',
+    cancel: '取消'
+  },
+  mode: {
+    remaining: '剩餘 %',
+    used: '已用 %'
+  },
+  chip: {
+    least: '剩餘最少'
+  },
+  page: {
+    subtitleLeft: '還剩多少，何時恢復',
+    subtitleUsed: '已用多少，何時重置',
+    displayMode: '額度顯示方式',
+    chipWindow: '狀態列顯示的視窗',
+    gateway: state => `閘道 ${state}`,
+    gatewayChecked: (state, time) => `閘道 ${state} · 檢查於 ${time}`,
+    statusBar: '狀態列',
+    statusBarAdd: '在狀態列新增用量彈窗。僅在開啟時重新整理。',
+    statusBarRemove: '從狀態列移除用量彈窗',
+    refreshing: '正在重新整理…',
+    refreshWait: '兩次重新整理之間請等待一分鐘',
+    refreshHint: '跳過快取，重新查詢所有供應商',
+    intro: '即時條目來自本機已登入的方案：先是 Hermes OAuth，然後是已登入的 Claude Code、Codex、Cursor、Kimi、Grok、GLM、DeepSeek、OpenCode Go、Ollama Cloud、MiniMax、Novita、DeepInfra、AI Gateway、Command Code 和 GitHub Copilot（CLI、應用或 API 金鑰）。Kimi 和 GLM 也可以使用 Hermes Coding Plan 的 API 金鑰。Command Code 使用 COMMANDCODE_API_KEY 或 cmd CLI 的登入。GitHub Copilot 使用本機已有的 GitHub 登入。點選區段名稱可將其摺疊。',
+    automatic: '自動',
+    allOff: '所有供應商都已關閉。請在「供應商與順序」中啟用一個供應商以檢視即時用量。',
+    noWindows: '還沒有額度視窗。請檢查「供應商與順序」，登入一個已啟用的供應商，然後重新整理。'
+  },
+  providers: {
+    title: '供應商與順序',
+    hint: '選擇要查詢和顯示的供應商。移動供應商以調整卡片順序。設定儲存在此 Desktop 安裝中，對所有設定檔生效。正在進行的重新整理可能會繼續完成。',
+    moveUp: name => `上移 ${name}`,
+    moveDown: name => `下移 ${name}`,
+    reset: '重置供應商'
+  },
+  card: {
+    left: percent => `剩餘 ${percent}%`,
+    used: percent => `已用 ${percent}%`,
+    unavailable: '不可用'
+  },
+  reset: {
+    now: when => `即將重置 · ${when}`,
+    minutes: (minutes, when) => `${minutes} 分鐘後重置 · ${when}`,
+    hours: (hours, minutes, when) => `${hours} 小時 ${minutes} 分鐘後重置 · ${when}`,
+    days: (days, hours, when) => `${days} 天 ${hours} 小時後重置 · ${when}`,
+    at: when => `重置於 ${when}`,
+    unknown: '重置時間未知'
+  },
+  status: {
+    available: age => age ? `可用 · ${age}` : '可用',
+    limitReached: (when, age) => {
+      const line = when ? `已達上限，${when} 重置` : '已達上限'
+      return age ? `${line} · ${age}` : line
+    },
+    signIn: age => age ? `需要重新登入 · ${age}` : '需要重新登入',
+    expired: age => age ? `已過期，未檢查 · ${age}` : '已過期，未檢查',
+    unknown: age => age ? `未知 · ${age}` : '未知',
+    checkedNow: '剛剛檢查',
+    checkedMinutes: minutes => `${minutes} 分鐘前檢查`,
+    checkedHours: hours => `${hours} 小時前檢查`,
+    checkedDays: days => `${days} 天前檢查`,
+    resetPassed: '已過重置時間，等待檢查',
+    // BEGIN CODEX RENEW COPY zh-hant
+    renew: '重新驗證登入',
+    renewBusy: '正在重新驗證登入',
+    renewConfirm: label => `要為 ${label} 重新驗證登入嗎？使用同一登入的 Codex CLI 工作階段可能會被登出。`,
+    renewOk: '登入已重新驗證。正在檢查用量。',
+    renewFailed: '無法重新驗證此登入。'
+    // END CODEX RENEW COPY zh-hant
+  },
+  clocks: {
+    title: '手動計時',
+    add: '新增計時',
+    close: '關閉',
+    custom: '自定義',
+    name: '名稱',
+    namePlaceholder: '方案名稱',
+    left: '剩餘 %',
+    resets: '重置時間',
+    url: '控制台網址（可選）',
+    typed: '由你手動填寫。供應商頁面變化時請更新。',
+    open: '開啟',
+    edit: '編輯',
+    remove: '刪除',
+    save: '儲存'
+  },
+  popup: {
+    open: '開啟用量和重置計時',
+    lowest: (name, percent) => `${PLUGIN_NAME}：${name}，剩餘 ${percent}%`,
+    idle: `${PLUGIN_NAME}：用量和重置計時`,
+    label: `${PLUGIN_NAME} 用量`,
+    usage: '用量',
+    title: '用量與重置',
+    displayMode: '快速額度顯示方式',
+    updating: '正在更新',
+    refreshWait: '兩次重新整理之間請至少等待一分鐘',
+    refreshHint: '重新整理用量',
+    unknownProfile: '未知設定檔',
+    remaining: '剩餘',
+    used: '已用',
+    offline: '離線，顯示快取資料',
+    showingLast: '更新期間顯示上次的資料',
+    stale: '快取已過期，等待重新整理',
+    latest: '最近一次檢查',
+    noPercent: '供應商未報告百分比',
+    firstRead: '首次讀取用量。之後開啟會立即顯示上次的檢查結果。',
+    empty: '還沒有用量資料。開啟完整頁面以檢查供應商。',
+    checked: time => `檢查於 ${time} | 開啟時每 5 分鐘重新整理`,
+    cadence: '開啟時每 5 分鐘重新整理',
+    fullPage: '完整頁面',
+    ringUnavailable: '用量不可用',
+    ringUsed: percent => `已用 ${percent}%`,
+    ringRemaining: percent => `剩餘 ${percent}%`
+  },
+  errors: {
+    liveUsage: '無法讀取即時用量',
+    refreshFailed: '重新整理失敗',
+    refreshFailedWith: message => `重新整理失敗：${message}`,
+    refreshUnavailable: '此 SDK 不支援重新整理',
+    nousUsage: '無法讀取 Nous 用量',
+    subscription: '無法讀取訂閱狀態',
+    accountLimits: '無法讀取已登入帳戶的額度',
+    usageCommand: '無法執行 /usage',
+    noOwner: '找不到目前工作階段所屬的設定檔',
+    noRoute: profile => `沒有 ${profile} 的 Desktop 路由`,
+    noHome: '找不到 probe.py 所需的 Hermes 主資料夾',
+    badProfile: 'Hermes 設定檔名稱無效',
+    unsafeShellArg: path => `無法從 ${path} 執行 probe.py：路徑中含有後端 shell 會展開的字元（$、%、!、反引號或引號）`,
+    noHttpx: '此閘道上找到的 Python 沒有安裝 httpx。無法使用閘道執行時、後端的 HERMES_PYTHON/VIRTUAL_ENV，或主資料夾/PATH 中的直譯器。',
+    noProbe: '在此閘道的獨立安裝或合併包安裝中都找不到 probe.py',
+    noPython: '此閘道上沒有可用的 Python 來啟動 probe.py（已檢查後端 HERMES_PYTHON 和主資料夾/PATH 中的直譯器）',
+    shellRefused: reason => `shell.exec 被拒絕：${reason}`,
+    shellNeedsSession: 'shell.exec 被拒絕：此 Hermes 只為目前聚焦的本機工作階段執行 probe.py。請開啟一個對話，然後重新整理。',
+    probeRun: '無法執行 probe.py',
+    probeNoPython: '無法執行 probe.py（沒有可用的 Hermes Python）'
+  }
+}
+
+const LOCALES = { en: EN, zh: ZH, 'zh-hant': ZH_HANT }
 
 let i18n = null
 
@@ -724,6 +1015,14 @@ function parseUsageOutput(text) {
       current = null
       continue
     }
+    // Usage-window layout: the block opens on the plan name ("Hermes Plus") instead of a
+    // fixed header, and each window is a gauge line ("This week  [|   ]  8% used  ·  resets in 6d").
+    if (/^(?:nous(?: portal)?|hermes (?:free|plus|pro|max|team|business)|insider)$/i.test(line)) {
+      inLimits = true
+      current = { provider: 'Nous Portal', windows: [], details: [] }
+      groups.push(current)
+      continue
+    }
     if (/^(session (token )?usage|session info|rate limits)\b/i.test(line)) {
       inLimits = false
       current = null
@@ -752,6 +1051,29 @@ function parseUsageOutput(text) {
         label: windowMatch[1].trim(),
         remaining: Number(windowMatch[2]),
         used: Number(windowMatch[3]),
+        resetText,
+        detail
+      })
+      continue
+    }
+    // Gauge line of the usage-window layout: "This month  [|    ]  <1% used  ·  resets in 4d 5h".
+    const gaugeMatch = line.match(
+      /^(.+?)\s*\[[^\]]*\]\s*(<?)\s*(\d+(?:\.\d+)?)%\s+used(?:\s*[·•]\s*(.+))?$/i
+    )
+    if (gaugeMatch) {
+      if (!current) {
+        current = { provider: 'Account', windows: [], details: [] }
+        groups.push(current)
+      }
+      const suffix = (gaugeMatch[4] || '').trim()
+      const resetText = /^resets\s+/i.test(suffix) ? suffix.replace(/^resets\s+/i, '') : ''
+      const detail = resetText ? '' : suffix
+      // "<1% used" is a rounding floor, not a measurement: read it as zero used.
+      const used = gaugeMatch[2] ? 0 : Number(gaugeMatch[3])
+      current.windows.push({
+        label: gaugeMatch[1].trim(),
+        remaining: clampPercent(100 - used),
+        used: clampPercent(used),
         resetText,
         detail
       })
@@ -1017,9 +1339,22 @@ function hermesHomeCandidates(fromConfig) {
   return out
 }
 
-function quoteShell(path) {
-  // shell.exec takes a single command string (no argv). Quote for spaces.
-  return `"${String(path).replace(/"/g, '\\"')}"`
+// The backend shell expands these on purpose: they name Hermes' own interpreter.
+const SHELL_RUNTIME_PYTHONS = new Set(['$HERMES_PYTHON', '%HERMES_PYTHON%'])
+
+// shell.exec takes one command string, run by sh on POSIX and cmd.exe on
+// Windows. Double quotes are the only quoting both understand, and inside
+// them sh still expands $ and backticks while cmd expands %VAR% and !VAR!.
+// No escape works in both shells, so any other value carrying one of those
+// characters is refused instead of quoted.
+function shellSafe(value) {
+  const text = String(value)
+  return SHELL_RUNTIME_PYTHONS.has(text) || !/["$`%!\r\n]/.test(text)
+}
+
+function quoteShell(value) {
+  if (!shellSafe(value)) throw new Error(tr('errors.unsafeShellArg', String(value)))
+  return `"${String(value)}"`
 }
 
 function probePythonCandidates(home) {
@@ -1146,15 +1481,17 @@ function pinnedPage(text, expectedToken) {
   }
   // probe.py main() reports a crash as a bare card list, even when paging.
   if (Array.isArray(parsed)) {
-    if (!expectedToken) return { snapshot_token: null, snapshots: parsed }
+    if (!expectedToken) return { snapshot_pin: null, snapshots: parsed }
     const crash = parsed.find(snap => snap && snap.provider === 'resetwatch')
     throw new Error((crash && String((crash.details || [])[0] || '')) || 'probe returned invalid snapshot pin')
   }
-  const token = parsed && parsed.snapshot_token
+  // Older probes send snapshot_token. Gateways that redact JSON keys
+  // naming a credential mask that value, so it then fails the check below.
+  const token = parsed && (parsed.snapshot_pin ?? parsed.snapshot_token)
   if (!/^[a-f0-9]{32}$/.test(token) || (expectedToken && token !== expectedToken) || !Array.isArray(parsed.snapshots)) {
     throw new Error('probe returned invalid snapshot pin')
   }
-  return parsed
+  return { snapshot_pin: token, snapshots: parsed.snapshots }
 }
 
 async function probeNextSlice(request, sid, python, probe, flags, token, offset) {
@@ -1170,8 +1507,10 @@ async function probeNextSlice(request, sid, python, probe, flags, token, offset)
 async function probeStockAccountUsage(request, opts) {
   try {
     const shown = await request('config.show', {})
-    const homes = hermesHomeCandidates(hermesHomeFromConfig(shown))
-    if (!homes.length) return { snapshots: null, error: tr('errors.noHome') }
+    const found = hermesHomeCandidates(hermesHomeFromConfig(shown))
+    if (!found.length) return { snapshots: null, error: tr('errors.noHome') }
+    const homes = found.filter(shellSafe)
+    if (!homes.length) return { snapshots: null, error: tr('errors.unsafeShellArg', found[0]) }
     const profileArg = String((opts && opts.profile) || '').trim()
     if (profileArg && !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profileArg)) {
       return { snapshots: null, error: tr('errors.badProfile') }
@@ -1234,13 +1573,13 @@ async function probeStockAccountUsage(request, opts) {
               deadPythons.add(python)
               break
             }
-            if (!first.snapshot_token) return { snapshots: first.snapshots, error: null }
+            if (!first.snapshot_pin) return { snapshots: first.snapshots, error: null }
             try {
               const all = [...first.snapshots]
               let offset = all.length
               // A short page can mean byte-budget exhaustion, not end of list.
               for (let page = 0; offset && page < 256; page++) {
-                const next = await probeNextSlice(request, opts && opts.sessionId, python, probe, flags, first.snapshot_token, offset)
+                const next = await probeNextSlice(request, opts && opts.sessionId, python, probe, flags, first.snapshot_pin, offset)
                 if (!next.length) break
                 all.push(...next)
                 offset += next.length
@@ -1346,9 +1685,10 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     }
   }
 
-  const probeResult = disabled.filter(key => key !== 'nous').length === LIVE_PROVIDERS.length - 1
-    ? { snapshots: [], error: null }
-    : await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
+  // The probe is the only source that can carry a Nous usage-window plan
+  // (usage.bars is a dollar model and reports one as unavailable), so it runs
+  // for a Nous-only setup too. All-disabled already returned above.
+  const probeResult = await probeStockAccountUsage(request, { cliOnly: haveAccountRpc, fresh, profile: target.profile, disabled, sessionId: sid })
   const probed = probeResult && probeResult.snapshots
   if (probeResult && probeResult.error && !(probed && probed.length)) {
     errors.push(probeResult.error)
@@ -1389,7 +1729,8 @@ async function fetchLiveCards(sessionId, opts, connectionId, profile) {
     try {
       const result = await request('slash.exec', { command: 'usage', session_id: sid })
       const output = result && typeof result.output === 'string' ? result.output : ''
-      const skipNous = cards.some(card => String(card.id).startsWith('nous:'))
+      // usage.bars cards are nous:*, a probed usage-window plan is account:nous*.
+      const skipNous = cards.some(card => String(card.id).startsWith('nous:') || accountCardProvider(card.id) === 'nous')
       cards.push(...cardsFromUsageGroups(parseUsageOutput(output), skipNous))
     } catch (error) {
       const message = error && error.message ? error.message : ''

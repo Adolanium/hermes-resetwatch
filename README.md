@@ -120,13 +120,13 @@ Copy both files. Live rows need `probe.py` for CLI and app logins Hermes does no
 Your Hermes Desktop  →  gateway RPCs and probe.py  →  the same usage APIs those apps already call
 ```
 
-- **Nous.** Dollars and renewal time come from the gateway (`usage.bars`, then `subscription.state` if needed).
+- **Nous.** Dollars and renewal time come from the gateway (`usage.bars`, then `subscription.state` if needed). A plan with usage windows (Hermes Plus) has no dollar bars, so `probe.py` reads its windows through Hermes's own `stored_token_account_info` and `build_nous_credits_snapshot`, the reader behind `/usage`. It uses the saved Nous token as is and never refreshes it.
 - **Gateway accounts.** If Hermes has `account.usage`, that RPC fills Claude, Codex, OpenRouter, and any other providers it already knows.
 - **Stock Hermes.** `probe.py` fills the rest through `shell.exec`. Claude and Codex also use the saved Hermes logins (read only) and show one labelled card set per account. [How those logins are read](docs/credentials.md).
 - **CLI fallback.** If Hermes OAuth is missing, Claude Code (`~/.claude`) and Codex CLI (`~/.codex`) fill those cards. Cursor, Kimi, Grok, and GLM come from those apps first.
 - **Env keys.** If Kimi or GLM CLI login is missing, Hermes env keys fill the same cards. DeepSeek, OpenCode Go, Ollama Cloud, MiniMax, Novita, DeepInfra, and AI Gateway always use Hermes env (process env or `$HERMES_HOME/.env`). Command Code uses Hermes env first, then `~/.commandcode/auth.json`.
 - **GitHub Copilot.** Included usage and the reset time come from GitHub's Copilot account call, `copilot_internal/user`. That endpoint is not in GitHub's published REST docs, so the numbers are best-effort and can change. The probe does not read Hermes `.env` or `auth.json` for this login. [How the login is found](docs/copilot.md).
-- **Codex status.** Each Codex account shows Available, Limit reached, Sign in again, Expired not checked, or Unknown, and how long ago that check ran. When a reset time has already passed, the row says the reset passed and is waiting for the next check. Sign in again and Expired rows can renew that one login after you confirm the masked name. [How the check works](docs/codex-status.md).
+- **Codex status.** Each Codex account shows Available, Limit reached, Sign in again, Expired not checked, or Unknown, and how long ago that check ran. When a reset time has already passed, the row says the reset passed and is waiting for the next check. In the standalone install, Sign in again and Expired rows can renew that one login after you confirm the masked name. The catalog install has no Renew button. [How the check works](docs/codex-status.md).
 - **Last resort.** Older `/usage` output is still parsed when a session is focused.
 
 Manual clocks are whatever you typed. They do not refresh themselves.
@@ -141,7 +141,7 @@ Live data goes through the desktop plugin SDK (`host.request` JSON-RPC), plus `p
 
 It may also write a small cache under `$HERMES_HOME/cache/resetwatch`. Incomplete timed-out runs and empty runs are not cached in the shared 5-minute result cache. Desktop paging writes a separate private, immutable snapshot for each invocation (including incomplete results). These page pins expire after 15 minutes and old pins are removed when a new one is made.
 
-The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop starts with `probe.py --pin-snapshot --slice=0:8`, receiving a random `snapshot_token` and up to eight rows / 3500 JSON characters. Every later page uses `--snapshot-token=TOKEN --slice=OFFSET:8`; pages only read that frozen result, never the shared cache or vendors. A missing, invalid, or expired pin fails that refresh instead of mixing in another result. A short page can mean the byte budget was reached, so Desktop advances by rows actually returned and stops on an empty page. The first page may use `--fresh`; later pages do not. A single oversized row becomes a visible error card with its account identity. Direct calls without `--slice` retain the original full-list output. Update the Desktop plugin and gateway probe together; an older probe does not speak the pin protocol.
+The gateway's `shell.exec` retains only the last 4000 characters of stdout. Desktop starts with `probe.py --pin-snapshot --slice=0:8`, receiving a random `snapshot_pin` and up to eight rows / 3500 JSON characters. Every later page uses `--snapshot-token=TOKEN --slice=OFFSET:8`; pages only read that frozen result, never the shared cache or vendors. A missing, invalid, or expired pin fails that refresh instead of mixing in another result. A short page can mean the byte budget was reached, so Desktop advances by rows actually returned and stops on an empty page. The first page may use `--fresh`; later pages do not. A single oversized row becomes a visible error card with its account identity. Direct calls without `--slice` retain the original full-list output. Update the Desktop plugin and gateway probe together; an older probe does not speak the pin protocol.
 
 ## Compatibility
 
@@ -158,6 +158,8 @@ When a profile is selected, its Hermes credentials and cache stay separate from 
 ## Contributing
 
 Contributions are welcome. Open an issue first for anything bigger than a small fix so we can agree on the shape before you spend time on it.
+
+Thanks to everyone who has sent fixes, including @jorisquintano (the Hermes Plus usage-window layout, #56), @Iversondwx (gateway interpreters installed under paths with spaces on Windows, #57) and @enochmessi2 (snapshot pins masked by gateway redaction, #59).
 
 Run the profile tests with Python and Node.js. No packages need to be installed:
 
@@ -178,7 +180,7 @@ The full suite, `python -m unittest discover`, also requires `httpx==0.28.1` and
 
 ### Translations
 
-The page, the status-bar popup, and the sidebar, palette, and shortcut labels read their text from the `EN` bundle near the top of `plugin.js`. To add a language, add a bundle to `LOCALES` under its Desktop locale, such as `zh` or `zh-hant`. A bundle only needs the keys it translates; Desktop shows English for the rest. Entries written as functions, such as `card.left`, take the values to insert, so their translations are functions too:
+The page, the status-bar popup, and the sidebar, palette, and shortcut labels read their text from the `EN` bundle near the top of `plugin.js`. Simplified (`zh`) and Traditional Chinese (`zh-hant`) are included as a first pass; corrections are welcome. To add a language, add a bundle to `LOCALES` under its Desktop locale, such as `zh` or `zh-hant`. A bundle only needs the keys it translates; Desktop shows English for the rest. Entries written as functions, such as `card.left`, take the values to insert, so their translations are functions too:
 
 ```js
 const LOCALES = {
@@ -328,4 +330,4 @@ Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py 
 to keep the package current, including any companion files. Catalog packaging
 releases use `catalog-v0.2.22` and are not marked as the latest standalone release.
 
-The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort. The page can renew one Codex login when you click Renew and confirm the masked name. That click runs Hermes `hermes auth refresh openai-codex` for that login only. Hermes saves the new login. A Codex CLI session using the same login can be signed out. The probe never does this, and nothing renews a login on a timer.
+The catalog probe is read-only for all login credentials: it does not exchange refresh tokens, save login files, invoke Hermes OAuth resolvers, or launch Cursor CLI commands. Expired Kimi/Grok logins ask you to sign in using the vendor CLI. Usage and rate-limit caches may still be written. Private usage APIs remain best-effort. The catalog page has no Renew button either: the build removes it, so nothing in a catalog install starts a token refresh. To renew a Codex login there, run `hermes auth refresh openai-codex` yourself.

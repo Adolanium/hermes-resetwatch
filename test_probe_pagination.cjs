@@ -7,7 +7,7 @@ const { test } = require('node:test')
 for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
   const source = fs.readFileSync(path.join(__dirname, file), 'utf8')
     .replace(/^import .*$/gm, '').replace('export default {', 'const pluginDefinition = {')
-  function setup(rows, { fresh = false, pageBudget = Infinity, onPage = () => {}, crashAt = -1 } = {}) {
+  function setup(rows, { fresh = false, pageBudget = Infinity, onPage = () => {}, crashAt = -1, pinKey = 'snapshot_pin', mask = value => value } = {}) {
     const commands = []
     const context = vm.createContext({ sdk: { host: {}, atom: value => ({ get: () => value, set: () => {} }) }, console })
     vm.runInContext(source, context)
@@ -47,7 +47,7 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
         if (JSON.stringify([...page, row]).length > pageBudget) break
         page.push(row)
       }
-      const stdout = JSON.stringify({ snapshot_token: token, snapshots: page })
+      const stdout = JSON.stringify({ [pinKey]: mask(token), snapshots: page })
       return { code: 0, stdout: stdout.slice(-4000) }
     }
     return { commands, run: () => vm.runInContext(`probeStockAccountUsage(request, ${JSON.stringify({ fresh })})`, context) }
@@ -97,6 +97,20 @@ for (const file of ['plugin.js', 'catalog/desktop/plugin.js']) {
     const result = await setup([{ provider: 'p' }], { crashAt: 0 }).run()
     assert.equal(result.error, null)
     assert.match(result.snapshots[0].details[0], /ValueError: boom/)
+  })
+  test(`${file}: still pages an older probe that sends snapshot_token`, async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => ({ provider: `p-${i}` }))
+    const result = await setup(rows, { pinKey: 'snapshot_token' }).run()
+    assert.equal(result.error, null)
+    assert.deepEqual(JSON.parse(JSON.stringify(result.snapshots)), rows)
+  })
+  test(`${file}: a pin masked by gateway redaction is refused, not paged with`, async () => {
+    // Gateways since NousResearch/hermes-agent@fb637f5bc8 mask the value of a
+    // JSON key that names a credential, so an older probe's pin arrives shortened.
+    const mask = value => `${value.slice(0, 6)}...${value.slice(-4)}`
+    const result = await setup(Array.from({ length: 12 }, (_, i) => ({ provider: `p-${i}` })), { pinKey: 'snapshot_token', mask }).run()
+    assert.equal(result.snapshots, null)
+    assert.match(result.error, /snapshot pin/)
   })
   test(`${file}: continuation crash reports the probe failure`, async () => {
     const result = await setup(Array.from({ length: 12 }, (_, i) => ({ provider: `p-${i}` })), { crashAt: 8 }).run()
