@@ -106,7 +106,7 @@ test(`${file}: Desktop without i18n shows English`, () => {
 
 test(`${file}: Desktop i18n translates components and labels, with English for missing keys`, () => {
   const app = load({ i18n: true })
-  assert.deepEqual(Object.keys(app.bundles), ['en'])
+  assert.deepEqual(Object.keys(app.bundles), ['en', 'zh', 'zh-hant'])
   // A partial bundle: everything it leaves out stays English.
   app.bundles.zh = {
     name: '重置表',
@@ -135,4 +135,30 @@ test(`${file}: Desktop i18n translates components and labels, with English for m
   // Text built outside React follows the same language.
   app.bundles.zh.errors = { noPython: '找不到可用的 Python' }
   assert.equal(app.run(`pickProbeFailure([{ kind: 'no-python', message: 'x' }])`), '找不到可用的 Python')
+})
+
+test('the Chinese bundles only carry English keys, with the same shape', () => {
+  const app = load({ i18n: true })
+  const walk = (en, other, prefix, out) => {
+    for (const [key, value] of Object.entries(other)) {
+      const name = prefix ? `${prefix}.${key}` : key
+      assert.ok(key in en, `${name} is not an English key`)
+      if (typeof value === 'function') {
+        assert.equal(typeof en[key], 'function', `${name} takes values in English`)
+        assert.equal(value.length, en[key].length, `${name} takes as many values as in English`)
+        assert.equal(typeof value(...Array(value.length).fill('7')), 'string')
+        out.push(name)
+      } else if (value && typeof value === 'object') {
+        walk(en[key], value, name, out)
+      } else {
+        assert.equal(typeof en[key], 'string', `${name} is a string in English`)
+        out.push(name)
+      }
+    }
+    return out
+  }
+  const zh = walk(app.bundles.en, app.bundles.zh, '', [])
+  const hant = walk(app.bundles.en, app.bundles['zh-hant'], '', [])
+  assert.deepEqual(hant, zh)
+  assert.ok(zh.length > 100)
 })
