@@ -4144,11 +4144,70 @@ def _collect_hermes_usage() -> list[dict]:
     return snapshots
 
 
+def _provider_has_live_credentials(provider: str) -> bool:
+    """Same availability signals the fetchers gate on, minus the network.
+
+    A provider with no login/config on this machine returns None from its
+    fetcher by design; that silence must not count as a dropped row. Only
+    local credential reads happen here (never refreshes, never the network).
+    Unknown providers count as live so a silent drop is never cached.
+    """
+    gates = {
+        "anthropic": lambda: bool(_claude_pool_accounts() or _claude_code_access_token()),
+        "openai-codex": lambda: bool(_codex_pool_accounts() or _codex_cli_access_context()),
+        "cursor": lambda: bool(_cursor_access_token()),
+        "kimi": lambda: bool(_kimi_code_access_token() or _kimi_coding_api_key()),
+        "grok": lambda: bool(_grok_access_context()),
+        "glm": lambda: bool(_zcode_coding_credentials() or _glm_hermes_api_key()),
+        "deepseek": lambda: bool(_deepseek_api_key()),
+        "opencode-go": lambda: bool(_opencode_go_api_keys()),
+        "ollama": lambda: bool(_ollama_api_key()),
+        "minimax": lambda: bool(_minimax_credentials()),
+        "novita": lambda: bool(_novita_api_key()),
+        "deepinfra": lambda: bool(_deepinfra_api_key()),
+        "ai-gateway": lambda: bool(_ai_gateway_api_key()),
+        "commandcode": lambda: bool(_commandcode_api_key()),
+        "copilot": lambda: any(_copilot_token_candidates() or ()),
+    }
+    gate = gates.get(_provider_key(provider))
+    if gate is None:
+        return True
+    try:
+        return bool(gate())
+    except Exception:
+        return False
+
+
+def _last_complete_provider_set() -> set[str]:
+    """Provider keys served by the last complete probe run.
+
+    probe_snapshots.full.json is written only for complete runs, so its
+    provider set is the record of which fetchers had live credentials and
+    produced a row recently. A provider that never completed a run is
+    absent here and therefore exempt from the dropped-provider check.
+    """
+    payload = _read_json_file(_probe_result_cache_path(cli_only=False))
+    if not isinstance(payload, dict):
+        return set()
+    snapshots = payload.get("snapshots")
+    if not isinstance(snapshots, list):
+        return set()
+    keys: set[str] = set()
+    for snap in snapshots:
+        if isinstance(snap, dict):
+            key = _provider_key(snap.get("provider"))
+            if key:
+                keys.add(key)
+    return keys
+
+
 def _collect_cli() -> tuple[list[dict], bool]:
     """Run vendor fetchers in parallel. Returns (snapshots, complete).
 
-    complete is False when the time budget cut the run short. Caller should
-    not cache incomplete results.
+    complete is False when the time budget cut the run short, or when a
+    provider the last complete run served is now missing with no error card
+    (a fetcher that returned None/[] instead of raising). Caller should not
+    cache incomplete results.
     """
     if not (set(LIVE_PROVIDERS) - {"nous", "openrouter"} - _disabled_providers):
         return [], True
@@ -4278,6 +4337,31 @@ def _collect_cli() -> tuple[list[dict], bool]:
         except TypeError:
             pool.shutdown(wait=False)
     snapshots = [results[key] for key in sorted(results)]
+    if complete:
+        # A fetcher that returns None/[] instead of raising leaves no row and
+        # no error card. Caching that run used to bake the omission into the
+        # 5-minute page cache (Nov 3 Grok, Nov 23 Claude incidents). If a
+        # provider the last complete run served is now missing with no error
+        # card and it still has live credentials, treat the run as incomplete
+        # so the caller keeps serving the last good cached set.
+        served = {
+            _provider_key(snap.get("provider"))
+            for snap in snapshots
+            if isinstance(snap, dict)
+        }
+        attempted = {_provider_key(item[0]) for item in fetchers}
+        for key in sorted((_last_complete_provider_set() & attempted) - served):
+            if key in _disabled_providers:
+                continue
+            if not _provider_has_live_credentials(key):
+                continue
+            complete = False
+            print(
+                f"resetwatch: {key} was served in the last complete run but "
+                "produced no row and no error card now; not caching this run",
+                file=sys.stderr,
+            )
+            break
     return snapshots, complete
 
 

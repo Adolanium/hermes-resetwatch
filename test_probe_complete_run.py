@@ -203,6 +203,20 @@ class CompleteRunTests(unittest.TestCase):
     def test_unknown_provider_defaults_to_live(self):
         self.assertTrue(probe._provider_has_live_credentials("brand-new-vendor"))
 
+    def test_copilot_empty_generator_has_no_live_credentials(self):
+        with patch.object(probe, "_copilot_token_candidates", lambda: iter(())):
+            self.assertFalse(probe._provider_has_live_credentials("copilot"))
+        with patch.object(probe, "_copilot_token_candidates", lambda: iter(("gho_tok",))):
+            self.assertTrue(probe._provider_has_live_credentials("copilot"))
+
+    def test_silent_drop_of_only_cli_provider_is_not_cached(self):
+        self.write_baseline(["anthropic"])
+        with live_creds(), fetchers_serving("anthropic", "grok", "glm", "minimax"):
+            complete, served, note = self.collect()
+        self.assertFalse(complete)
+        self.assertEqual(served, set())
+        self.assertIn("anthropic", note)
+
 
 if __name__ == "__main__":
     unittest.main()

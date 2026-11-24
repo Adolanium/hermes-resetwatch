@@ -4504,7 +4504,7 @@ def _provider_has_live_credentials(provider: str) -> bool:
         "deepinfra": lambda: bool(_deepinfra_api_key()),
         "ai-gateway": lambda: bool(_ai_gateway_api_key()),
         "commandcode": lambda: bool(_commandcode_api_key()),
-        "copilot": lambda: bool(_copilot_token_candidates()),
+        "copilot": lambda: any(_copilot_token_candidates() or ()),
     }
     gate = gates.get(_provider_key(provider))
     if gate is None:
@@ -4674,7 +4674,7 @@ def _collect_cli() -> tuple[list[dict], bool]:
         except TypeError:
             pool.shutdown(wait=False)
     snapshots = [results[key] for key in sorted(results)]
-    if complete and snapshots:
+    if complete:
         # A fetcher that returns None/[] instead of raising leaves no row and
         # no error card. Caching that run used to bake the omission into the
         # 5-minute page cache (Nov 3 Grok, Nov 23 Claude incidents). If a
