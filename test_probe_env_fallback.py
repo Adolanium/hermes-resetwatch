@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,7 +45,49 @@ def write_secret_cache(home: Path, value: str, name: str = NAME) -> None:
     )
 
 
+def fake_secret_scope_modules():
+    scope = [None]
+
+    def load_env_file(path):
+        env_path = Path(path)
+        if not env_path.is_file():
+            return {}
+        out = {}
+        for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+        return out
+
+    def set_secret_scope(mapping, profile_home=None):
+        previous = scope[0]
+        scope[0] = dict(mapping)
+        return previous
+
+    def reset_secret_scope(previous):
+        scope[0] = previous
+
+    def get_secret(name, default=None):
+        return (scope[0] or {}).get(name, default)
+
+    secret_scope = types.ModuleType("agent.secret_scope")
+    secret_scope.load_env_file = load_env_file
+    secret_scope.set_secret_scope = set_secret_scope
+    secret_scope.reset_secret_scope = reset_secret_scope
+    secret_scope.get_secret = get_secret
+    agent = types.ModuleType("agent")
+    agent.secret_scope = secret_scope
+    return {"agent": agent, "agent.secret_scope": secret_scope}
+
+
 class ProbeEnvFallbackTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(sys.modules, fake_secret_scope_modules())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_dotenv_precedence_and_preserve_existing(self):
         for source, probe in probes():
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
@@ -226,10 +269,31 @@ class ProbeEnvFallbackTests(unittest.TestCase):
 
 
 ENTRYPOINT_RUNNER = r'''
-import importlib.util, sys
+import importlib.util, sys, types
 from pathlib import Path
 script, home, url, profile = sys.argv[1:]
 Path.home = classmethod(lambda cls: Path(home) / "unused-user")
+_scope = [None]
+def _load_env_file(path):
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    out = {}
+    for raw in p.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip()
+    return out
+ss = types.ModuleType("agent.secret_scope")
+ss.load_env_file = _load_env_file
+ss.set_secret_scope = lambda m, profile_home=None: (_scope.__setitem__(0, dict(m)) or None)
+ss.reset_secret_scope = lambda prev: _scope.__setitem__(0, prev)
+ss.get_secret = lambda name, default=None: (_scope[0] or {}).get(name, default)
+agent_pkg = types.ModuleType("agent")
+agent_pkg.secret_scope = ss
+sys.modules.update({"agent": agent_pkg, "agent.secret_scope": ss})
 spec = importlib.util.spec_from_file_location("tested_probe", script)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)

@@ -350,7 +350,7 @@ class CopilotUsageTests(unittest.TestCase):
                      patch.dict(sys.modules, {"agent.secret_scope": None}), \
                      patch.object(probe, "_user_home", return_value=Path(tmp)), \
                      patch.object(probe, "_hermes_env_value", side_effect=AssertionError("dotenv")), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=AssertionError("gh ran")), \
                      patch.object(httpx, "Client", return_value=client):
                     hermes = Path(tmp) / ".hermes"
@@ -392,7 +392,7 @@ class CopilotUsageTests(unittest.TestCase):
                      patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "gho_process"}, clear=False), \
                      patch.object(probe, "_user_home", return_value=Path(tmp)), \
                      patch.object(probe, "_hermes_env_value", side_effect=AssertionError("dotenv")), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=AssertionError("gh ran")), \
                      patch.object(httpx, "Client", side_effect=open_client):
                     (Path(tmp) / ".env").write_text("COPILOT_GITHUB_TOKEN=gho_from_dotenv\n", encoding="utf-8")
@@ -406,7 +406,7 @@ class CopilotUsageTests(unittest.TestCase):
                      patch.dict(sys.modules, {"agent": package, "agent.secret_scope": scope}), \
                      patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "gho_process"}, clear=False), \
                      patch.object(probe, "_user_home", return_value=Path(tmp)), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=AssertionError("gh ran")), \
                      patch.object(httpx, "Client", side_effect=open_client):
                     editor = Path(tmp) / ".config" / "github-copilot"
@@ -425,7 +425,7 @@ class CopilotUsageTests(unittest.TestCase):
                 seen.clear()
                 with patch.dict(sys.modules, {"agent": package, "agent.secret_scope": scope}), \
                      patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "gho_process"}, clear=False), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=AssertionError("gh ran")), \
                      patch.object(httpx, "Client", side_effect=open_client):
                     card = probe._fetch_copilot_account_usage()
@@ -465,7 +465,7 @@ class CopilotUsageTests(unittest.TestCase):
                      patch.dict(sys.modules, {"agent.secret_scope": None}), \
                      patch.object(probe, "_user_home", return_value=Path(tmp)), \
                      patch.object(probe, "_hermes_env_value", side_effect=AssertionError("dotenv")), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=fake_run), \
                      patch.object(httpx, "Client", side_effect=open_client):
                     home = Path(tmp)
@@ -495,7 +495,7 @@ class CopilotUsageTests(unittest.TestCase):
                      }, clear=False), \
                      patch.dict(sys.modules, {"agent.secret_scope": None}), \
                      patch.object(probe, "_user_home", return_value=Path(tmp)), \
-                     patch.object(probe, "_read_env_file_value", side_effect=AssertionError("dotenv")), \
+                     patch.object(probe, "_hermes_dotenv_value", side_effect=AssertionError("dotenv")), \
                      patch.object(probe.subprocess, "run", side_effect=fake_run), \
                      patch.object(httpx, "Client", side_effect=open_client):
                     home = Path(tmp)

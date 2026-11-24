@@ -296,6 +296,79 @@ class CodexAccountTests(unittest.TestCase):
                 self.assertEqual(snap["auth_state"], "sign_in")
                 self.assertEqual(snap["reason_code"], "token_invalidated")
 
+    def test_standalone_hermes_codex_seat_works_and_dedupes_with_pool(self):
+        import sys
+        import types
+
+        standalone = codex_jwt("user-standalone", account="workspace-standalone")
+        pool_tok = codex_jwt("user-pool", account="workspace-pool")
+
+        def make_modules(resolved):
+            calls = []
+
+            def resolve_codex_runtime_credentials(*, read_only=False):
+                calls.append(read_only)
+                return resolved
+
+            auth_codex = types.ModuleType("hermes_cli.auth_codex")
+            auth_codex.resolve_codex_runtime_credentials = resolve_codex_runtime_credentials
+            pkg = types.ModuleType("hermes_cli")
+            pkg.auth_codex = auth_codex
+            return {"hermes_cli": pkg, "hermes_cli.auth_codex": auth_codex}, calls
+
+        for source, probe in probes():
+            with self.subTest(source=source):
+                # Standalone seat with an empty pool produces one healthy account.
+                mods, calls = make_modules({
+                    "api_key": standalone,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "source": "hermes-auth-store",
+                })
+                with patch.dict(sys.modules, mods), \
+                     patch.object(probe, "_pool_entries", return_value=[]), \
+                     patch.object(probe, "_codex_token_expiring", return_value=False):
+                    accounts = probe._codex_pool_accounts()
+                    self.assertEqual(calls, [True])
+                    self.assertEqual([a["account_id"] for a in accounts], ["workspace-standalone"])
+                    self.assertEqual(accounts[0]["token"], standalone)
+                    self.assertTrue(probe._provider_has_live_credentials("openai-codex"))
+
+                # Same token in pool and runtime deduplicates to one account, preserving pool key/label.
+                mods, _ = make_modules({
+                    "api_key": pool_tok,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "source": "credential_pool",
+                })
+                with patch.dict(sys.modules, mods), \
+                     patch.object(probe, "_pool_entries", return_value=[{"id": "pool-1", "access_token": pool_tok, "label": "work"}]), \
+                     patch.object(probe, "_codex_token_expiring", return_value=False):
+                    accounts = probe._codex_pool_accounts()
+                    self.assertEqual(len(accounts), 1)
+                    self.assertEqual(accounts[0]["key"], "pool-1")
+                    self.assertEqual(accounts[0]["label"], "work")
+
+                # Healthy standalone seat overrides a dead pool row for the same account.
+                dead_tok = codex_jwt("user-standalone", account="workspace-standalone") + "dead"
+                mods, _ = make_modules({
+                    "api_key": standalone,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "source": "hermes-auth-store",
+                })
+                with patch.dict(sys.modules, mods), \
+                     patch.object(probe, "_pool_entries", return_value=[{"id": "revoked", "access_token": dead_tok, "last_status": "dead"}]), \
+                     patch.object(probe, "_codex_token_expiring", return_value=False):
+                    accounts = probe._codex_pool_accounts()
+                    self.assertEqual(len(accounts), 1)
+                    self.assertEqual(accounts[0]["token"], standalone)
+                    self.assertNotIn("status", accounts[0])
+
+                # Distinct standalone and pool accounts both remain visible.
+                with patch.dict(sys.modules, mods), \
+                     patch.object(probe, "_pool_entries", return_value=[{"id": "pool-1", "access_token": pool_tok}]), \
+                     patch.object(probe, "_codex_token_expiring", return_value=False):
+                    accounts = probe._codex_pool_accounts()
+                    self.assertEqual([a["account_id"] for a in accounts], ["workspace-pool", "workspace-standalone"])
+
 
 if __name__ == "__main__":
     unittest.main()

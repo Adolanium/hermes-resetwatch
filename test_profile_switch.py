@@ -46,7 +46,7 @@ def seed_profile(home: Path, name: str, marker: str) -> None:
 # Load the real entry point, but stop before vendor fetches on a cache miss.
 # This also makes it safe to run these tests against a broken or older probe.
 RUNNER = r'''
-import importlib.util, json, os, socket, subprocess, sys
+import importlib.util, json, os, socket, subprocess, sys, types
 from pathlib import Path
 script, user_home, mode, *flags = sys.argv[1:]
 Path.home = classmethod(lambda cls: Path(user_home))
@@ -54,6 +54,47 @@ def blocked(*args, **kwargs):
     raise AssertionError("vendor access is blocked in this test")
 socket.socket = blocked
 subprocess.Popen = blocked
+if mode == "credentials":
+    _scope = [None]
+    def _load_env_file(path):
+        p = Path(path)
+        if not p.is_file():
+            return {}
+        out = {}
+        for raw in p.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+        return out
+    def _set_scope(mapping, profile_home=None):
+        prev = _scope[0]
+        _scope[0] = dict(mapping)
+        return prev
+    def _reset_scope(prev):
+        _scope[0] = prev
+    def _get_secret(name, default=None):
+        return (_scope[0] or {}).get(name, default)
+    ss = types.ModuleType("agent.secret_scope")
+    ss.load_env_file = _load_env_file
+    ss.set_secret_scope = _set_scope
+    ss.reset_secret_scope = _reset_scope
+    ss.get_secret = _get_secret
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.secret_scope = ss
+    def _read_pool(provider_id=None):
+        home = Path(os.environ.get("HERMES_HOME") or "")
+        path = home / "auth.json"
+        if not path.is_file():
+            return []
+        rows = (json.loads(path.read_text(encoding="utf-8-sig")).get("credential_pool") or {}).get(provider_id)
+        return list(rows) if isinstance(rows, list) else []
+    auth_mod = types.ModuleType("hermes_cli.auth")
+    auth_mod.read_credential_pool = _read_pool
+    cli_pkg = types.ModuleType("hermes_cli")
+    cli_pkg.auth = auth_mod
+    sys.modules.update({"agent": agent_pkg, "agent.secret_scope": ss, "hermes_cli": cli_pkg, "hermes_cli.auth": auth_mod})
 spec = importlib.util.spec_from_file_location("tested_probe", script)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
@@ -244,7 +285,19 @@ class ProfileSwitchTest(unittest.TestCase):
 
             account_usage = types.ModuleType("agent.account_usage")
             account_usage.fetch_account_usage = fetch
-            with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.account_usage": account_usage}), \
+            scope_state = [None]
+            secret_scope = types.ModuleType("agent.secret_scope")
+            secret_scope.load_env_file = lambda path: dict(
+                line.split("=", 1) for line in Path(path).read_text().splitlines() if "=" in line
+            ) if Path(path).is_file() else {}
+            secret_scope.set_secret_scope = lambda mapping, profile_home=None: (scope_state.__setitem__(0, dict(mapping)) or None)
+            secret_scope.reset_secret_scope = lambda token: scope_state.__setitem__(0, None)
+            secret_scope.get_secret = lambda name, default=None: (scope_state[0] or {}).get(name, default)
+            agent_pkg = types.ModuleType("agent")
+            agent_pkg.account_usage = account_usage
+            agent_pkg.secret_scope = secret_scope
+            with patch.dict(sys.modules, {"agent": agent_pkg, "agent.account_usage": account_usage,
+                                          "agent.secret_scope": secret_scope}), \
                  patch.object(probe, "_profile_home", home), patch.object(probe, "_profile_inherits_env", False), \
                  patch.dict(os.environ, {"OPENROUTER_API_KEY": "alpha-key", "OPENAI_API_KEY": "alpha-alias",
                                          "CUSTOM_BASE_URL": "https://alpha.example/api"}):

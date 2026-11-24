@@ -1,13 +1,14 @@
-"""A named profile falls back to the base home's credential pool per provider.
+"""Credential pool resolution delegates to Hermes's read_credential_pool.
 
-Hermes's read_credential_pool() uses the base home's rows for a provider
-whenever the profile has none for that provider, even if the profile has its
-own auth.json. The probe must follow the same rule so the Claude card does
-not disappear on a profile that runs on the base Claude login (#36).
+Hermes's read_credential_pool() owns profile fallback to the base home's
+auth.json. When that helper cannot be imported, the probe skips the pool
+instead of opening auth.json directly.
 """
 
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -32,26 +33,47 @@ class ProfilePoolFallbackTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _helper_modules(self):
+        def read_credential_pool(provider_id=None):
+            active = probe._profile_home or self.base
+            homes = [active]
+            if active.parent.name == "profiles":
+                homes.append(active.parent.parent)
+            for home in homes:
+                path = home / "auth.json"
+                if not path.is_file():
+                    continue
+                rows = (json.loads(path.read_text()).get("credential_pool") or {}).get(provider_id)
+                if isinstance(rows, list) and rows:
+                    return list(rows)
+            return []
+
+        auth = types.ModuleType("hermes_cli.auth")
+        auth.read_credential_pool = read_credential_pool
+        pkg = types.ModuleType("hermes_cli")
+        pkg.auth = auth
+        return {"hermes_cli": pkg, "hermes_cli.auth": auth}
+
     def pool(self, provider: str) -> list:
-        with patch.object(probe, "_profile_home", self.profile):
+        with patch.dict(sys.modules, self._helper_modules()), \
+             patch.object(probe, "_profile_home", self.profile):
             return [row["id"] for row in probe._pool_entries(provider)]
 
-    def test_profile_without_auth_json_uses_base_rows(self):
+    def test_profile_without_auth_json_uses_base_rows_via_hermes_helper(self):
         self.assertEqual(self.pool("anthropic"), ["base-claude"])
 
-    def test_profile_with_other_provider_only_still_uses_base_rows(self):
+    def test_profile_with_other_provider_only_still_uses_base_rows_via_hermes_helper(self):
         write_pool(self.profile, {"openrouter": [{"id": "profile-openrouter"}]})
         self.assertEqual(self.pool("anthropic"), ["base-claude"])
         self.assertEqual(self.pool("openrouter"), ["profile-openrouter"])
 
-    def test_profile_with_own_rows_uses_only_those(self):
+    def test_profile_with_own_rows_uses_only_those_via_hermes_helper(self):
         write_pool(self.profile, {"anthropic": [{"id": "profile-claude"}]})
         self.assertEqual(self.pool("anthropic"), ["profile-claude"])
 
-    def test_home_outside_profiles_has_no_fallback(self):
-        other = Path(self.tmp.name) / "elsewhere" / "curry"
-        other.mkdir(parents=True)
-        with patch.object(probe, "_profile_home", other):
+    def test_missing_helper_skips_auth_json_instead_of_reading_directly(self):
+        with patch.dict(sys.modules, {"hermes_cli": None, "hermes_cli.auth": None}), \
+             patch.object(probe, "_profile_home", self.profile):
             self.assertEqual(probe._pool_entries("anthropic"), [])
 
 
