@@ -4,15 +4,19 @@ The probe asks Hermes for credentials through Hermes's own helpers. It does not 
 
 ## Pooled logins
 
-`read_credential_pool` in `hermes_cli.auth` returns the saved pool for one provider. The probe uses that list when the helper imports. An empty list is the answer: the probe does not open `auth.json` after that. If the helper cannot be imported, or it raises, the probe reads `credential_pool` from the saved `auth.json` and still does not write the file. A profile with no rows for a provider keeps the existing fallback to the base home.
+`read_credential_pool` in `hermes_cli.auth` returns the saved pool for one provider, including Hermes's own fallback to the base home when a profile has no rows for that provider. If the helper cannot be imported, or it raises, the probe skips the pool and does not open `auth.json` directly.
+
+## Standalone Codex login
+
+`resolve_codex_runtime_credentials(read_only=True)` in `hermes_cli.auth_codex` returns Hermes's own Codex login outside the pool without Codex CLI adoption, token refresh, or auth-store writes. If the helper cannot be imported, does not accept `read_only=True` (older Hermes), or raises, the probe skips that source and does not open `auth.json` directly.
 
 ## Profile env files
 
-`get_secret` from `agent.secret_scope` is the helper for `$HERMES_HOME/.env`. The probe runs in its own process, so a bare `get_secret` call would only see the process environment. When the module imports, the probe loads the profile file with `load_env_file`, installs that map with `set_secret_scope`, then calls `get_secret`. Names missing from that file stay missing. They are not filled from another profile's environment. If the module cannot be imported, or the read raises, the probe uses its own `.env` parser. Process environment and the existing secret-source cache still come first when the profile inherits them. The probe does not refresh secret sources and does not write the cache.
+`get_secret` from `agent.secret_scope` is the helper for `$HERMES_HOME/.env`. The probe runs in its own process, so a bare `get_secret` call would only see the process environment. When the module imports, the probe loads the profile file with `load_env_file`, installs that map with `set_secret_scope`, then calls `get_secret`. Names missing from that file stay missing. They are not filled from another profile's environment. If the module cannot be imported, or the read raises, the probe skips `.env` and does not parse it directly. Process environment and the existing secret-source cache still come first when the profile inherits them. The probe does not refresh secret sources and does not write the cache.
 
-## The Anthropic OAuth file
+## The Anthropic OAuth seat
 
-`.anthropic_oauth.json` stays a direct read. Hermes's resolver for that file can refresh the token, and the catalog build removes that resolver. No read-only helper returns this one file without a refresh. The probe does not refresh it. Pooled `anthropic` rows still go through `read_credential_pool`.
+`read_hermes_oauth_credentials` in `agent.anthropic_credentials` returns Hermes's saved Anthropic OAuth credentials without refreshing or writing the token. If the helper cannot be imported, or it raises, the probe skips that source and does not open `.anthropic_oauth.json` directly. Pooled `anthropic` rows still go through `read_credential_pool`.
 
 ## The Nous portal login
 

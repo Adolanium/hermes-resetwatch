@@ -39,9 +39,6 @@ def readonly_probe(source):
                 body = body[:body.index('    if not allow_refresh:')] + '    return None\n'
                 annotation = 'Optional[str]' if name == '_kimi_code_access_token' else 'Optional[tuple[str, str]]'
                 replacement = f'def {name}(*, previous: Optional[str] = None) -> {annotation}:\n    """Read an existing access token without exchanging or saving credentials."""\n' + body
-            elif name == "_hermes_anthropic_oauth_token":
-                body = original[original.index('    for home in _hermes_homes():'):]
-                replacement = 'def _hermes_anthropic_oauth_token() -> Optional[str]:\n    """Read the saved token; Hermes token resolvers may refresh it."""\n' + body
             elif name == "_cursor_cli_json":
                 replacement = 'def _cursor_cli_json(args: list[str]) -> Optional[dict]:\n    """Do not launch a CLI that may refresh its login as a side effect."""\n    return None\n'
             elif name in ("_fetch_kimi_cli_usage", "_fetch_grok_account_usage"):
@@ -84,17 +81,30 @@ def readonly_probe(source):
     end = result.index('"""', 3) + 3
     result = '''"""Read-only catalog usage probe for Resetwatch.
 
-Reads existing CLI and Hermes access tokens and calls vendor usage APIs. Never
-exchanges refresh tokens or writes login files. Expired Kimi/Grok credentials
-produce an error asking the user to sign in with the vendor CLI. Cursor CLI
-commands and Hermes OAuth resolvers are not invoked. Result/rate-limit caches
+Reads existing CLI and Hermes access tokens (through Hermes's read-only
+credential helpers) and calls vendor usage APIs. Never exchanges refresh
+tokens, never writes login files, and never opens Hermes credential files
+directly. Expired Kimi/Grok credentials produce an error asking the user to sign in with the vendor CLI. Cursor CLI commands and
+refreshing Hermes OAuth resolvers are not invoked. Result/rate-limit caches
 under $HERMES_HOME/cache/resetwatch may be written. No tokens on stdout.
 
 Private vendor APIs are best-effort and may change without notice.
 """''' + result[end:]
     for forbidden in (*removed, *constants, 'allow_refresh', 'resolve_anthropic_token', 'grant_type',
-                      '_fetch_portal_account', 'get_nous_portal_account_info', 'resolve_nous_access_token'):
+                      '_fetch_portal_account', 'get_nous_portal_account_info', 'resolve_nous_access_token',
+                      '.anthropic_oauth.json', '_read_env_file_value', '_read_auth_store', '_pool_rows_from_saved_store'):
         if forbidden in result:
-            raise ValueError("Read-only probe contains refresh code: " + forbidden)
-    ast.parse(result)
+            raise ValueError("Read-only probe contains forbidden code: " + forbidden)
+    parsed = ast.parse(result)
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Call):
+            callee = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else None
+            )
+            if callee == "resolve_codex_runtime_credentials":
+                read_only_kw = [kw for kw in node.keywords if kw.arg == "read_only"]
+                if node.args or len(read_only_kw) != 1 or not (
+                    isinstance(read_only_kw[0].value, ast.Constant) and read_only_kw[0].value.value is True
+                ):
+                    raise ValueError("resolve_codex_runtime_credentials must be called with read_only=True")
     return result

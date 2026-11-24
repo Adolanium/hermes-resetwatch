@@ -83,17 +83,42 @@ class CatalogReadOnlyTests(unittest.TestCase):
         self.assertEqual(calls, ["stored", "stored"])
 
     def test_indirect_credential_refresh_paths_are_excluded(self):
+        import sys
+        import types
+
         with patch.object(probe.subprocess, "run", side_effect=AssertionError("CLI executed")):
             self.assertIsNone(probe._cursor_cli_json(["status", "--json"]))
-        # Resolver imports must not be attempted, even when a Hermes install exists.
-        with patch.object(probe, "_hermes_homes", return_value=[]), \
-             patch("builtins.__import__", side_effect=AssertionError("resolver imported")):
-            self.assertIsNone(probe._hermes_anthropic_oauth_token())
-        for name in ("_write_secret_json", "_kimi_code_refresh_tokens", "_grok_refresh_entry"):
+        # Anthropic OAuth uses only read_hermes_oauth_credentials (never resolve_anthropic_token or direct file read).
+        creds = types.ModuleType("agent.anthropic_credentials")
+        creds.read_hermes_oauth_credentials = lambda: {"accessToken": "sk-ant-oat01-readonly"}
+        creds.resolve_anthropic_token = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("refreshing resolver"))
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.anthropic_credentials = creds
+        with patch.dict(sys.modules, {"agent": agent_pkg, "agent.anthropic_credentials": creds}):
+            self.assertEqual(probe._hermes_anthropic_oauth_token(), "sk-ant-oat01-readonly")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".anthropic_oauth.json").write_text(json.dumps({"accessToken": "sk-ant-oat01-file"}))
+            with patch.dict(sys.modules, {"agent": None, "agent.anthropic_credentials": None}), \
+                 patch.object(probe, "_hermes_homes", return_value=[home]):
+                self.assertIsNone(probe._hermes_anthropic_oauth_token())
+        # Codex standalone helper must pass read_only=True and skip older resolvers that lack it.
+        seen_read_only = []
+        auth_codex = types.ModuleType("hermes_cli.auth_codex")
+        auth_codex.resolve_codex_runtime_credentials = lambda *, read_only=False: (
+            seen_read_only.append(read_only) or {"api_key": "codex-ro", "base_url": "https://chatgpt.com/backend-api/codex"}
+        )
+        cli_pkg = types.ModuleType("hermes_cli")
+        cli_pkg.auth_codex = auth_codex
+        with patch.dict(sys.modules, {"hermes_cli": cli_pkg, "hermes_cli.auth_codex": auth_codex}):
+            self.assertEqual(probe._hermes_codex_runtime_entry()["access_token"], "codex-ro")
+        self.assertEqual(seen_read_only, [True])
+        for name in ("_write_secret_json", "_kimi_code_refresh_tokens", "_grok_refresh_entry",
+                     "_read_env_file_value", "_read_auth_store", "_pool_rows_from_saved_store"):
             self.assertFalse(hasattr(probe, name))
         text = Path(__file__).resolve().parent.joinpath("catalog/desktop/probe.py").read_text(encoding="utf-8")
-        self.assertNotIn("cli.exec", text)
-        self.assertNotIn("auth refresh", text)
+        for forbidden in ("cli.exec", "auth refresh", "resolve_anthropic_token", ".anthropic_oauth.json"):
+            self.assertNotIn(forbidden, text)
 
 
 if __name__ == "__main__":

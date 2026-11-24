@@ -1,9 +1,10 @@
 """Read-only catalog usage probe for Resetwatch.
 
-Reads existing CLI and Hermes access tokens and calls vendor usage APIs. Never
-exchanges refresh tokens or writes login files. Expired Kimi/Grok credentials
-produce an error asking the user to sign in with the vendor CLI. Cursor CLI
-commands and Hermes OAuth resolvers are not invoked. Result/rate-limit caches
+Reads existing CLI and Hermes access tokens (through Hermes's read-only
+credential helpers) and calls vendor usage APIs. Never exchanges refresh
+tokens, never writes login files, and never opens Hermes credential files
+directly. Expired Kimi/Grok credentials produce an error asking the user to sign in with the vendor CLI. Cursor CLI commands and
+refreshing Hermes OAuth resolvers are not invoked. Result/rate-limit caches
 under $HERMES_HOME/cache/resetwatch may be written. No tokens on stdout.
 
 Private vendor APIs are best-effort and may change without notice.
@@ -562,15 +563,20 @@ def _store_anthropic_snapshot(snap: dict) -> None:
 
 
 def _hermes_anthropic_oauth_token() -> Optional[str]:
-    """Read the saved token; Hermes token resolvers may refresh it."""
-    for home in _hermes_homes():
-        path = home / ".anthropic_oauth.json"
-        payload = _read_json_file(path)
-        if not isinstance(payload, dict):
-            continue
-        token = str(payload.get("accessToken") or payload.get("access_token") or "").strip()
-        if token and _is_claude_oauth_token(token):
-            return token
+    """Read Hermes's saved Anthropic OAuth token without refreshing it."""
+    try:
+        from agent.anthropic_credentials import read_hermes_oauth_credentials
+    except Exception:
+        return None
+    try:
+        payload = read_hermes_oauth_credentials()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = str(payload.get("accessToken") or payload.get("access_token") or "").strip()
+    if token and _is_claude_oauth_token(token):
+        return token
     return None
 
 
@@ -2235,21 +2241,10 @@ def _fetch_codex_cli_account_usage() -> Optional[dict]:
     return _fetch_codex_usage(token, account_id)
 
 
-def _read_auth_store(path: Path) -> Optional[dict]:
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError, UnicodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def _pool_rows_from_helper(provider: str) -> Optional[list]:
     """Rows from Hermes's pool reader.
 
-    None means the helper could not be imported or it raised. An empty
-    list is an answer, and the saved file is not opened after that.
+    None means the helper could not be imported or it raised.
     The reader does not refresh or write tokens.
     """
     try:
@@ -2267,38 +2262,13 @@ def _pool_rows_from_helper(provider: str) -> Optional[list]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def _pool_rows_from_saved_store(provider: str) -> list[dict]:
-    """Read credential_pool rows from the saved store. Never writes the file.
-
-    Used only when read_credential_pool cannot be reached. A profile with
-    no rows for a provider uses the base home's rows, even when it has a
-    store of its own.
-    """
-    homes = _hermes_homes()
-    if _profile_home is not None and _profile_home.parent.name == "profiles":
-        homes = [*homes, _profile_home.parent.parent]
-    for home in homes:
-        store = _read_auth_store(home / "auth.json")
-        if not store:
-            continue
-        pool = store.get("credential_pool")
-        if not isinstance(pool, dict):
-            continue
-        rows = pool.get(provider)
-        if isinstance(rows, list) and rows:
-            return [row for row in rows if isinstance(row, dict)]
-    return []
-
-
 def _pool_entries(provider: str) -> list[dict]:
-    """Credential pool rows for one provider. Never writes the store."""
+    """Credential pool rows for one provider via Hermes. Never opens auth.json directly."""
     name = str(provider or "").strip()
     if not name:
         return []
     rows = _pool_rows_from_helper(name)
-    if rows is not None:
-        return rows
-    return _pool_rows_from_saved_store(name)
+    return rows if rows is not None else []
 
 
 CODEX_DEAD_LOGIN = "Hermes reports this login is no longer valid. Sign in to Codex again in Hermes."
@@ -2308,8 +2278,39 @@ CODEX_EXPIRED_LOGIN = (
 )
 
 
+def _hermes_codex_runtime_entry() -> Optional[dict]:
+    """Read Hermes's standalone Codex login through Hermes's read-only resolver.
+
+    Never adopts Codex CLI tokens, never refreshes, and never writes auth.json.
+    Older Hermes versions whose resolver does not accept read_only=True raise
+    TypeError and are skipped.
+    """
+    try:
+        from hermes_cli.auth_codex import resolve_codex_runtime_credentials
+    except Exception:
+        return None
+    try:
+        resolved = resolve_codex_runtime_credentials(read_only=True)
+    except Exception:
+        return None
+    if not isinstance(resolved, dict):
+        return None
+    token = str(resolved.get("api_key") or "").strip()
+    if not token:
+        return None
+    entry: dict[str, Any] = {"access_token": token}
+    base_url = str(resolved.get("base_url") or "").strip()
+    if base_url:
+        entry["base_url"] = base_url
+    return entry
+
+
 def _codex_pool_entries() -> list[dict]:
-    return _pool_entries("openai-codex")
+    rows = list(_pool_entries("openai-codex"))
+    runtime = _hermes_codex_runtime_entry()
+    if runtime:
+        rows.append(runtime)
+    return rows
 
 
 def _codex_pool_accounts() -> list[dict]:
@@ -2686,60 +2687,23 @@ def _hermes_homes() -> list[Path]:
     return unique
 
 
-def _read_env_file_value(path: Path, name: str) -> Optional[str]:
-    if not path.is_file():
-        return None
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError):
-        try:
-            text = path.read_text(encoding="latin-1")
-        except OSError:
-            return None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        if key.strip() != name:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        else:
-            # Strip unquoted inline comments: KEY=value # note
-            cut = None
-            for index, char in enumerate(value):
-                if char == "#" and (index == 0 or value[index - 1].isspace()):
-                    cut = index
-                    break
-            if cut is not None:
-                value = value[:cut].rstrip()
-        return value.strip() or None
-    return None
-
-
 def _hermes_dotenv_value(home: Path, name: str) -> Optional[str]:
-    """One profile secret.
+    """One profile secret via Hermes's secret_scope helpers.
 
     get_secret alone sees the process environment, because this probe is a
     separate process and has no profile scope installed. When secret_scope
     imports, its reader loads the profile file and get_secret answers from
-    that scope. The local parser runs only when that module cannot be
-    imported or the read raises.
+    that scope. When the module cannot be imported or the read raises, this
+    source is skipped instead of parsing .env directly.
     """
     try:
         from agent.secret_scope import get_secret, load_env_file, reset_secret_scope, set_secret_scope
     except Exception:
-        return _read_env_file_value(home / ".env", name)
+        return None
     try:
         payload = load_env_file(home / ".env")
     except Exception:
-        return _read_env_file_value(home / ".env", name)
+        return None
     if not isinstance(payload, dict):
         return None
     scope = {
@@ -2753,7 +2717,7 @@ def _hermes_dotenv_value(home: Path, name: str) -> Optional[str]:
         token = set_secret_scope(scope, profile_home=str(home))
         value = get_secret(name)
     except Exception:
-        value = scope.get(name)
+        return None
     finally:
         if token is not None:
             try:
@@ -4153,7 +4117,7 @@ def _provider_has_live_credentials(provider: str) -> bool:
     Unknown providers count as live so a silent drop is never cached.
     """
     gates = {
-        "anthropic": lambda: bool(_claude_pool_accounts() or _claude_code_access_token()),
+        "anthropic": lambda: bool(_claude_pool_accounts() or _claude_code_access_token() or _hermes_anthropic_oauth_token()),
         "openai-codex": lambda: bool(_codex_pool_accounts() or _codex_cli_access_context()),
         "cursor": lambda: bool(_cursor_access_token()),
         "kimi": lambda: bool(_kimi_code_access_token() or _kimi_coding_api_key()),
